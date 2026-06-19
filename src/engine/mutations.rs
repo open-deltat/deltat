@@ -8,7 +8,7 @@ use crate::limits::*;
 use crate::model::*;
 
 use super::availability::subtract_intervals;
-use super::conflict::{check_no_conflict, now_ms, validate_span};
+use super::conflict::{check_batch_capacity, check_no_conflict, validate_span};
 use super::{Engine, EngineError, WalCommand};
 
 impl Engine {
@@ -146,7 +146,7 @@ impl Engine {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
 
-        check_no_conflict(&guard, &span, now_ms())?;
+        check_no_conflict(&guard, &span, self.now_ms())?;
 
         let event = Event::HoldPlaced { id, resource_id, span, expires_at };
         self.persist_and_apply(resource_id, &mut guard, &event).await
@@ -179,7 +179,7 @@ impl Engine {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
 
-        check_no_conflict(&guard, &span, now_ms())?;
+        check_no_conflict(&guard, &span, self.now_ms())?;
 
         let event = Event::BookingConfirmed { id, resource_id, span, label };
         self.persist_and_apply(resource_id, &mut guard, &event).await
@@ -226,7 +226,7 @@ impl Engine {
         }
 
         // Phase 1: Validate all bookings against current state + intra-batch.
-        let now = now_ms();
+        let now = self.now_ms();
 
         let mut by_resource: HashMap<Ulid, Vec<(Ulid, Span)>> = HashMap::new();
         for (id, rid, span, _) in &bookings {
@@ -241,18 +241,26 @@ impl Engine {
             }
 
             if batch.len() > 1 {
-                let buffer = guard.buffer_after.unwrap_or(0);
-                for i in 0..batch.len() {
-                    for j in (i + 1)..batch.len() {
-                        let effective_i = Span::new(batch[i].1.start, batch[i].1.end + buffer);
-                        if effective_i.overlaps(&batch[j].1) {
-                            return Err(EngineError::Conflict(batch[i].0));
-                        }
-                        let effective_j = Span::new(batch[j].1.start, batch[j].1.end + buffer);
-                        if effective_j.overlaps(&batch[i].1) {
-                            return Err(EngineError::Conflict(batch[j].0));
+                if guard.capacity <= 1 {
+                    // Capacity-1: any two overlapping members (with buffer) conflict.
+                    let buffer = guard.buffer_after.unwrap_or(0);
+                    for i in 0..batch.len() {
+                        for j in (i + 1)..batch.len() {
+                            let effective_i = Span::new(batch[i].1.start, batch[i].1.end + buffer);
+                            if effective_i.overlaps(&batch[j].1) {
+                                return Err(EngineError::Conflict(batch[i].0));
+                            }
+                            let effective_j = Span::new(batch[j].1.start, batch[j].1.end + buffer);
+                            if effective_j.overlaps(&batch[i].1) {
+                                return Err(EngineError::Conflict(batch[j].0));
+                            }
                         }
                     }
+                } else {
+                    // Capacity-N: overlapping members are allowed up to capacity. Fold them in
+                    // with committed load and reject only if concurrency would exceed capacity.
+                    let spans: Vec<Span> = batch.iter().map(|(_, s)| *s).collect();
+                    check_batch_capacity(guard, &spans, now)?;
                 }
             }
         }

@@ -5,8 +5,7 @@ use ulid::Ulid;
 use crate::limits::*;
 use crate::model::*;
 
-use super::availability::availability;
-use super::conflict::now_ms;
+use super::availability::{availability, merge_overlapping};
 use super::{Engine, EngineError};
 
 impl Engine {
@@ -81,6 +80,12 @@ impl Engine {
         query_end: Ms,
         min_duration_ms: Option<Ms>,
     ) -> Result<Vec<Span>, EngineError> {
+        // An empty or inverted window has no availability — return empty rather than letting
+        // Span::new panic on untrusted query bounds (the query check below is signed, so a
+        // negative width passes it).
+        if query_end <= query_start {
+            return Ok(vec![]);
+        }
         if query_end - query_start > MAX_QUERY_WINDOW_MS {
             return Err(EngineError::LimitExceeded("query window too wide"));
         }
@@ -94,7 +99,7 @@ impl Engine {
         let (inherited_non_blocking, inherited_blocking) =
             self.collect_inherited_rules(&guard, &query).await?;
 
-        let now = now_ms();
+        let now = self.now_ms();
         let mut free = availability(
             &guard,
             &query,
@@ -142,7 +147,7 @@ impl Engine {
 
         all_events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-        let mut result = Vec::new();
+        let mut segments = Vec::new();
         let mut count: i32 = 0;
         let mut seg_start: Option<Ms> = None;
         let threshold = min_available as i32;
@@ -156,14 +161,25 @@ impl Engine {
             } else if prev >= threshold && count < threshold
                 && let Some(start) = seg_start.take()
                 && *time > start {
-                    let span = Span::new(start, *time);
-                    if min_duration_ms.is_none_or(|d| span.duration_ms() >= d) {
-                        result.push(span);
-                    }
+                    segments.push(Span::new(start, *time));
                 }
         }
 
-        Ok(result)
+        // When one resource covers [a,T) and another covers [T,b), coverage of the
+        // single continuous window [a,b) is handed off at the shared half-open
+        // boundary T: the sweep closes a segment at T (count dips) and reopens it,
+        // emitting two adjacent segments. Merge adjacent segments BEFORE the
+        // min_duration filter — otherwise a continuous window long enough to
+        // qualify is split into sub-threshold fragments and every fragment is
+        // dropped, hiding a real slot (GAP-13). The single-resource path already
+        // merges (availability.rs); this mirrors it. Segments are emitted in
+        // ascending time order, so they are already sorted for merge_overlapping.
+        let mut merged = merge_overlapping(&segments);
+        if let Some(d) = min_duration_ms {
+            merged.retain(|s| s.duration_ms() >= d);
+        }
+
+        Ok(merged)
     }
 
     pub fn list_resources(&self) -> Vec<ResourceInfo> {

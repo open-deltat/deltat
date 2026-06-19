@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "wall-clock reads must go through the injected Clock (src/clock.rs) so the engine stays deterministically testable" },
+]

@@ -3,13 +3,6 @@ use crate::model::*;
 use super::availability::compute_saturated_spans;
 use super::EngineError;
 
-pub(crate) fn now_ms() -> Ms {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as Ms
-}
-
 pub(crate) fn validate_span(span: &Span) -> Result<(), EngineError> {
     use crate::limits::*;
     if span.start < MIN_VALID_TIMESTAMP_MS || span.end > MAX_VALID_TIMESTAMP_MS {
@@ -54,6 +47,36 @@ pub(crate) fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Res
                 return Err(EngineError::CapacityExceeded(rs.capacity));
             }
         }
+    }
+    Ok(())
+}
+
+/// Validate that committing `spans` all at once on a capacity-N resource never pushes the
+/// concurrent allocation count past capacity. Per-span `check_no_conflict` only weighs each new
+/// span against *committed* state; this also weighs the batch members against each other, which
+/// is what makes true atomic multi-unit booking on a capacity pool correct (e.g. N GA tickets
+/// bought together). Caller uses this for `capacity > 1`; the capacity-1 path keeps its simpler
+/// pairwise overlap check.
+pub(crate) fn check_batch_capacity(
+    rs: &ResourceState,
+    spans: &[Span],
+    now: Ms,
+) -> Result<(), EngineError> {
+    let buffer = rs.buffer_after.unwrap_or(0);
+    let lo = spans.iter().map(|s| s.start).min().unwrap_or(0);
+    let hi = spans.iter().map(|s| s.end + buffer).max().unwrap_or(lo + 1);
+    let window = Span::new((lo - buffer).max(0), hi);
+
+    // Combine already-committed active allocations (buffer-extended) with all batch members,
+    // then look for any region where the concurrent count EXCEEDS capacity (>= capacity + 1).
+    let mut allocs = collect_active_allocs_with_buffer(rs, &window, now, buffer);
+    for s in spans {
+        allocs.push(Span::new(s.start, s.end + buffer));
+    }
+    allocs.sort_by_key(|s| s.start);
+
+    if !compute_saturated_spans(&allocs, rs.capacity + 1).is_empty() {
+        return Err(EngineError::CapacityExceeded(rs.capacity));
     }
     Ok(())
 }

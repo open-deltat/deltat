@@ -1,5 +1,6 @@
 use super::*;
-use super::conflict::{now_ms, validate_span};
+use super::conflict::validate_span;
+use crate::clock::{now_ms, TestClock};
 use crate::limits::*;
 
 const H: Ms = 3_600_000; // 1 hour in ms
@@ -54,6 +55,20 @@ fn test_wal_path(name: &str) -> PathBuf {
     let path = dir.join(name);
     let _ = std::fs::remove_file(&path);
     path
+}
+
+#[tokio::test]
+async fn engine_reads_now_from_injected_clock() {
+    // The whole determinism seam in one assertion: the engine's notion of "now" is
+    // exactly what the injected clock says, and it tracks the clock as it advances.
+    let path = test_wal_path("clock_seam.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let engine = Engine::with_clock(path, notify, clock.clone()).unwrap();
+
+    assert_eq!(engine.now_ms(), 1_000_000);
+    clock.advance(5_000);
+    assert_eq!(engine.now_ms(), 1_005_000);
 }
 
 #[tokio::test]
@@ -2068,6 +2083,77 @@ async fn capacity_one_is_default_behavior() {
 }
 
 #[tokio::test]
+async fn batch_capacity_books_n_units_same_span_atomically() {
+    // A capacity-N pool (e.g. a stadium GA section) must accept N simultaneous bookings for
+    // the SAME span in one atomic batch — the "buy N GA tickets at once" path.
+    let path = test_wal_path("batch_cap_n_ok.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 4, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(0, 10000), false).await.unwrap();
+
+    let batch: Vec<_> = (0..4)
+        .map(|_| (Ulid::new(), rid, Span::new(1000, 2000), None))
+        .collect();
+    engine.batch_confirm_bookings(batch).await.unwrap();
+
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn batch_capacity_rejects_over_capacity_atomically() {
+    // N+1 simultaneous units on a capacity-N pool must fail as a whole — none committed.
+    let path = test_wal_path("batch_cap_over.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 4, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(0, 10000), false).await.unwrap();
+
+    let batch: Vec<_> = (0..5)
+        .map(|_| (Ulid::new(), rid, Span::new(1000, 2000), None))
+        .collect();
+    assert!(matches!(
+        engine.batch_confirm_bookings(batch).await,
+        Err(EngineError::CapacityExceeded(4))
+    ));
+
+    // Atomic: the failed batch left nothing behind.
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn batch_capacity_accounts_for_committed_load() {
+    // Committed bookings count against the batch: 1 existing + 3 batch == capacity 4 (ok),
+    // but 1 existing + 4 batch exceeds it (rejected, atomically).
+    let path = test_wal_path("batch_cap_committed.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 4, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(0, 10000), false).await.unwrap();
+
+    engine.confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None).await.unwrap();
+
+    // 1 committed + 4 same-span batch members = 5 > capacity 4 → reject, nothing added.
+    let over: Vec<_> = (0..4).map(|_| (Ulid::new(), rid, Span::new(1000, 2000), None)).collect();
+    assert!(matches!(
+        engine.batch_confirm_bookings(over).await,
+        Err(EngineError::CapacityExceeded(4))
+    ));
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+
+    // 1 committed + 3 same-span batch members = 4 == capacity 4 → ok.
+    let ok: Vec<_> = (0..3).map(|_| (Ulid::new(), rid, Span::new(1000, 2000), None)).collect();
+    engine.batch_confirm_bookings(ok).await.unwrap();
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 4);
+}
+
+#[tokio::test]
 async fn capacity_availability_shows_partial_slots() {
     let path = test_wal_path("cap_avail.wal");
     let notify = Arc::new(NotifyHub::new());
@@ -2455,6 +2541,52 @@ async fn multi_avail_union_pool() {
 }
 
 #[tokio::test]
+async fn multi_avail_merges_adjacent_coverage_before_min_duration() {
+    // GAP-13 regression: when coverage of one continuous window is handed off
+    // between resources at a shared half-open boundary (r1 free [8,12), r2 free
+    // [12,16)), the sweep emits two adjacent segments. They must be merged before
+    // the min_duration filter, or a genuinely continuous 8h window gets split into
+    // two 4h fragments and dropped — hiding a real slot.
+    let path = test_wal_path("multi_avail_gap13.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let r1 = Ulid::new();
+    engine.create_resource(r1, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), r1, Span::new(8 * H, 12 * H), false).await.unwrap();
+
+    let r2 = Ulid::new();
+    engine.create_resource(r2, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), r2, Span::new(12 * H, 16 * H), false).await.unwrap();
+
+    // Union is one continuous window [8,16); output must be merged, not fragmented.
+    let union = engine
+        .compute_multi_availability(&[r1, r2], 0, 24 * H, 1, None)
+        .await
+        .unwrap();
+    assert_eq!(union, vec![Span::new(8 * H, 16 * H)]);
+
+    // The continuous 8h window must survive a 6h minimum (the bug returned []).
+    let filtered = engine
+        .compute_multi_availability(&[r1, r2], 0, 24 * H, 1, Some(6 * H))
+        .await
+        .unwrap();
+    assert_eq!(filtered, vec![Span::new(8 * H, 16 * H)]);
+
+    // k-of-N variant: r3 spans the whole window so "at least 2" is continuous
+    // across the r1→r2 handoff at 12h.
+    let r3 = Ulid::new();
+    engine.create_resource(r3, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), r3, Span::new(8 * H, 16 * H), false).await.unwrap();
+
+    let two_of_three = engine
+        .compute_multi_availability(&[r1, r2, r3], 0, 24 * H, 2, Some(6 * H))
+        .await
+        .unwrap();
+    assert_eq!(two_of_three, vec![Span::new(8 * H, 16 * H)]);
+}
+
+#[tokio::test]
 async fn multi_avail_with_min_duration() {
     let path = test_wal_path("multi_avail_mindur.wal");
     let notify = Arc::new(NotifyHub::new());
@@ -2797,17 +2929,16 @@ async fn multi_avail_exact_boundary_touch() {
         .unwrap();
     assert!(result.is_empty());
 
-    // Union: [8,12) ∪ [12,17) = [8,17) (continuous)
+    // Union: [8,12) ∪ [12,17) = [8,17). The two resources hand off coverage at
+    // the exact boundary 12h, so the result is ONE continuous window — not two
+    // fragments. (Before GAP-13 the sweep emitted two adjacent spans here; that
+    // representation silently dropped continuous windows under a min_duration
+    // filter, so the result is now merged to match the single-resource path.)
     let union = engine
         .compute_multi_availability(&[a, b], 0, 24 * H, 1, None)
         .await
         .unwrap();
-    // Note: sweep-line produces [8,12) then [12,17) — they're adjacent
-    // but since one ends and the next starts at the same time, count goes
-    // 0→1→0→1→0, so we should get two separate spans
-    assert_eq!(union.len(), 2);
-    assert_eq!(union[0], Span::new(8 * H, 12 * H));
-    assert_eq!(union[1], Span::new(12 * H, 17 * H));
+    assert_eq!(union, vec![Span::new(8 * H, 17 * H)]);
 }
 
 #[tokio::test]
