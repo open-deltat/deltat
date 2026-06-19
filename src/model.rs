@@ -17,6 +17,17 @@ impl Span {
         Self { start, end }
     }
 
+    /// Fallible constructor for untrusted/parsed input. `new` asserts (an internal invariant for
+    /// engine-derived spans); `try_new` returns `Err` instead of panicking when `start >= end`, so
+    /// external input (parsed SQL) is rejected cleanly. (TIME-05: eventually all construction is fallible.)
+    pub fn try_new(start: Ms, end: Ms) -> Result<Self, &'static str> {
+        if start < end {
+            Ok(Self { start, end })
+        } else {
+            Err("span start must be before end")
+        }
+    }
+
     pub fn duration_ms(&self) -> Ms {
         self.end - self.start
     }
@@ -467,6 +478,13 @@ mod tests {
     #[should_panic(expected = "Span start must be before end")]
     fn span_assert_start_before_end() {
         Span::new(200, 100);
+    }
+
+    #[test]
+    fn span_try_new_rejects_inverted_and_empty() {
+        assert!(Span::try_new(100, 200).is_ok());
+        assert_eq!(Span::try_new(200, 100), Err("span start must be before end"));
+        assert_eq!(Span::try_new(100, 100), Err("span start must be before end"));
     }
 
     #[test]

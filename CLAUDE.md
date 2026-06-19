@@ -17,6 +17,8 @@ These apply to ALL code in this repo. No exceptions.
 
 A custom time-allocation database written in Rust. Speaks PostgreSQL wire protocol (pgwire). No Postgres underneath — it's a single binary with an in-memory state machine backed by an append-only WAL.
 
+> Note: pgwire/SQL is the **current, transitional** transport — v2 replaces it with a framed `Command` protocol + HTTP/MCP adapters (see `docs/REQUIREMENTS.md` PROTO-01/02). The kernel `Schedule` feature was removed; recurrence is expanded into Rules at the edge (MODEL-11 / EDGE-03). `docs/REQUIREMENTS.md` is authoritative where docs conflict.
+
 **Core capability:** Given resources and time rules, compute availability with sub-millisecond latency. Supports hierarchical resources, multi-slot capacity, buffer times, holds with auto-expiry, atomic batch bookings, and real-time LISTEN/NOTIFY.
 
 ## Architecture

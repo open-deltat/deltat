@@ -146,8 +146,9 @@ impl DeltaTHandler {
                 end,
                 blocking,
             } => {
+                let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
-                    .add_rule(id, resource_id, Span::new(start, end), blocking)
+                    .add_rule(id, resource_id, span, blocking)
                     .await
                     .map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
@@ -163,8 +164,9 @@ impl DeltaTHandler {
                 end,
                 expires_at,
             } => {
+                let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
-                    .place_hold(id, resource_id, Span::new(start, end), expires_at)
+                    .place_hold(id, resource_id, span, expires_at)
                     .await
                     .map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
@@ -180,8 +182,9 @@ impl DeltaTHandler {
                 end,
                 label,
             } => {
+                let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
-                    .confirm_booking(id, resource_id, Span::new(start, end), label)
+                    .confirm_booking(id, resource_id, span, label)
                     .await
                     .map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
@@ -190,8 +193,12 @@ impl DeltaTHandler {
                 let count = bookings.len();
                 let batch: Vec<_> = bookings
                     .into_iter()
-                    .map(|(id, resource_id, start, end, label)| (id, resource_id, Span::new(start, end), label))
-                    .collect();
+                    .map(|(id, resource_id, start, end, label)| {
+                        Span::try_new(start, end)
+                            .map(|span| (id, resource_id, span, label))
+                            .map_err(span_err)
+                    })
+                    .collect::<PgWireResult<Vec<_>>>()?;
                 engine
                     .batch_confirm_bookings(batch)
                     .await
@@ -269,8 +276,9 @@ impl DeltaTHandler {
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
             Command::UpdateRule { id, start, end, blocking } => {
+                let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
-                    .update_rule(id, Span::new(start, end), blocking)
+                    .update_rule(id, span, blocking)
                     .await
                     .map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
@@ -584,18 +592,41 @@ fn count_params(sql: &str) -> usize {
 fn substitute_params(portal: &Portal<String>) -> String {
     let sql = portal.statement.statement.to_string();
     let params = &portal.parameters;
-    let mut result = sql;
+    if params.is_empty() {
+        return sql;
+    }
 
-    for (i, param) in params.iter().enumerate().rev() {
-        let placeholder = format!("${}", i + 1);
-        let value = match param {
-            Some(bytes) => {
-                let text = String::from_utf8_lossy(bytes);
-                format!("'{}'", text.replace('\'', "''"))
+    // Single left-to-right scan: replace each `$N` token in place. A global str::replace per
+    // placeholder could clobber a `$N` sequence that appears *inside* an already-substituted
+    // value; scanning once and emitting substituted values verbatim cannot. char-based so
+    // multibyte UTF-8 in the SQL (or in values) is preserved.
+    let chars: Vec<char> = sql.chars().collect();
+    let mut result = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut n: usize = 0;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                n = n * 10 + (chars[j] as usize - '0' as usize);
+                j += 1;
             }
-            None => "NULL".to_string(),
-        };
-        result = result.replace(&placeholder, &value);
+            if n >= 1 && n <= params.len() {
+                match &params[n - 1] {
+                    Some(bytes) => {
+                        let text = String::from_utf8_lossy(bytes);
+                        result.push('\'');
+                        result.push_str(&text.replace('\'', "''"));
+                        result.push('\'');
+                    }
+                    None => result.push_str("NULL"),
+                }
+                i = j;
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
     }
 
     result
@@ -814,6 +845,16 @@ fn engine_err(e: crate::engine::EngineError) -> PgWireError {
         "ERROR".into(),
         "P0001".into(),
         e.to_string(),
+    )))
+}
+
+/// Reject an invalid time range from untrusted SQL input cleanly, instead of letting
+/// `Span::new` panic the connection task (SQLSTATE 22007 = invalid_datetime_format).
+fn span_err(msg: &'static str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        "22007".into(),
+        msg.into(),
     )))
 }
 

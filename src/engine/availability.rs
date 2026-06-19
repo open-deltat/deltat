@@ -23,21 +23,40 @@ pub fn availability(
     let mut own_blocking: Vec<Span> = Vec::new();
     let mut active_allocs: Vec<Span> = Vec::new();
 
-    for interval in resource.overlapping(query) {
-        let clamped = Span::new(
-            interval.span.start.max(query.start),
-            interval.span.end.min(query.end),
-        );
+    // Allocations carry a buffer that extends their effective end, so one ending
+    // just before `query.start` can still block the head of the window. Scan a
+    // buffer-expanded window (mirrors check_no_conflict) so the read path agrees
+    // with the write path. Rules carry no buffer, so they only count when they
+    // overlap the real query. MIN_VALID_TIMESTAMP_MS is 0, so this stays valid.
+    let scan = Span::new((query.start - buffer).max(0), query.end);
+
+    for interval in resource.overlapping(&scan) {
         match &interval.kind {
-            IntervalKind::NonBlocking => own_non_blocking.push(clamped),
-            IntervalKind::Blocking => own_blocking.push(clamped),
+            IntervalKind::NonBlocking | IntervalKind::Blocking => {
+                if interval.span.end <= query.start {
+                    continue; // entirely before the window — rules have no buffer
+                }
+                let clamped = Span::new(
+                    interval.span.start.max(query.start),
+                    interval.span.end.min(query.end),
+                );
+                if matches!(interval.kind, IntervalKind::NonBlocking) {
+                    own_non_blocking.push(clamped);
+                } else {
+                    own_blocking.push(clamped);
+                }
+            }
             IntervalKind::Hold { expires_at } if *expires_at > now => {
                 let effective_end = interval.span.end + buffer;
-                active_allocs.push(Span::new(interval.span.start, effective_end));
+                if effective_end > query.start {
+                    active_allocs.push(Span::new(interval.span.start, effective_end));
+                }
             }
             IntervalKind::Booking { .. } => {
                 let effective_end = interval.span.end + buffer;
-                active_allocs.push(Span::new(interval.span.start, effective_end));
+                if effective_end > query.start {
+                    active_allocs.push(Span::new(interval.span.start, effective_end));
+                }
             }
             _ => {} // expired hold
         }
@@ -357,6 +376,24 @@ mod tests {
     }
 
     #[test]
+    fn buffer_straddling_query_start_blocks_availability() {
+        let ten = 10 * H;
+        let eleven = 11 * H;
+        let buffer = 30 * M;
+        // Open all day, capacity 1, 30-min buffer after each booking.
+        let rs = make_resource_with_capacity(
+            vec![rule(0, 24 * H, false), booking(ten, eleven)],
+            1,
+            Some(buffer),
+        );
+        // Query a window that STARTS inside the booking's buffer tail [11:00, 11:30).
+        // The read path must agree with check_no_conflict: this slot is not bookable.
+        let query = Span::new(eleven + 5 * M, 12 * H);
+        let free = availability(&rs, &query, &[], &[], 0);
+        assert_eq!(free, vec![Span::new(eleven + buffer, 12 * H)]);
+    }
+
+    #[test]
     fn blocking_rule_subtracts() {
         let nine = 9 * H;
         let ten = 10 * H;
@@ -413,5 +450,201 @@ mod tests {
     fn saturated_spans_empty() {
         let sat = compute_saturated_spans(&[], 5);
         assert!(sat.is_empty());
+    }
+}
+
+/// Executable spec (TEST-01/02): property-test `availability()` against an
+/// independent brute-force reference. The reference samples every integer
+/// millisecond in the query window and decides freeness from first principles
+/// (open ∧ ¬blocked ∧ active < capacity), then reassembles maximal free runs.
+/// Because all coordinates are integers and spans are half-open `[start, end)`,
+/// point-sampling at integers reconstructs the exact span set — so any
+/// disagreement is a real bug in the production algorithm, not sampling error.
+///
+/// This makes INV-01 (availability is derived, never stored) and INV-02
+/// (a point is free iff open, unblocked, and under capacity) *verified* across
+/// thousands of generated edge cases rather than asserted by hand-picked tests.
+#[cfg(test)]
+mod spec {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// All generated coordinates live in `[0, RANGE)`, and the query is exactly
+    /// `[0, RANGE)`. Keeping every interval inside the query makes rule-clamping a
+    /// no-op and guarantees every allocation passes the engine's `overlapping(query)`
+    /// gate, isolating the test to the core set math (this is the contract the
+    /// engine and reference must agree on; query-boundary buffer behaviour is
+    /// covered separately by unit tests).
+    const RANGE: Ms = 60;
+    const NOW: Ms = 1000;
+
+    #[derive(Debug, Clone)]
+    enum GenKind {
+        NonBlocking,
+        Blocking,
+        Booking,
+        Hold { expires_at: Ms },
+    }
+
+    #[derive(Debug, Clone)]
+    struct GenInterval {
+        start: Ms,
+        end: Ms,
+        kind: GenKind,
+    }
+
+    fn kind_strategy() -> impl Strategy<Value = GenKind> {
+        // Concentrate expires_at ON and AROUND `now`: the `expires_at > now`
+        // boundary (AVAIL-11 — a hold at exactly `now` is expired) is a one-point
+        // edge that uniform sampling almost never hits. Without this weighting the
+        // test cannot distinguish `>` from `>=` (a mutation that proved exactly
+        // this slipped through before the weighting was added).
+        let expires = prop_oneof![
+            3 => Just(NOW),
+            3 => NOW - 2..=NOW + 2,
+            1 => 0i64..2 * NOW,
+        ];
+        prop_oneof![
+            Just(GenKind::NonBlocking),
+            Just(GenKind::Blocking),
+            Just(GenKind::Booking),
+            expires.prop_map(|e| GenKind::Hold { expires_at: e }),
+        ]
+    }
+
+    fn interval_strategy() -> impl Strategy<Value = GenInterval> {
+        (0i64..RANGE - 1, 1i64..=12, kind_strategy()).prop_map(|(start, len, kind)| GenInterval {
+            start,
+            end: (start + len).min(RANGE),
+            kind,
+        })
+    }
+
+    fn span_strategy() -> impl Strategy<Value = Span> {
+        (0i64..RANGE - 1, 1i64..=12).prop_map(|(start, len)| Span::new(start, (start + len).min(RANGE)))
+    }
+
+    fn to_interval(g: &GenInterval) -> Interval {
+        Interval {
+            id: ulid::Ulid::new(),
+            span: Span::new(g.start, g.end),
+            kind: match &g.kind {
+                GenKind::NonBlocking => IntervalKind::NonBlocking,
+                GenKind::Blocking => IntervalKind::Blocking,
+                GenKind::Booking => IntervalKind::Booking { label: None },
+                GenKind::Hold { expires_at } => IntervalKind::Hold { expires_at: *expires_at },
+            },
+        }
+    }
+
+    /// Brute-force reference: independent of the production algorithm.
+    fn reference(
+        intervals: &[Interval],
+        capacity: u32,
+        buffer: Ms,
+        inherited_nb: &[Span],
+        inherited_b: &[Span],
+        query: &Span,
+        now: Ms,
+    ) -> Vec<Span> {
+        // OVERRIDE rule (AVAIL): own non-blocking, if any overlaps the query, fully
+        // replaces inherited non-blocking as the base of what is open.
+        let own_nb_present = intervals
+            .iter()
+            .any(|i| matches!(i.kind, IntervalKind::NonBlocking) && i.span.overlaps(query));
+
+        let mut runs = Vec::new();
+        let mut run_start: Option<Ms> = None;
+
+        for t in query.start..query.end {
+            let open = if own_nb_present {
+                intervals
+                    .iter()
+                    .any(|i| matches!(i.kind, IntervalKind::NonBlocking) && i.span.contains_instant(t))
+            } else {
+                inherited_nb.iter().any(|s| s.contains_instant(t))
+            };
+
+            let blocked = intervals
+                .iter()
+                .any(|i| matches!(i.kind, IntervalKind::Blocking) && i.span.contains_instant(t))
+                || inherited_b.iter().any(|s| s.contains_instant(t));
+
+            // ACCUMULATE rule: count live allocations (bookings + unexpired holds),
+            // each extended by the buffer. Capacity is the max concurrent count.
+            // No query gate — an allocation occupies `[start, end + buffer)` wherever
+            // that lands, including a buffer tail that reaches past `query.start`.
+            let active = intervals
+                .iter()
+                .filter(|i| {
+                    let is_live = match &i.kind {
+                        IntervalKind::Booking { .. } => true,
+                        IntervalKind::Hold { expires_at } => *expires_at > now,
+                        _ => false,
+                    };
+                    is_live && i.span.start <= t && t < i.span.end + buffer
+                })
+                .count() as u32;
+
+            let free = open && !blocked && active < capacity;
+
+            match (free, run_start) {
+                (true, None) => run_start = Some(t),
+                (false, Some(s)) => {
+                    runs.push(Span::new(s, t));
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = run_start.take() {
+            runs.push(Span::new(s, query.end));
+        }
+        runs
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
+
+        #[test]
+        fn availability_matches_brute_force_reference(
+            gen_intervals in prop::collection::vec(interval_strategy(), 0..12),
+            capacity in 1u32..=3,
+            buffer in 0i64..=8,
+            // A sub-window query (start > 0) exercises rule-clamping and the
+            // buffer-straddle path: allocations before the window whose buffer
+            // tail reaches into it must still subtract.
+            q_start in 0i64..RANGE / 2,
+            gen_inherited_nb in prop::collection::vec(span_strategy(), 0..4),
+            gen_inherited_b in prop::collection::vec(span_strategy(), 0..4),
+        ) {
+            let query = Span::new(q_start, RANGE);
+            let intervals: Vec<Interval> = gen_intervals.iter().map(to_interval).collect();
+
+            // collect_inherited_rules always clamps inherited spans to the query
+            // window before they reach availability(); mirror that contract here.
+            let clamp = |spans: &[Span]| -> Vec<Span> {
+                spans
+                    .iter()
+                    .filter_map(|s| {
+                        let start = s.start.max(query.start);
+                        let end = s.end.min(query.end);
+                        (start < end).then(|| Span::new(start, end))
+                    })
+                    .collect()
+            };
+            let inherited_nb = clamp(&gen_inherited_nb);
+            let inherited_b = clamp(&gen_inherited_b);
+
+            let mut rs = ResourceState::new(ulid::Ulid::new(), None, None, capacity, Some(buffer));
+            for i in &intervals {
+                rs.insert_interval(i.clone());
+            }
+
+            let got = availability(&rs, &query, &inherited_nb, &inherited_b, NOW);
+            let want = reference(&intervals, capacity, buffer, &inherited_nb, &inherited_b, &query, NOW);
+
+            prop_assert_eq!(got, want);
+        }
     }
 }
