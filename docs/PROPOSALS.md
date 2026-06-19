@@ -3,37 +3,36 @@
 Forward-looking ideas surfaced while building the demos. Not built yet; captured so the design
 intent isn't lost. `docs/REQUIREMENTS.md` remains authoritative for what's implemented.
 
-## SYNC-01 — Synchronous (contiguous, stable-unit) availability
+## SYNC-01 — Synchronous (contiguous, stable-unit) availability ✅ ALREADY GUARANTEED
 
-**Problem.** The capacity sweep answers "is *a* unit free in window W?" (AVAIL-01/AVAIL-06). It
-does **not** answer "is *the same* unit free across N consecutive windows?" For a capacity-N pool
-of interchangeable units, the engine may report a window bookable on each of three nights even
-though no *single* unit is free all three nights — i.e. you could only honour it by making the
-guest switch units between nights. Real venues forbid that: a hotel guest keeps one room for the
-stay; a desk-booker wants the same desk all week.
+**The question.** For a capacity-N pool of interchangeable units, can a stay occupy *the same*
+unit across N consecutive periods — i.e. without the guest switching rooms mid-stay? Real venues
+require it (a hotel guest keeps one room; a desk-booker wants the same desk all week).
 
-This is **not** hotel-specific — it's the multi-period generalisation of the capacity sweep, and
-applies to any capacity-N resource booked over a sequence (hotel room-types, rental fleets,
-recurring desk/locker bookings, multi-session course seats).
+**Finding: the capacity sweep already guarantees this — no new primitive needed.** A stay is a
+single interval booked against the pool. Bookings on a pool form an **interval graph**, whose
+chromatic number equals its maximum clique (max concurrent overlap). So **a stable single unit is
+free for a whole span ⟺ the max concurrent occupancy over that span is `< capacity`** — which is
+*exactly* what `check_no_conflict` / the saturation sweep already enforce when a stay is committed
+as one booking (AVAIL-01/AVAIL-06). The worry that "each of three nights reads free yet no single
+unit is free all three" cannot occur: if every instant in the span has `< N` booked, the intervals
+are N-colourable and one colour (unit) stays free across the whole span.
 
-**Proposed primitive.** Given a capacity-N resource, a sequence of periods `P₁..Pₖ` (e.g. nights),
-and a required run length `r`, return the placements where a *single notional unit* is free for
-`r` consecutive periods. Concretely: model the N units as an assignment problem over the periods —
-a contiguous run of length `r` is satisfiable iff a matching exists that keeps one unit assigned to
-the whole run without exceeding capacity in any period. The sweep already yields per-period
-occupancy `occ(Pᵢ)`; a run `[Pᵢ, Pᵢ₊ᵣ)` is **stable-unit available** iff `occ(Pⱼ) < N` for every
-`j` in the run AND the committed bookings can be packed so one unit stays free across the run
-(for interchangeable units the first condition is necessary; the packing check handles the case
-where existing multi-period bookings fragment the units).
+Corollaries, both already supported:
+- **Booking** a multi-night stay as one `[check-in, check-out)` booking on the pool is accepted iff
+  a stable unit exists, and rejected (would require a switch) otherwise — automatically.
+- **Listing** the stable multi-night openings = `availability(resource, horizon, min_duration = run)`
+  (AVAIL-15) — the free runs long enough to fit the stay on one unit.
 
-**Why it belongs in the kernel.** It's pure interval/capacity math over the same `Span` +
-`ResourceState.capacity` the engine already owns — defining it once gives every edge (hotel,
-fleet, desks) correct "no-switching" availability instead of each frontend re-deriving it (badly).
+**Locked by test:** `sync_stable_unit_multi_night_availability` (engine/tests.rs) — capacity-2 pool,
+two overlapping stays saturate the middle night; a 3-night stay across it is rejected, a clear stay
+is accepted, and `compute_availability(.., Some(2 nights))` lists exactly the stable openings.
 
-**Sketch API.** `synchronous_availability(resource, periods: &[Span], run: usize) -> Vec<Span>`
-(or a `min_consecutive` arg on the existing availability query). Red→green tests: 5 double-rooms
-intermittently booked → a 3-night run is offered only where a single room is genuinely free all
-three nights, not where coverage requires a switch.
+**The genuinely-open extension: named-unit assignment.** The pool model answers "*a* unit," not
+"room 207." Telling a guest *which* physical room (and keeping that stable across the stay) is the
+real future work — either model each unit as a capacity-1 child (N resources, fully named) or add a
+thin assignment layer that pins a stay to a concrete unit id. That's a product/edge decision on the
+assigned-vs-pool axis, not a gap in the availability math.
 
 ## EDGE-GCAL — Google Calendar adapter (read-through)
 

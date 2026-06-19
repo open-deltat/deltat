@@ -2154,6 +2154,44 @@ async fn batch_capacity_accounts_for_committed_load() {
 }
 
 #[tokio::test]
+async fn sync_stable_unit_multi_night_availability() {
+    // SYNC-01: a capacity-2 pool = 2 interchangeable rooms. Two overlapping multi-night stays
+    // saturate the middle night; a longer stay spanning it would require switching rooms, so it
+    // must be rejected — while a stay clear of it fits on a single stable room. The capacity
+    // sweep already guarantees this: a stay is ONE interval, and max-overlap < capacity over its
+    // span ⟺ a stable unit exists for the whole span (interval-graph colouring; chromatic
+    // number = max clique). No new primitive needed; this test locks the guarantee.
+    let path = test_wal_path("sync_stable.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 2, None).await.unwrap();
+    let day = 24 * H;
+    engine.add_rule(Ulid::new(), rid, Span::new(0, 10 * day), false).await.unwrap();
+
+    // Stay A: nights 1–3, Stay B: nights 2–4 → night [2,3) is fully booked (2 of 2).
+    engine.confirm_booking(Ulid::new(), rid, Span::new(day, 3 * day), None).await.unwrap();
+    engine.confirm_booking(Ulid::new(), rid, Span::new(2 * day, 4 * day), None).await.unwrap();
+
+    // A 3-night stay across the saturated night would need a 3rd room → rejected.
+    assert!(engine
+        .confirm_booking(Ulid::new(), rid, Span::new(day, 4 * day), None)
+        .await
+        .is_err());
+
+    // A stay clear of the saturated night fits on a stable room.
+    engine
+        .confirm_booking(Ulid::new(), rid, Span::new(5 * day, 8 * day), None)
+        .await
+        .unwrap();
+
+    // Availability with a 2-night minimum lists exactly the stable multi-night openings:
+    // everything except the saturated night [2,3) → [0,2) and [3,10).
+    let openings = engine.compute_availability(rid, 0, 10 * day, Some(2 * day)).await.unwrap();
+    assert_eq!(openings, vec![Span::new(0, 2 * day), Span::new(3 * day, 10 * day)]);
+}
+
+#[tokio::test]
 async fn capacity_availability_shows_partial_slots() {
     let path = test_wal_path("cap_avail.wal");
     let notify = Arc::new(NotifyHub::new());
