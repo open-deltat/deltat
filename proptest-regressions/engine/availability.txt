@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 06d8092291ade22c49ae0b6989867d41929ab58deae3f85c36f24851c7489a3e # shrinks to gen_intervals = [GenInterval { start: 13, end: 24, kind: NonBlocking }, GenInterval { start: 7, end: 16, kind: Booking }], capacity = 1, buffer = 8, q_start = 16, gen_inherited_nb = [], gen_inherited_b = []
+cc 2058ac6a5a9f1dcc83f8c648ca9d3b1abebaae590921f01ea8454abb4239477d # shrinks to gen_intervals = [GenInterval { start: 1, end: 4, kind: Booking }, GenInterval { start: 10, end: 11, kind: NonBlocking }, GenInterval { start: 0, end: 3, kind: Booking }], capacity = 2, buffer = 8, q_start = 0, gen_inherited_nb = [], gen_inherited_b = []
+cc d608ca000d059023373d0d3ff9a30798db03755f44f89bb7dbef14776e6320ae # shrinks to gen_intervals = [GenInterval { start: 13, end: 19, kind: Hold { expires_at: 1000 } }, GenInterval { start: 9, end: 18, kind: NonBlocking }], capacity = 1, buffer = 0, q_start = 0, gen_inherited_nb = [], gen_inherited_b = []
