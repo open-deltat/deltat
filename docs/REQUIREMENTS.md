@@ -21,6 +21,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 
 ## VISION — the North Star (what we want this to become)
 
+- **VIS-00** ✅ **Premise — scheduling is 1-D collision detection.** A booking is a segment on the number line of Unix time; a conflict is two segments overlapping on one line. Every concept (capacity = how many segments stack on a point, buffer = a forced gap, rule = an open/closed region, hold = a segment with a self-destruct timer, availability = the gaps between segments) is an extension of that one primitive. It is **not** literal 2-D: deltat is **N coupled 1-D timelines keyed by an opaque resource id, bound by batch atomicity** — the resource axis is a categorical lock key, not a metric dimension (see V2-DESIGN "is it 2D collisions?"). The atomicity, not a second dimension, is the load-bearing property.
 - **VIS-01** ⏸ One universal booking/scheduling protocol that can replace siloed booking systems.
 - **VIS-02** ⏸ A **confederation** of independent self-hostable servers anyone can join (like email / the web), no central gatekeeper.
 - **VIS-03** ⏸ **AI-native discovery**: any AI agent can search the federation for "bookable X near me, free at T" and book it.
