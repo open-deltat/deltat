@@ -1,4 +1,6 @@
 pub mod auth;
+pub mod clock;
+pub mod command;
 pub mod engine;
 pub mod limits;
 pub mod model;

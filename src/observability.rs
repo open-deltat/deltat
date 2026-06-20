@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::sql::Command;
+use crate::command::Command;
 
 // ── RED metrics (request-driven) ────────────────────────────────
 

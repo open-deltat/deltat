@@ -27,7 +27,14 @@ metrics-exporter-prometheus = { version = "0.16", features = ["http-listener"] }
 [dev-dependencies]
 tokio-test = "0.4"
 tokio-postgres = "0.7"
+proptest = "1"
 
 [[bench]]
 name = "stress"
 harness = false
+
+# Surface arithmetic overflow as a panic (not a silent wrap) even in release, so a slipped-through
+# out-of-range value fails loudly instead of corrupting a span. Boundary validation + saturating
+# arithmetic keep this from firing on the hot path.
+[profile.release]
+overflow-checks = true
