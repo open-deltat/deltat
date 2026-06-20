@@ -30,7 +30,8 @@ use crate::auth::DeltaTAuthSource;
 use crate::engine::Engine;
 use crate::limits::{MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
 use crate::model::*;
-use crate::sql::{self, Command};
+use crate::command::Command;
+use crate::sql;
 use crate::tenant::TenantManager;
 
 // ── Subscription plumbing ────────────────────────────────────────
