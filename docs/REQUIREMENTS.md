@@ -262,6 +262,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 - **FED-06** ⏸ Geo lives in the **indexer edge only**; one scheme (**S2**); cell-covering radius fan-out.
 - **FED-07** ⏸ Cross-node multi-resource atomicity is an **unsolved saga** — documented, not faked. Mitigation: co-locate a booker's calendar with what they book.
 - **FED-08** ❌ Building any federation/relay/indexer/identity/signing code before a real second operator exists.
+- **FED-09** ✅ (principle/truth) **Availability composition is topology-free; only booking isn't.** Combining N parties is a *commutative + associative* intersection of free-interval lists (the `min_available` sweep, `queries.rs`), so it gives the same answer chained person→person or gathered by one per-request coordinator, over lists from any tenant/server — the in-tenant `compute_multi_availability` and a cross-home edge run the *identical* sweep. The **read is portable data** (no kernel cross-tenant join). The **write isn't**: booking must fan out and commit at each home (FED-02/03). So the coordinator is *per-request*, not a central authority; each home stays the source of truth for its own calendar and bookings.
 
 ---
 
