@@ -6,6 +6,8 @@ mod queries;
 mod store;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verify;
 
 pub use availability::{availability, compute_saturated_spans, merge_overlapping, subtract_intervals};
 pub use error::EngineError;
@@ -18,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use ulid::Ulid;
 
+use crate::clock::{Clock, SystemClock};
 use crate::model::*;
 use crate::notify::NotifyHub;
 use crate::wal::Wal;
@@ -137,10 +140,21 @@ pub struct Engine {
     pub(super) store: InMemoryStore,
     pub(super) wal_tx: mpsc::Sender<WalCommand>,
     pub notify: Arc<NotifyHub>,
+    clock: Arc<dyn Clock>,
 }
 
 impl Engine {
     pub fn new(wal_path: PathBuf, notify: Arc<NotifyHub>) -> std::io::Result<Self> {
+        Self::with_clock(wal_path, notify, Arc::new(SystemClock))
+    }
+
+    /// Construct with an explicit clock. Tests and simulations inject a deterministic
+    /// clock here; `new` uses the real wall clock.
+    pub fn with_clock(
+        wal_path: PathBuf,
+        notify: Arc<NotifyHub>,
+        clock: Arc<dyn Clock>,
+    ) -> std::io::Result<Self> {
         let events = Wal::replay(&wal_path)?;
         let wal = Wal::open(&wal_path)?;
         let (wal_tx, wal_rx) = mpsc::channel(4096);
@@ -151,6 +165,7 @@ impl Engine {
             store,
             wal_tx,
             notify,
+            clock,
         };
 
         // Replay events — we're the sole owner of these Arcs, so try_read/try_write
@@ -209,6 +224,12 @@ impl Engine {
 
     pub fn get_resource_for_entity(&self, entity_id: &Ulid) -> Option<Ulid> {
         self.store.get_resource_for_entity(entity_id)
+    }
+
+    /// Current time in UTC Unix milliseconds, taken from the injected clock — the single
+    /// point through which the whole engine reads "now".
+    pub fn now_ms(&self) -> Ms {
+        self.clock.now_ms()
     }
 
     /// WAL-append + apply + notify in one call. Eliminates the repeated 3-line pattern.

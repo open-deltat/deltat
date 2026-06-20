@@ -10,10 +10,7 @@ pub async fn run_reaper(engine: Arc<Engine>) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = engine.now_ms();
         let expired = engine.collect_expired_holds(now);
         for (hold_id, _resource_id) in expired {
             match engine.release_hold(hold_id).await {
@@ -32,10 +29,7 @@ pub async fn run_gc(engine: Arc<Engine>, retention_ms: i64) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         interval.tick().await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = engine.now_ms();
         let collected = engine.gc_past_intervals(now, retention_ms);
         if collected > 0 {
             info!("GC collected {collected} intervals");
@@ -90,10 +84,7 @@ mod tests {
             .await
             .unwrap();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = engine.now_ms();
         let hold_id = Ulid::new();
 
         // Place a hold that expires immediately

@@ -39,6 +39,8 @@ Human-readable time is a display concern that belongs in the client. The databas
 
 A single Rust binary that speaks PostgreSQL. No Postgres underneath — it's a purpose-built in-memory engine backed by an append-only WAL. Connect with any Postgres client.
 
+> The PostgreSQL wire protocol is the current transport; a v2 framed protocol (+ HTTP/MCP) is planned (see `docs/REQUIREMENTS.md`).
+
 - Sub-millisecond availability queries
 - Hierarchical resources (Flight → Cabin → Seat)
 - Capacity, buffers, holds with auto-expiry
