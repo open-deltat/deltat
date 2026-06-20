@@ -107,6 +107,41 @@ async fn connect_and_query() {
 }
 
 #[tokio::test]
+async fn inverted_span_errors_without_panicking() {
+    // T-01 / SEC-09: untrusted SQL with end < start must be rejected cleanly, never panic the
+    // connection task (which the old Span::new assert! did).
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let rid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+
+    // A booking with end < start is invalid input — must return an error, not crash.
+    let bid = Ulid::new();
+    let bad = client
+        .batch_execute(&format!(
+            r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{bid}', '{rid}', 2000, 1000)"#
+        ))
+        .await;
+    assert!(bad.is_err(), "inverted-span booking should error");
+
+    // An inverted availability window returns empty, not a panic.
+    let avail = client
+        .simple_query(&format!(
+            r#"SELECT * FROM availability WHERE resource_id = '{rid}' AND start >= 2000 AND "end" <= 1000"#
+        ))
+        .await;
+    assert!(avail.is_ok(), "inverted availability window must not panic");
+
+    // The decisive check: the connection is still alive after the bad input (no panic killed the task).
+    let rows = client.simple_query("SELECT * FROM resources").await.unwrap();
+    assert!(!rows.is_empty(), "connection survived the rejected input");
+}
+
+#[tokio::test]
 async fn listen_receives_notification() {
     let (addr, _tm) = start_test_server().await;
 
@@ -640,6 +675,10 @@ async fn hold_bubbles_to_parent() {
     // Place hold on child
     let (client2, _) = connect(addr).await;
     let hold_id = Ulid::new();
+    // Integration-test fixture computing a real hold expiry over the SQL path. The Clock
+    // seam bans ambient time in the engine, not in external test clients; this whole
+    // client-supplied-expiry pattern goes away when expiry becomes authority-assigned.
+    #[allow(clippy::disallowed_methods)]
     let expires = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
