@@ -28,7 +28,7 @@ pub fn availability(
     // buffer-expanded window (mirrors check_no_conflict) so the read path agrees
     // with the write path. Rules carry no buffer, so they only count when they
     // overlap the real query. MIN_VALID_TIMESTAMP_MS is 0, so this stays valid.
-    let scan = Span::new((query.start - buffer).max(0), query.end);
+    let scan = Span::new(query.start.saturating_sub(buffer).max(0), query.end);
 
     for interval in resource.overlapping(&scan) {
         match &interval.kind {
@@ -47,13 +47,13 @@ pub fn availability(
                 }
             }
             IntervalKind::Hold { expires_at } if *expires_at > now => {
-                let effective_end = interval.span.end + buffer;
+                let effective_end = interval.span.end.saturating_add(buffer);
                 if effective_end > query.start {
                     active_allocs.push(Span::new(interval.span.start, effective_end));
                 }
             }
             IntervalKind::Booking { .. } => {
-                let effective_end = interval.span.end + buffer;
+                let effective_end = interval.span.end.saturating_add(buffer);
                 if effective_end > query.start {
                     active_allocs.push(Span::new(interval.span.start, effective_end));
                 }
@@ -394,6 +394,26 @@ mod tests {
     }
 
     #[test]
+    fn huge_buffer_does_not_overflow() {
+        // Defense-in-depth: a resource carrying an absurd buffer (as could arrive by replaying a WAL
+        // written before buffer validation existed) must compute availability via saturating
+        // arithmetic. Without it, `span.end + buffer` overflows i64 and panics (debug overflow checks
+        // / release overflow-checks) — the DoS the boundary validation closes on the write path.
+        let ten = 10 * H;
+        let eleven = 11 * H;
+        let rs = make_resource_with_capacity(
+            vec![rule(0, 24 * H, false), booking(ten, eleven)],
+            1,
+            Some(i64::MAX),
+        );
+        let query = Span::new(0, 12 * H);
+        let free = availability(&rs, &query, &[], &[], 0);
+        // The point is that it returns instead of panicking; the booking's saturated tail swallows
+        // everything from 10:00 on, leaving only the morning.
+        assert_eq!(free, vec![Span::new(0, ten)]);
+    }
+
+    #[test]
     fn blocking_rule_subtracts() {
         let nine = 9 * H;
         let ten = 10 * H;
@@ -582,7 +602,7 @@ mod spec {
                         IntervalKind::Hold { expires_at } => *expires_at > now,
                         _ => false,
                     };
-                    is_live && i.span.start <= t && t < i.span.end + buffer
+                    is_live && i.span.start <= t && t < i.span.end.saturating_add(buffer)
                 })
                 .count() as u32;
 

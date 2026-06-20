@@ -14,13 +14,34 @@ pub(crate) fn validate_span(span: &Span) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// A turnaround buffer is a non-negative duration. Bound it so `span.end + buffer` can never
+/// approach i64::MAX (which would overflow the effective-span arithmetic and panic the task).
+pub(crate) fn validate_buffer(buffer_after: Option<Ms>) -> Result<(), EngineError> {
+    use crate::limits::*;
+    if let Some(b) = buffer_after
+        && !(0..=MAX_SPAN_DURATION_MS).contains(&b)
+    {
+        return Err(EngineError::LimitExceeded("buffer_after out of range"));
+    }
+    Ok(())
+}
+
+/// A standalone timestamp (e.g. a hold's expires_at) must sit inside the valid window.
+pub(crate) fn validate_timestamp(ts: Ms) -> Result<(), EngineError> {
+    use crate::limits::*;
+    if !(MIN_VALID_TIMESTAMP_MS..=MAX_VALID_TIMESTAMP_MS).contains(&ts) {
+        return Err(EngineError::LimitExceeded("timestamp out of range"));
+    }
+    Ok(())
+}
+
 pub(crate) fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Result<(), EngineError> {
     let buffer = rs.buffer_after.unwrap_or(0);
     // Expand the search window to catch:
     // - Existing allocations whose end + buffer > span.start (search backwards by buffer)
     // - Our allocation's end + buffer reaching into existing allocations
-    let search_start = (span.start - buffer).max(0);
-    let search_end = span.end + buffer;
+    let search_start = span.start.saturating_sub(buffer).max(0);
+    let search_end = span.end.saturating_add(buffer);
     let search_span = Span::new(search_start, search_end);
 
     if rs.capacity <= 1 {
@@ -29,7 +50,7 @@ pub(crate) fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Res
             match &interval.kind {
                 IntervalKind::Hold { expires_at } if *expires_at <= now => continue,
                 IntervalKind::Hold { .. } | IntervalKind::Booking { .. } => {
-                    let effective_end = interval.span.end + buffer;
+                    let effective_end = interval.span.end.saturating_add(buffer);
                     let effective = Span::new(interval.span.start, effective_end);
                     if effective.overlaps(span) {
                         return Err(EngineError::Conflict(interval.id));
@@ -64,14 +85,14 @@ pub(crate) fn check_batch_capacity(
 ) -> Result<(), EngineError> {
     let buffer = rs.buffer_after.unwrap_or(0);
     let lo = spans.iter().map(|s| s.start).min().unwrap_or(0);
-    let hi = spans.iter().map(|s| s.end + buffer).max().unwrap_or(lo + 1);
-    let window = Span::new((lo - buffer).max(0), hi);
+    let hi = spans.iter().map(|s| s.end.saturating_add(buffer)).max().unwrap_or(lo + 1);
+    let window = Span::new(lo.saturating_sub(buffer).max(0), hi);
 
     // Combine already-committed active allocations (buffer-extended) with all batch members,
     // then look for any region where the concurrent count EXCEEDS capacity (>= capacity + 1).
     let mut allocs = collect_active_allocs_with_buffer(rs, &window, now, buffer);
     for s in spans {
-        allocs.push(Span::new(s.start, s.end + buffer));
+        allocs.push(Span::new(s.start, s.end.saturating_add(buffer)));
     }
     allocs.sort_by_key(|s| s.start);
 
@@ -93,7 +114,7 @@ fn collect_active_allocs_with_buffer(
         match &interval.kind {
             IntervalKind::Hold { expires_at } if *expires_at <= now => continue,
             IntervalKind::Hold { .. } | IntervalKind::Booking { .. } => {
-                let effective_end = interval.span.end + buffer;
+                let effective_end = interval.span.end.saturating_add(buffer);
                 allocs.push(Span::new(interval.span.start, effective_end));
             }
             _ => {}

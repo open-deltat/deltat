@@ -1,5 +1,5 @@
 use super::*;
-use super::conflict::validate_span;
+use super::conflict::{validate_buffer, validate_span, validate_timestamp};
 use crate::clock::{now_ms, TestClock};
 use crate::limits::*;
 
@@ -4193,6 +4193,67 @@ fn validate_span_at_max_timestamp_boundary() {
 fn validate_span_at_max_duration_boundary() {
     let span = Span::new(0, MAX_SPAN_DURATION_MS);
     assert!(validate_span(&span).is_ok());
+}
+
+#[test]
+fn validate_buffer_bounds() {
+    assert!(validate_buffer(None).is_ok());
+    assert!(validate_buffer(Some(0)).is_ok());
+    assert!(validate_buffer(Some(MAX_SPAN_DURATION_MS)).is_ok());
+    assert!(matches!(
+        validate_buffer(Some(-1)),
+        Err(EngineError::LimitExceeded("buffer_after out of range"))
+    ));
+    assert!(matches!(
+        validate_buffer(Some(MAX_SPAN_DURATION_MS + 1)),
+        Err(EngineError::LimitExceeded("buffer_after out of range"))
+    ));
+    assert!(matches!(
+        validate_buffer(Some(i64::MAX)),
+        Err(EngineError::LimitExceeded("buffer_after out of range"))
+    ));
+}
+
+#[test]
+fn validate_timestamp_bounds() {
+    assert!(validate_timestamp(MIN_VALID_TIMESTAMP_MS).is_ok());
+    assert!(validate_timestamp(MAX_VALID_TIMESTAMP_MS).is_ok());
+    assert!(validate_timestamp(-1).is_err());
+    assert!(validate_timestamp(i64::MAX).is_err());
+}
+
+#[tokio::test]
+async fn create_resource_rejects_overflowing_buffer() {
+    // Regression: an out-of-range buffer_after used to flow into `span.end + buffer` and panic the
+    // connection task on every booking/availability query (integer overflow → DoS). It must be
+    // rejected at the boundary instead.
+    let path = test_wal_path("buffer_overflow_reject.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let result = engine
+        .create_resource(Ulid::new(), None, None, 1, Some(i64::MAX))
+        .await;
+    assert!(matches!(
+        result,
+        Err(EngineError::LimitExceeded("buffer_after out of range"))
+    ));
+}
+
+#[tokio::test]
+async fn place_hold_rejects_out_of_range_expiry() {
+    let path = test_wal_path("hold_expiry_reject.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(0, 10_000), false).await.unwrap();
+    let result = engine
+        .place_hold(Ulid::new(), rid, Span::new(100, 200), i64::MAX)
+        .await;
+    assert!(matches!(
+        result,
+        Err(EngineError::LimitExceeded("timestamp out of range"))
+    ));
 }
 
 #[tokio::test]
