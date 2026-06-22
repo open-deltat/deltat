@@ -548,7 +548,11 @@ fn parse_i64_expr(expr: &Expr) -> Result<i64, SqlError> {
         expr,
     } = expr
     {
-        Ok(-parse_i64_expr(expr)?)
+        // checked_neg so negating i64::MIN cannot overflow-panic. (The inner literal parse already
+        // rejects i64::MAX+1, so this is belt-and-suspenders, but it makes the safety self-evident.)
+        parse_i64_expr(expr)?
+            .checked_neg()
+            .ok_or_else(|| SqlError::Parse("integer literal out of range".into()))
     } else {
         Err(SqlError::Parse(format!("expected value, got {expr:?}")))
     }
