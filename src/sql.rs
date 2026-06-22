@@ -255,6 +255,11 @@ fn extract_availability_filters(
                     f.min_duration = Some(parse_i64_expr(right)?);
                 } else if col.as_deref() == Some("min_available") {
                     let v = parse_i64_expr(right)?;
+                    if v < 0 {
+                        return Err(SqlError::Unsupported(
+                            "min_available must be non-negative".into(),
+                        ));
+                    }
                     f.min_available = Some(v as usize);
                 }
             }

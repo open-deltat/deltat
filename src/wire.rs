@@ -817,27 +817,63 @@ pub async fn process_connection(
     Ok(())
 }
 
+/// Result-column schema for a Describe, derived from the parsed SQL rather than scanning the
+/// text. This runs at Describe time when `$N` placeholders are still unbound, so the statement
+/// cannot be value-parsed into a Command yet; inspecting the AST's target table avoids both
+/// that limitation and the false matches a substring scan would make against string literals.
 fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
-    let upper = sql.to_uppercase();
-    if !upper.contains("SELECT") {
+    use sqlparser::ast::{ObjectNamePart, SetExpr, Statement, TableFactor};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
         return vec![];
-    }
-    if upper.contains("AVAILABILITY") {
-        if upper.contains(" IN ") {
-            multi_availability_schema()
-        } else {
-            availability_schema()
+    };
+    let Some(Statement::Query(query)) = statements.first() else {
+        return vec![];
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return vec![];
+    };
+    let Some(from) = select.from.first() else {
+        return vec![];
+    };
+    let TableFactor::Table { name, .. } = &from.relation else {
+        return vec![];
+    };
+    let Some(ObjectNamePart::Identifier(table)) = name.0.last() else {
+        return vec![];
+    };
+
+    // Fold case to match the execution path, which lowercases identifiers (sql.rs), so a Describe
+    // of `BOOKINGS` returns the same schema the query will produce.
+    match table.value.to_lowercase().as_str() {
+        "availability" => {
+            // Multi-resource availability (resource_id IN (...)) merges resources, so it has a
+            // narrower schema than the single-resource form.
+            if select.selection.as_ref().is_some_and(selection_has_in_list) {
+                multi_availability_schema()
+            } else {
+                availability_schema()
+            }
         }
-    } else if upper.contains("RESOURCES") {
-        resources_schema()
-    } else if upper.contains("RULES") {
-        rules_schema()
-    } else if upper.contains("BOOKINGS") {
-        bookings_schema()
-    } else if upper.contains("HOLDS") {
-        holds_schema()
-    } else {
-        vec![]
+        "resources" => resources_schema(),
+        "rules" => rules_schema(),
+        "bookings" => bookings_schema(),
+        "holds" => holds_schema(),
+        _ => vec![],
+    }
+}
+
+fn selection_has_in_list(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::InList { .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            selection_has_in_list(left) || selection_has_in_list(right)
+        }
+        Expr::Nested(inner) => selection_has_in_list(inner),
+        _ => false,
     }
 }
 
@@ -950,6 +986,18 @@ mod tests {
         let schema = schema_for_sql("SELECT * FROM holds WHERE resource_id = $1");
         assert_eq!(schema.len(), 5);
         assert_eq!(schema[4].name(), "expires_at");
+    }
+
+    #[test]
+    fn schema_for_select_is_case_insensitive() {
+        // The execution path lowercases identifiers, so a Describe of a mixed or upper-case table
+        // must return the same schema the query will produce, not an empty one.
+        let single = schema_for_sql("SELECT * FROM BOOKINGS WHERE resource_id = $1");
+        assert_eq!(single.len(), 5);
+        assert_eq!(single[4].name(), "label");
+
+        let multi = schema_for_sql("SELECT * FROM Availability WHERE resource_id IN ($1, $2)");
+        assert_eq!(multi.len(), 2);
     }
 
     #[test]
