@@ -178,19 +178,32 @@ All times are **Unix milliseconds**. Intervals are half-open `[start, end)` — 
 | `DELTAT_BIND` | `0.0.0.0` | Bind address |
 | `DELTAT_DATA_DIR` | `./data` | WAL storage directory |
 | `DELTAT_PASSWORD` | `deltat` | Connection password |
+| `DELTAT_MAX_CONNECTIONS` | `256` | Concurrent connection cap |
+| `DELTAT_COMPACT_THRESHOLD` | `1000` | WAL appends before a compaction runs |
+| `DELTAT_GC_RETENTION_MS` | `604800000` | Age (7 days) past which finished bookings and expired holds are collected |
+| `DELTAT_METRICS_PORT` | unset | Prometheus `/metrics` port; metrics are off when unset |
+| `DELTAT_TLS_CERT` | unset | PEM certificate path; TLS is off unless both cert and key are set |
+| `DELTAT_TLS_KEY` | unset | PEM private key path; TLS is off unless both cert and key are set |
 
 ### Architecture
 
 ```
 src/
-  engine/       Availability computation, conflict detection, state mutations
-  model.rs      Core types: Span, Interval, ResourceState
-  sql.rs        SQL parser → command enum
-  wire.rs       pgwire protocol (simple + extended query)
-  wal.rs        Append-only write-ahead log
-  notify.rs     LISTEN/NOTIFY broadcast
-  reaper.rs     Hold expiration
-  main.rs       TCP listener
+  engine/          Availability computation, conflict detection, state mutations, queries
+  model.rs         Core types: Span, Interval, ResourceState, Event
+  command.rs       Transport-neutral command vocabulary (the v2 protocol target)
+  sql.rs           SQL parser, producing commands
+  wire.rs          pgwire protocol (simple + extended query)
+  wal.rs           Append-only write-ahead log with group commit
+  tenant.rs        Per-tenant engine + WAL, lazily created
+  notify.rs        LISTEN/NOTIFY broadcast
+  reaper.rs        Background hold expiration, WAL compaction, interval GC
+  clock.rs         Injected clock seam (deterministic in tests)
+  auth.rs          Cleartext password authentication
+  tls.rs           Optional rustls TLS
+  observability.rs Prometheus metrics (opt-in)
+  limits.rs        Hard caps (resources, intervals, query windows)
+  main.rs          TCP listener and configuration
 ```
 
 ### Client libraries
@@ -199,7 +212,7 @@ src/
 
 ### Demos
 
-The [tap](https://github.com/open-tap/tap) repo includes a Next.js demo app with interactive examples: airline seat booking, theater reservations, stadium events, calendar scheduling, multi-resource availability, and temporary holds.
+The [tap](https://github.com/open-tap/tap) repo includes a Next.js demo app with interactive examples spanning seat maps (airline, theater, stadium), multi-resource availability, recurring schedules, capacity pools, and hold-to-book flows.
 
 ## License
 
