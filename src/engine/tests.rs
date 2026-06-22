@@ -4932,3 +4932,71 @@ fn engine_never_exceeds_capacity_through_command_path() {
         }
     );
 }
+
+#[test]
+fn multi_availability_never_panics_on_arbitrary_inputs() {
+    // Extends the no-panic guarantee to the multi-resource sweep over several occupied resources:
+    // arbitrary thresholds and windows must never panic. In particular the segment-close guard must
+    // never construct a zero-width Span when coverage opens and closes at the same instant.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (engine, ids) = rt.block_on(async {
+        let path = test_wal_path("fuzz_multi_avail.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+        let mut ids = Vec::new();
+        for k in 0..4i64 {
+            let id = Ulid::new();
+            engine.create_resource(id, None, None, 2, None).await.unwrap();
+            engine
+                .add_rule(Ulid::new(), id, Span::new(0, 10_000), false)
+                .await
+                .unwrap();
+            let base = k * 1_000;
+            engine
+                .confirm_booking(Ulid::new(), id, Span::new(base, base + 1_500), None)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        (engine, ids)
+    });
+
+    proptest!(
+        ProptestConfig::with_cases(1500),
+        |(start in 0i64..6_000, end in 0i64..6_000, min_av in 1usize..=4, n in 1usize..=4)| {
+            let subset = &ids[..n.min(ids.len())];
+            let _ = rt.block_on(engine.compute_multi_availability(subset, start, end, min_av, None));
+        }
+    );
+}
+
+#[tokio::test]
+async fn availability_bounds_a_corrupt_over_deep_hierarchy() {
+    // create_resource caps depth, but WAL replay inserts resources directly without that check, so
+    // a crafted or corrupt store could exceed MAX_HIERARCHY_DEPTH. collect_inherited_rules must
+    // still bound its ancestor walk and reject it rather than loop unbounded.
+    let path = test_wal_path("corrupt_deep_hierarchy.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let mut parent = None;
+    let mut deepest = Ulid::new();
+    for _ in 0..MAX_HIERARCHY_DEPTH + 5 {
+        let id = Ulid::new();
+        engine.store.insert_resource(
+            id,
+            Arc::new(tokio::sync::RwLock::new(ResourceState::new(id, parent, None, 1, None))),
+        );
+        parent = Some(id);
+        deepest = id;
+    }
+
+    let result = engine.compute_availability(deepest, 0, 1_000, None).await;
+    assert!(matches!(
+        result,
+        Err(EngineError::LimitExceeded("hierarchy too deep"))
+    ));
+}
