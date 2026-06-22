@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 
 use crate::model::Event;
 
+/// Upper bound on a single WAL record's payload. A serialized `Event` is at most a few kilobytes
+/// (a label is capped at MAX_LABEL_LEN), so anything larger is a corrupt length prefix; replay
+/// treats it as corruption instead of allocating up to 4 GiB from an untrusted u32.
+const MAX_WAL_RECORD_BYTES: usize = 1 << 20; // 1 MiB
+
 /// Encode a single event to [len][bincode][crc32] format.
 fn encode_event(writer: &mut impl Write, event: &Event) -> io::Result<()> {
     let payload =
@@ -128,6 +133,11 @@ impl Wal {
                 Err(e) => return Err(e),
             }
             let len = u32::from_le_bytes(len_buf) as usize;
+            // Reject an implausible length before allocating, so a corrupt prefix cannot drive a
+            // multi-gigabyte allocation ahead of the CRC check. Trailing corruption ends replay.
+            if len > MAX_WAL_RECORD_BYTES {
+                break;
+            }
 
             // Read payload
             let mut payload = vec![0u8; len];
@@ -153,7 +163,10 @@ impl Wal {
             }
 
             match bincode::deserialize::<Event>(&payload) {
-                Ok(event) => events.push(event),
+                Ok(event) if event.spans_valid() => events.push(event),
+                // A CRC-valid record whose span violates start < end is a crafted or corrupt
+                // entry; bincode would otherwise admit it past Span::new's invariant. Stop here.
+                Ok(_) => break,
                 Err(_) => break, // corrupt payload
             }
         }
@@ -264,6 +277,54 @@ mod tests {
             f.write_all(&len.to_le_bytes()).unwrap();
             f.write_all(&payload).unwrap();
             f.write_all(&bad_crc.to_le_bytes()).unwrap();
+        }
+
+        let replayed = Wal::replay(&path).unwrap();
+        assert!(replayed.is_empty());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_rejects_oversized_length_prefix() {
+        let path = tmp_path("oversized_len.wal");
+        let _ = fs::remove_file(&path);
+
+        // A corrupt length prefix far larger than any real record must be rejected before any
+        // allocation, not drive a multi-gigabyte vec.
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+            f.write_all(b"trailing").unwrap();
+        }
+
+        let replayed = Wal::replay(&path).unwrap();
+        assert!(replayed.is_empty());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_rejects_inverted_span_record() {
+        let path = tmp_path("inverted_span.wal");
+        let _ = fs::remove_file(&path);
+
+        // A CRC-valid record whose span violates start < end (the engine never writes this, but a
+        // crafted or corrupt WAL could): replay must reject it rather than admit an inverted span.
+        let event = Event::BookingConfirmed {
+            id: Ulid::new(),
+            resource_id: Ulid::new(),
+            span: crate::model::Span { start: 2000, end: 1000 },
+            label: None,
+        };
+        {
+            let payload = bincode::serialize(&event).unwrap();
+            let len = payload.len() as u32;
+            let crc = crc32fast::hash(&payload);
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&len.to_le_bytes()).unwrap();
+            f.write_all(&payload).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
         }
 
         let replayed = Wal::replay(&path).unwrap();

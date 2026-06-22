@@ -2,6 +2,7 @@ use super::*;
 use super::conflict::{validate_buffer, validate_span, validate_timestamp};
 use crate::clock::{now_ms, TestClock};
 use crate::limits::*;
+use proptest::prelude::*;
 
 const H: Ms = 3_600_000; // 1 hour in ms
 const M: Ms = 60_000; // 1 minute in ms
@@ -4074,7 +4075,8 @@ async fn interval_limit_hold() {
     // Add one non-blocking rule to cover all holds
     engine.add_rule(Ulid::new(), rid, Span::new(0, (MAX_INTERVALS_PER_RESOURCE as i64 + 2) * 10), false).await.unwrap();
 
-    let far_future = i64::MAX / 2;
+    // The largest valid expiry instant; i64::MAX/2 is rejected by validate_timestamp (out of range).
+    let far_future = MAX_VALID_TIMESTAMP_MS;
     for i in 0..MAX_INTERVALS_PER_RESOURCE - 1 {
         let start = (i as i64) * 10;
         engine.place_hold(Ulid::new(), rid, Span::new(start, start + 5), far_future).await.unwrap();
@@ -4846,4 +4848,87 @@ async fn concurrent_bookings_on_capacity_one_admit_exactly_one() {
     }
     assert_eq!(admitted, 1);
     assert_eq!(conflicted, 7);
+}
+
+#[test]
+fn availability_never_panics_on_arbitrary_query_bounds() {
+    // PRIN-08: the read path must never panic on untrusted bounds, however extreme. Drive both
+    // availability functions with arbitrary i64 windows and arbitrary usize thresholds against a
+    // non-trivial resource. Any Ok or Err is acceptable; a panic fails the test.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (engine, id) = rt.block_on(async {
+        let path = test_wal_path("fuzz_avail_bounds.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+        let id = Ulid::new();
+        engine.create_resource(id, None, None, 3, None).await.unwrap();
+        engine
+            .add_rule(Ulid::new(), id, Span::new(0, 100_000_000), false)
+            .await
+            .unwrap();
+        engine
+            .confirm_booking(Ulid::new(), id, Span::new(1_000, 2_000), None)
+            .await
+            .unwrap();
+        (engine, id)
+    });
+
+    proptest!(
+        ProptestConfig::with_cases(1000),
+        |(start in any::<i64>(), end in any::<i64>(), min_av in any::<usize>())| {
+            let _ = rt.block_on(engine.compute_availability(id, start, end, None));
+            let _ = rt.block_on(engine.compute_multi_availability(&[id], start, end, min_av, None));
+        }
+    );
+}
+
+#[test]
+fn engine_never_exceeds_capacity_through_command_path() {
+    // INV-01 through the real mutation path (the spec's pending TEST-02, focused form): apply an
+    // arbitrary booking sequence to a capacity-K resource. The engine accepts some and rejects any
+    // that would breach capacity, so no instant may end up with more than K active bookings.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    proptest!(
+        ProptestConfig::with_cases(64),
+        |(raw in prop::collection::vec((0i64..20, 1i64..15), 1..25), capacity in 1u32..4)| {
+            let accepted: Vec<Span> = rt.block_on(async {
+                let path = test_wal_path(&format!("stateful_capacity_{}.wal", Ulid::new()));
+                let notify = Arc::new(NotifyHub::new());
+                let engine = Engine::new(path, notify).unwrap();
+                let id = Ulid::new();
+                engine
+                    .create_resource(id, None, None, capacity, None)
+                    .await
+                    .unwrap();
+                let mut accepted = Vec::new();
+                for (start_h, len_h) in &raw {
+                    let span = Span::new(start_h * H, (start_h + len_h) * H);
+                    if engine
+                        .confirm_booking(Ulid::new(), id, span, None)
+                        .await
+                        .is_ok()
+                    {
+                        accepted.push(span);
+                    }
+                }
+                accepted
+            });
+
+            for t in 0..40i64 {
+                let instant = t * H;
+                let active = accepted.iter().filter(|s| s.contains_instant(instant)).count() as u32;
+                prop_assert!(
+                    active <= capacity,
+                    "instant {instant}: {active} active exceeds capacity {capacity}"
+                );
+            }
+        }
+    );
 }

@@ -194,6 +194,21 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Whether every span this event carries is a valid half-open interval. Replay uses this to
+    /// reject a corrupt or crafted WAL record whose span would violate the `start < end` invariant
+    /// that `Span::new` enforces at the write boundary but bincode deserialization bypasses.
+    pub fn spans_valid(&self) -> bool {
+        match self {
+            Event::RuleAdded { span, .. }
+            | Event::RuleUpdated { span, .. }
+            | Event::HoldPlaced { span, .. }
+            | Event::BookingConfirmed { span, .. } => span.start < span.end,
+            _ => true,
+        }
+    }
+}
+
 // ── Query result types ───────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
