@@ -216,12 +216,20 @@ fn parse_select(query: &ast::Query) -> Result<Command, SqlError> {
             Ok(Command::SelectRules { resource_id })
         }
         "bookings" => {
-            let resource_id = extract_resource_id_filter(&select.selection)?;
-            Ok(Command::SelectBookings { resource_id })
+            let ids = extract_resource_ids_filter(&select.selection)?;
+            if let [resource_id] = ids[..] {
+                Ok(Command::SelectBookings { resource_id })
+            } else {
+                Ok(Command::SelectBookingsMulti { resource_ids: ids })
+            }
         }
         "holds" => {
-            let resource_id = extract_resource_id_filter(&select.selection)?;
-            Ok(Command::SelectHolds { resource_id })
+            let ids = extract_resource_ids_filter(&select.selection)?;
+            if let [resource_id] = ids[..] {
+                Ok(Command::SelectHolds { resource_id })
+            } else {
+                Ok(Command::SelectHoldsMulti { resource_ids: ids })
+            }
         }
         _ => Err(SqlError::UnknownTable(table)),
     }
@@ -381,6 +389,51 @@ fn extract_resource_id_filter(selection: &Option<Expr>) -> Result<Ulid, SqlError
         }
         _ => Err(SqlError::MissingFilter("resource_id")),
     }
+}
+
+/// Collect resource ids from `WHERE resource_id = X` or `WHERE resource_id IN (...)`, ignoring
+/// any ANDed range predicates. One id parses to a single-resource Select; many to a Multi. The
+/// `IN` length is bounded here (mirrors the availability path) so an oversized list is rejected
+/// at parse time rather than fanned out in the engine.
+fn extract_resource_ids_filter(selection: &Option<Expr>) -> Result<Vec<Ulid>, SqlError> {
+    let mut ids = Vec::new();
+    if let Some(sel) = selection {
+        collect_resource_ids(sel, &mut ids)?;
+    }
+    if ids.is_empty() {
+        return Err(SqlError::MissingFilter("resource_id"));
+    }
+    Ok(ids)
+}
+
+fn collect_resource_ids(expr: &Expr, ids: &mut Vec<Ulid>) -> Result<(), SqlError> {
+    match expr {
+        Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            collect_resource_ids(left, ids)?;
+            collect_resource_ids(right, ids)?;
+        }
+        Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
+            if expr_column_name(left).as_deref() == Some("resource_id") {
+                ids.push(parse_ulid_expr(right)?);
+            }
+        }
+        Expr::InList { expr: col_expr, list, negated } if !negated => {
+            if expr_column_name(col_expr).as_deref() == Some("resource_id") {
+                if list.len() > MAX_IN_CLAUSE_IDS {
+                    return Err(SqlError::Parse(format!(
+                        "IN clause too large: {} IDs (max {})",
+                        list.len(),
+                        MAX_IN_CLAUSE_IDS
+                    )));
+                }
+                for item in list {
+                    ids.push(parse_ulid_expr(item)?);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn extract_parent_id_filter(selection: &Expr) -> Result<Option<Ulid>, SqlError> {
@@ -1064,6 +1117,56 @@ mod tests {
             }
             _ => panic!("expected SelectHolds, got {cmd:?}"),
         }
+    }
+
+    #[test]
+    fn parse_select_bookings_multi() {
+        let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!("SELECT * FROM bookings WHERE resource_id IN ('{id1}', '{id2}')");
+        match parse_sql(&sql).unwrap() {
+            Command::SelectBookingsMulti { resource_ids } => {
+                assert_eq!(resource_ids.len(), 2);
+                assert_eq!(resource_ids[0].to_string(), id1);
+                assert_eq!(resource_ids[1].to_string(), id2);
+            }
+            cmd => panic!("expected SelectBookingsMulti, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_select_holds_multi() {
+        let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!("SELECT * FROM holds WHERE resource_id IN ('{id1}', '{id2}')");
+        match parse_sql(&sql).unwrap() {
+            Command::SelectHoldsMulti { resource_ids } => {
+                assert_eq!(resource_ids.len(), 2);
+            }
+            cmd => panic!("expected SelectHoldsMulti, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_select_bookings_single_in_list_collapses() {
+        // A one-element IN list is equivalent to `=`, so it stays single-resource.
+        let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!("SELECT * FROM bookings WHERE resource_id IN ('{id1}')");
+        match parse_sql(&sql).unwrap() {
+            Command::SelectBookings { resource_id } => assert_eq!(resource_id.to_string(), id1),
+            cmd => panic!("expected SelectBookings, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_select_holds_multi_too_many_ids() {
+        // MAX_IN_CLAUSE_IDS is 200 under cfg(test); 201 ids must be rejected at parse time.
+        let ids = (0..=MAX_IN_CLAUSE_IDS)
+            .map(|_| format!("'{}'", Ulid::new()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT * FROM holds WHERE resource_id IN ({ids})");
+        assert!(parse_sql(&sql).is_err());
     }
 
     #[test]
