@@ -567,21 +567,36 @@ impl ExtendedQueryHandler for DeltaTHandler {
     }
 }
 
+/// Parse a `$N` placeholder index: the run of ASCII digits starting at `digit_start` in `chars`.
+/// Returns the parsed index (None when the run overflows usize, so an untrusted huge run is never
+/// fatal) and the position just past the digits.
+fn parse_param_index(chars: &[char], digit_start: usize) -> (Option<usize>, usize) {
+    let mut j = digit_start;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    let n = chars[digit_start..j]
+        .iter()
+        .collect::<String>()
+        .parse::<usize>()
+        .ok();
+    (n, j)
+}
+
 /// Count the highest $N parameter placeholder in the SQL string.
 fn count_params(sql: &str) -> usize {
+    let chars: Vec<char> = sql.chars().collect();
     let mut max = 0usize;
-    let bytes = sql.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            i += 1;
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i > start && let Ok(n) = sql[start..i].parse::<usize>() && n > max {
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            let (n, j) = parse_param_index(&chars, i + 1);
+            if let Some(n) = n
+                && n > max
+            {
                 max = n;
             }
+            i = j;
         } else {
             i += 1;
         }
@@ -606,13 +621,13 @@ fn substitute_params(portal: &Portal<String>) -> String {
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
-            let mut j = i + 1;
-            let mut n: usize = 0;
-            while j < chars.len() && chars[j].is_ascii_digit() {
-                n = n * 10 + (chars[j] as usize - '0' as usize);
-                j += 1;
-            }
-            if n >= 1 && n <= params.len() {
+            // Checked parse via the shared helper: a huge out-of-range index from untrusted input
+            // becomes None and is left as a literal, never overflowing usize and panicking the task.
+            let (n, j) = parse_param_index(&chars, i + 1);
+            if let Some(n) = n
+                && n >= 1
+                && n <= params.len()
+            {
                 match &params[n - 1] {
                     Some(bytes) => {
                         let text = String::from_utf8_lossy(bytes);
@@ -998,6 +1013,36 @@ mod tests {
 
         let multi = schema_for_sql("SELECT * FROM Availability WHERE resource_id IN ($1, $2)");
         assert_eq!(multi.len(), 2);
+    }
+
+    #[test]
+    fn parse_param_index_handles_overflow_and_normal_runs() {
+        // A digit run that overflows usize must yield None, never panic the connection task.
+        let overflow: Vec<char> = "$99999999999999999999".chars().collect();
+        let (n, end) = parse_param_index(&overflow, 1);
+        assert_eq!(n, None::<usize>);
+        assert_eq!(end, overflow.len());
+
+        let normal: Vec<char> = "$12 rest".chars().collect();
+        let (n, end) = parse_param_index(&normal, 1);
+        assert_eq!(n, Some(12));
+        assert_eq!(end, 3);
+    }
+
+    #[test]
+    fn count_params_ignores_overflowing_placeholder() {
+        assert_eq!(count_params("SELECT 1"), 0);
+        assert_eq!(count_params("WHERE a = $1 AND b = $3 AND c = $2"), 3);
+        // An out-of-range run is not a valid index, so it must not inflate the count or panic.
+        assert_eq!(count_params("WHERE id = $1 OR id = $99999999999999999999"), 1);
+    }
+
+    #[test]
+    fn count_params_never_panics_on_arbitrary_input() {
+        use proptest::prelude::*;
+        proptest!(ProptestConfig::with_cases(2000), |(s in r"[\$0-9A-Za-z ]{0,48}")| {
+            let _ = count_params(&s);
+        });
     }
 
     #[test]
