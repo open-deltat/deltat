@@ -271,4 +271,43 @@ impl Engine {
             })
             .collect())
     }
+
+    /// Bookings across several resources in one request. Each resource is read independently and
+    /// its rows keep their own resource_id, so the caller can regroup. Ids are deduped because,
+    /// unlike availability (which merges its output), bookings are returned verbatim and a repeated
+    /// id would re-emit the same resource's rows. The id count is bounded for transports that build
+    /// the Command without going through the SQL parser.
+    pub async fn get_bookings_multi(
+        &self,
+        resource_ids: &[Ulid],
+    ) -> Result<Vec<BookingInfo>, EngineError> {
+        if resource_ids.len() > MAX_IN_CLAUSE_IDS {
+            return Err(EngineError::LimitExceeded("too many resource IDs"));
+        }
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for &rid in resource_ids {
+            if seen.insert(rid) {
+                out.extend(self.get_bookings(rid).await?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_holds_multi(
+        &self,
+        resource_ids: &[Ulid],
+    ) -> Result<Vec<HoldInfo>, EngineError> {
+        if resource_ids.len() > MAX_IN_CLAUSE_IDS {
+            return Err(EngineError::LimitExceeded("too many resource IDs"));
+        }
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for &rid in resource_ids {
+            if seen.insert(rid) {
+                out.extend(self.get_holds(rid).await?);
+            }
+        }
+        Ok(out)
+    }
 }
