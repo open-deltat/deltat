@@ -170,6 +170,10 @@ impl Engine {
                 seg_start = Some(*time);
             } else if prev >= threshold && count < threshold
                 && let Some(start) = seg_start.take()
+                // Events are sorted (time, then delta with -1 before +1), so at any shared instant
+                // every close is processed before any open. A segment therefore always closes at a
+                // strictly later time than it opened, and `*time > start` holds. The guard keeps
+                // Span::new (which requires start < end) total even if that ordering ever changed.
                 && *time > start {
                     segments.push(Span::new(start, *time));
                 }
