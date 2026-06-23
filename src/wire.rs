@@ -989,17 +989,13 @@ fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
     // of `BOOKINGS` returns the same schema the query will produce.
     match table.value.to_lowercase().as_str() {
         "availability" => {
-            // Only the MERGED form (resource_id IN (...) AND min_available = N) drops resource_id
-            // for the narrower combined schema. The per-resource IN form (no min_available) and the
-            // single-resource form both carry resource_id.
-            let merged = select
-                .selection
-                .as_ref()
-                .is_some_and(|s| selection_has_in_list(s) && selection_references_min_available(s));
-            if merged {
-                multi_availability_schema()
-            } else {
-                availability_schema()
+            // Pick the schema with the exact classifier the executor uses to pick the Command, so
+            // the announced column set always matches the rows produced. Only the merged form
+            // (resource_id IN (...) AND min_available = N) drops resource_id for the narrower
+            // combined schema; per-resource IN and single-resource forms both carry resource_id.
+            match crate::sql::availability_shape(select.selection.as_ref()) {
+                crate::sql::AvailabilityShape::Merged => multi_availability_schema(),
+                _ => availability_schema(),
             }
         }
         "resources" => resources_schema(),
@@ -1007,33 +1003,6 @@ fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
         "bookings" => bookings_schema(),
         "holds" => holds_schema(),
         _ => vec![],
-    }
-}
-
-fn selection_has_in_list(expr: &sqlparser::ast::Expr) -> bool {
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::InList { .. } => true,
-        Expr::BinaryOp { left, right, .. } => {
-            selection_has_in_list(left) || selection_has_in_list(right)
-        }
-        Expr::Nested(inner) => selection_has_in_list(inner),
-        _ => false,
-    }
-}
-
-/// True if the WHERE clause references the `min_available` pseudo-column — the marker that
-/// distinguishes a merged multi-resource availability query from a per-resource one.
-fn selection_references_min_available(expr: &sqlparser::ast::Expr) -> bool {
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::Identifier(id) => id.value.eq_ignore_ascii_case("min_available"),
-        Expr::BinaryOp { left, right, .. } => {
-            selection_references_min_available(left) || selection_references_min_available(right)
-        }
-        Expr::Nested(inner) => selection_references_min_available(inner),
-        Expr::InList { expr, .. } => selection_references_min_available(expr),
-        _ => false,
     }
 }
 
@@ -1156,6 +1125,70 @@ mod tests {
             schema_for_sql("SELECT * FROM availability WHERE resource_id IN ($1, $2)");
         assert_eq!(per_resource.len(), 3);
         assert_eq!(per_resource[0].name(), "resource_id");
+    }
+
+    /// The number of result columns the executor will actually emit for an availability Command.
+    fn executed_availability_width(cmd: &Command) -> usize {
+        match cmd {
+            // Merged across the set: rows are (start, end) only.
+            Command::SelectMultiAvailability { .. } => 2,
+            // Per-resource and single: rows carry resource_id too.
+            Command::SelectAvailability { .. } | Command::SelectAvailabilityMulti { .. } => 3,
+            other => panic!("not an availability command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_schema_width_matches_executed_row_width() {
+        // The merged schema (start, end) is announced ONLY for the exact form the executor routes
+        // as merged: `resource_id IN (...) AND min_available = N`. Every other syntactic form must
+        // announce the per-resource schema (resource_id, start, end), because that is what the
+        // executor produces. A divergence here is a wire protocol break: the client reads a
+        // RowDescription with N columns and then DataRows with a different column count.
+        //
+        // Each case pairs the placeholder SQL a client Describes with the value-bound SQL it later
+        // Executes; the asserted invariant is schema_for_sql(describe) == executed row width.
+        let cases = [
+            // canonical merged form → 2 cols
+            (
+                "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND min_available = $3 AND start >= $4 AND \"end\" <= $5",
+                "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND min_available = 2 AND start >= 0 AND \"end\" <= 100",
+            ),
+            // `>` is not the merged marker (executor matches Eq only) → per-resource, 3 cols
+            (
+                "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND min_available > $3 AND start >= $4 AND \"end\" <= $5",
+                "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND min_available > 1 AND start >= 0 AND \"end\" <= 100",
+            ),
+            // `>=` likewise → per-resource, 3 cols
+            (
+                "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND min_available >= $3 AND start >= $4 AND \"end\" <= $5",
+                "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND min_available >= 1 AND start >= 0 AND \"end\" <= 100",
+            ),
+            // reversed operand `N = min_available` (column on the right) → executor does not match → per-resource, 3 cols
+            (
+                "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND $3 = min_available AND start >= $4 AND \"end\" <= $5",
+                "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND 2 = min_available AND start >= 0 AND \"end\" <= 100",
+            ),
+            // plain per-resource IN, no min_available → 3 cols
+            (
+                "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND start >= $3 AND \"end\" <= $4",
+                "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND start >= 0 AND \"end\" <= 100",
+            ),
+            // single resource → 3 cols
+            (
+                "SELECT * FROM availability WHERE resource_id = $1 AND start >= $2 AND \"end\" <= $3",
+                "SELECT * FROM availability WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND start >= 0 AND \"end\" <= 100",
+            ),
+        ];
+        for (describe_sql, execute_sql) in cases {
+            let announced = schema_for_sql(describe_sql).len();
+            let cmd = sql::parse_sql(execute_sql).expect("execute SQL parses");
+            let produced = executed_availability_width(&cmd);
+            assert_eq!(
+                announced, produced,
+                "Describe announced {announced} cols but executor produces {produced} for: {describe_sql}",
+            );
+        }
     }
 
     #[test]

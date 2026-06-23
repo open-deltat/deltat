@@ -187,32 +187,32 @@ fn parse_select(query: &ast::Query) -> Result<Command, SqlError> {
             let start = filters.start.ok_or(SqlError::MissingFilter("start"))?;
             let end = filters.end.ok_or(SqlError::MissingFilter("end"))?;
 
-            if !filters.resource_ids.is_empty() {
-                // min_available present => merged intersection across the set (getCombined).
-                // Absent => per-resource availability, each row tagged with its resource_id
-                // (getMany), mirroring bookings/holds IN-list reads.
-                match filters.min_available {
-                    Some(min_available) => Ok(Command::SelectMultiAvailability {
-                        resource_ids: filters.resource_ids,
-                        start,
-                        end,
-                        min_available,
-                        min_duration: filters.min_duration,
-                    }),
-                    None => Ok(Command::SelectAvailabilityMulti {
-                        resource_ids: filters.resource_ids,
-                        start,
-                        end,
-                        min_duration: filters.min_duration,
-                    }),
-                }
-            } else {
-                Ok(Command::SelectAvailability {
+            // Branch on the same structural classifier the Describe path uses, so the announced
+            // schema always matches the rows produced. Merged => intersection across the set
+            // (getCombined); PerResourceMulti => per-resource rows tagged with resource_id
+            // (getMany), mirroring bookings/holds IN-list reads.
+            match availability_shape(select.selection.as_ref()) {
+                AvailabilityShape::Merged => Ok(Command::SelectMultiAvailability {
+                    resource_ids: filters.resource_ids,
+                    start,
+                    end,
+                    min_available: filters
+                        .min_available
+                        .ok_or(SqlError::MissingFilter("min_available"))?,
+                    min_duration: filters.min_duration,
+                }),
+                AvailabilityShape::PerResourceMulti => Ok(Command::SelectAvailabilityMulti {
+                    resource_ids: filters.resource_ids,
+                    start,
+                    end,
+                    min_duration: filters.min_duration,
+                }),
+                AvailabilityShape::Single => Ok(Command::SelectAvailability {
                     resource_id: filters.resource_id.ok_or(SqlError::MissingFilter("resource_id"))?,
                     start,
                     end,
                     min_duration: filters.min_duration,
-                })
+                }),
             }
         }
         "resources" => {
@@ -310,6 +310,60 @@ fn extract_availability_filters(
         _ => {}
     }
     Ok(())
+}
+
+/// Structural shape of an `availability` query, derived purely from the WHERE AST. Both the
+/// execution router (`parse_select`) and the Describe schema (`wire::schema_for_sql`) branch on
+/// this single function so the announced column set always matches the rows that get produced.
+/// It must agree at Describe time (when `$N` placeholders are still unbound and values cannot be
+/// read) and at execution time, so it inspects only structure — never literal values.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AvailabilityShape {
+    /// `resource_id = X` — per-resource rows tagged with `resource_id`.
+    Single,
+    /// `resource_id IN (...)` without `min_available` — per-resource rows, each tagged.
+    PerResourceMulti,
+    /// `resource_id IN (...) AND min_available = N` — merged across the set, no `resource_id`.
+    Merged,
+}
+
+pub fn availability_shape(selection: Option<&Expr>) -> AvailabilityShape {
+    let has_resource_in_list = selection.is_some_and(selection_has_resource_id_in_list);
+    let has_min_available_eq = selection.is_some_and(selection_has_min_available_eq);
+    match (has_resource_in_list, has_min_available_eq) {
+        (true, true) => AvailabilityShape::Merged,
+        (true, false) => AvailabilityShape::PerResourceMulti,
+        _ => AvailabilityShape::Single,
+    }
+}
+
+/// Mirror `extract_availability_filters`' resource-id matching exactly: a non-negated
+/// `resource_id IN (...)`, reachable only through `AND` (never `Nested`/`OR`).
+fn selection_has_resource_id_in_list(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            selection_has_resource_id_in_list(left) || selection_has_resource_id_in_list(right)
+        }
+        Expr::InList { expr, negated: false, .. } => {
+            expr_column_name(expr).as_deref() == Some("resource_id")
+        }
+        _ => false,
+    }
+}
+
+/// Mirror `extract_availability_filters`' merged-marker matching exactly: `min_available = ...`
+/// with the column on the left (`Eq` only — not `>`, `>=`, or a reversed `N = min_available`),
+/// reachable only through `AND`.
+fn selection_has_min_available_eq(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            selection_has_min_available_eq(left) || selection_has_min_available_eq(right)
+        }
+        Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, .. } => {
+            expr_column_name(left).as_deref() == Some("min_available")
+        }
+        _ => false,
+    }
 }
 
 fn parse_update(
@@ -844,6 +898,25 @@ mod tests {
                 assert_eq!(min_available, 2);
             }
             other => panic!("expected SelectMultiAvailability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_min_available_eq_routes_to_merged() {
+        // The merged form is selected ONLY by `min_available = N` (Eq, column on the left). Any
+        // other form (`>`, `>=`, reversed `N = min_available`) routes per-resource. The Describe
+        // schema (wire::schema_for_sql) classifies with the same `availability_shape`, so the
+        // announced column set matches the produced rows — see the wire cross-check test.
+        let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let b = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let prefix = format!("SELECT * FROM availability WHERE resource_id IN ('{a}', '{b}')");
+
+        for clause in ["min_available > 1", "min_available >= 1", "2 = min_available"] {
+            let sql = format!("{prefix} AND {clause} AND start >= 0 AND end <= 100");
+            assert!(
+                matches!(parse_sql(&sql).unwrap(), Command::SelectAvailabilityMulti { .. }),
+                "non-Eq min_available form must route per-resource: {clause}",
+            );
         }
     }
 
