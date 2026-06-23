@@ -324,4 +324,34 @@ impl Engine {
         }
         Ok(out)
     }
+
+    /// Availability for several resources in one request, each free span tagged with its
+    /// resource_id so the caller can regroup. Unlike `compute_multi_availability` (which merges
+    /// the set into one combined timeline), this computes each resource independently — the read
+    /// equivalent of `get_bookings_multi`. Ids are deduped; the count is bounded for transports
+    /// that build the Command without the SQL parser.
+    pub async fn get_availability_multi(
+        &self,
+        resource_ids: &[Ulid],
+        query_start: Ms,
+        query_end: Ms,
+        min_duration_ms: Option<Ms>,
+    ) -> Result<Vec<(Ulid, Span)>, EngineError> {
+        if resource_ids.len() > MAX_IN_CLAUSE_IDS {
+            return Err(EngineError::LimitExceeded("too many resource IDs"));
+        }
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for &rid in resource_ids {
+            if seen.insert(rid) {
+                for span in self
+                    .compute_availability(rid, query_start, query_end, min_duration_ms)
+                    .await?
+                {
+                    out.push((rid, span));
+                }
+            }
+        }
+        Ok(out)
+    }
 }
