@@ -271,31 +271,27 @@ fn extract_availability_filters(
                     f.min_available = Some(v as usize);
                 }
             }
-            ast::BinaryOperator::GtEq => {
-                if expr_column_name(left).as_deref() == Some("start") {
-                    f.start = Some(parse_i64_expr(right)?);
-                }
+            ast::BinaryOperator::GtEq if expr_column_name(left).as_deref() == Some("start") => {
+                f.start = Some(parse_i64_expr(right)?);
             }
-            ast::BinaryOperator::LtEq => {
-                if expr_column_name(left).as_deref() == Some("end") {
-                    f.end = Some(parse_i64_expr(right)?);
-                }
+            ast::BinaryOperator::LtEq if expr_column_name(left).as_deref() == Some("end") => {
+                f.end = Some(parse_i64_expr(right)?);
             }
             _ => {}
         },
         // resource_id IN ('id1', 'id2', ...)
-        Expr::InList { expr: col_expr, list, negated } if !negated => {
-            if expr_column_name(col_expr).as_deref() == Some("resource_id") {
-                if list.len() > MAX_IN_CLAUSE_IDS {
-                    return Err(SqlError::Parse(format!(
-                        "IN clause too large: {} IDs (max {})",
-                        list.len(),
-                        MAX_IN_CLAUSE_IDS
-                    )));
-                }
-                for item in list {
-                    f.resource_ids.push(parse_ulid_expr(item)?);
-                }
+        Expr::InList { expr: col_expr, list, negated }
+            if !negated && expr_column_name(col_expr).as_deref() == Some("resource_id") =>
+        {
+            if list.len() > MAX_IN_CLAUSE_IDS {
+                return Err(SqlError::Parse(format!(
+                    "IN clause too large: {} IDs (max {})",
+                    list.len(),
+                    MAX_IN_CLAUSE_IDS
+                )));
+            }
+            for item in list {
+                f.resource_ids.push(parse_ulid_expr(item)?);
             }
         }
         _ => {}
@@ -422,18 +418,18 @@ fn collect_resource_ids(expr: &Expr, ids: &mut Vec<Ulid>) -> Result<(), SqlError
                 ids.push(parse_ulid_expr(right)?);
             }
         }
-        Expr::InList { expr: col_expr, list, negated } if !negated => {
-            if expr_column_name(col_expr).as_deref() == Some("resource_id") {
-                if list.len() > MAX_IN_CLAUSE_IDS {
-                    return Err(SqlError::Parse(format!(
-                        "IN clause too large: {} IDs (max {})",
-                        list.len(),
-                        MAX_IN_CLAUSE_IDS
-                    )));
-                }
-                for item in list {
-                    ids.push(parse_ulid_expr(item)?);
-                }
+        Expr::InList { expr: col_expr, list, negated }
+            if !negated && expr_column_name(col_expr).as_deref() == Some("resource_id") =>
+        {
+            if list.len() > MAX_IN_CLAUSE_IDS {
+                return Err(SqlError::Parse(format!(
+                    "IN clause too large: {} IDs (max {})",
+                    list.len(),
+                    MAX_IN_CLAUSE_IDS
+                )));
+            }
+            for item in list {
+                ids.push(parse_ulid_expr(item)?);
             }
         }
         _ => {}
