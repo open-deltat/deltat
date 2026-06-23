@@ -196,6 +196,12 @@ impl Engine {
 
         check_no_conflict(&guard, &span, self.now_ms())?;
 
+        // Lower the reaper's earliest-expiry watermark so it will scan once this hold can expire.
+        // A removal (release/commit) may leave the bound stale-low, which only costs a redundant
+        // scan — never a missed expiry.
+        self.earliest_hold_expiry
+            .fetch_min(expires_at, std::sync::atomic::Ordering::Relaxed);
+
         let event = Event::HoldPlaced { id, resource_id, span, expires_at };
         self.persist_and_apply(resource_id, &mut guard, &event).await
     }
@@ -414,18 +420,40 @@ impl Engine {
     }
 
     pub fn collect_expired_holds(&self, now: Ms) -> Vec<(Ulid, Ulid)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Skip the whole-tenant scan when no hold can be due yet. The watermark is a lower bound on
+        // the earliest live hold's expiry, so `now < watermark` proves nothing is expired.
+        if now < self.earliest_hold_expiry.load(Relaxed) {
+            return Vec::new();
+        }
+
         let mut expired = Vec::new();
+        // Recompute the exact next earliest expiry from the live (non-expired) holds we see. If any
+        // resource is locked we can't see its holds, so we cannot raise the bound past it — fall
+        // back to i64::MIN to force a scan next cycle rather than risk skipping a due hold.
+        let mut next_earliest = i64::MAX;
+        let mut had_locked = false;
         for rid in self.store.resource_ids() {
-            if let Some(rs) = self.store.get_resource(&rid)
-                && let Ok(guard) = rs.try_read() {
+            let Some(rs) = self.store.get_resource(&rid) else {
+                continue;
+            };
+            match rs.try_read() {
+                Ok(guard) => {
                     for interval in &guard.intervals {
-                        if let IntervalKind::Hold { expires_at } = interval.kind
-                            && expires_at <= now {
+                        if let IntervalKind::Hold { expires_at } = interval.kind {
+                            if expires_at <= now {
                                 expired.push((interval.id, guard.id));
+                            } else {
+                                next_earliest = next_earliest.min(expires_at);
                             }
+                        }
                     }
                 }
+                Err(_) => had_locked = true,
+            }
         }
+        self.earliest_hold_expiry
+            .store(if had_locked { i64::MIN } else { next_earliest }, Relaxed);
         expired
     }
 
