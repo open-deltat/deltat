@@ -94,6 +94,12 @@ pub enum Command {
         min_available: usize,
         min_duration: Option<Ms>,
     },
+    SelectBookingsMulti {
+        resource_ids: Vec<Ulid>,
+    },
+    SelectHoldsMulti {
+        resource_ids: Vec<Ulid>,
+    },
     Listen {
         channel: String,
     },

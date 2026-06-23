@@ -358,6 +358,29 @@ async fn engine_min_duration_filter() {
 }
 
 #[tokio::test]
+async fn get_bookings_multi_groups_dedups_and_skips_unknown() {
+    let path = test_wal_path("bookings_multi3.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let a = Ulid::new();
+    let b = Ulid::new();
+    engine.create_resource(a, None, None, 1, None).await.unwrap();
+    engine.create_resource(b, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), a, Span::new(9 * H, 17 * H), false).await.unwrap();
+    engine.add_rule(Ulid::new(), b, Span::new(9 * H, 17 * H), false).await.unwrap();
+    engine.confirm_booking(Ulid::new(), a, Span::new(10 * H, 11 * H), None).await.unwrap();
+    engine.confirm_booking(Ulid::new(), b, Span::new(12 * H, 13 * H), None).await.unwrap();
+
+    // Duplicate `a` must NOT re-emit a's booking; the unknown id resolves to nothing.
+    let unknown = Ulid::new();
+    let rows = engine.get_bookings_multi(&[a, b, a, unknown]).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.iter().filter(|r| r.resource_id == a).count(), 1);
+    assert_eq!(rows.iter().filter(|r| r.resource_id == b).count(), 1);
+}
+
+#[tokio::test]
 async fn engine_hold_conflict() {
     let path = test_wal_path("hold_conflict3.wal");
     let notify = Arc::new(NotifyHub::new());
