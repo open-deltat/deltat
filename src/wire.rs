@@ -358,6 +358,40 @@ impl DeltaTHandler {
                     .collect();
                 Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
             }
+            Command::SelectBookingsMulti { resource_ids } => {
+                let bookings = engine.get_bookings_multi(&resource_ids).await.map_err(engine_err)?;
+                let schema = Arc::new(bookings_schema());
+                let rows: Vec<PgWireResult<_>> = bookings
+                    .into_iter()
+                    .map(|b| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        encoder.encode_field(&b.id.to_string())?;
+                        encoder.encode_field(&b.resource_id.to_string())?;
+                        encoder.encode_field(&b.start)?;
+                        encoder.encode_field(&b.end)?;
+                        encoder.encode_field(&b.label)?;
+                        Ok(encoder.take_row())
+                    })
+                    .collect();
+                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+            }
+            Command::SelectHoldsMulti { resource_ids } => {
+                let holds = engine.get_holds_multi(&resource_ids).await.map_err(engine_err)?;
+                let schema = Arc::new(holds_schema());
+                let rows: Vec<PgWireResult<_>> = holds
+                    .into_iter()
+                    .map(|h| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        encoder.encode_field(&h.id.to_string())?;
+                        encoder.encode_field(&h.resource_id.to_string())?;
+                        encoder.encode_field(&h.start)?;
+                        encoder.encode_field(&h.end)?;
+                        encoder.encode_field(&h.expires_at)?;
+                        Ok(encoder.take_row())
+                    })
+                    .collect();
+                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+            }
             Command::Listen { channel } => {
                 let resource_id = Self::parse_channel_resource_id(&channel)?;
                 if let Some(ref tx) = self.subscribe_tx {
