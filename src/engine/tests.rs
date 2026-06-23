@@ -691,6 +691,89 @@ async fn engine_commit_hold_torn_write_never_overbooks() {
     assert!(holds.is_empty(), "release was durable, so no hold lingers");
 }
 
+#[tokio::test]
+async fn engine_commit_hold_excludes_own_hold_on_capacity_n() {
+    // On a capacity-2 resource already holding two overlapping allocations, committing one must
+    // succeed: excluding the committed hold from its own conflict check leaves only the other
+    // allocation (1 < 2). Without the exclusion the sweep would count both holds (= capacity) and
+    // reject the new booking — so this exercises the capacity>1 exclusion path through
+    // collect_active_allocs_with_buffer, distinct from the capacity-1 fast path.
+    let path = test_wal_path("commit_hold_cap_n.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 2, None).await.unwrap();
+
+    let far = now_ms() + H;
+    let a = Ulid::new();
+    let b = Ulid::new();
+    engine.place_hold(a, rid, Span::new(10, 20), far).await.unwrap();
+    engine.place_hold(b, rid, Span::new(10, 20), far).await.unwrap(); // 2/2 on [10,20]
+
+    // Convert A's slot in place: booking A + hold B = 2 ≤ capacity.
+    engine.commit_hold(a, Ulid::new(), None).await.unwrap();
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_holds(rid).await.unwrap().len(), 1);
+
+    // A third overlapping allocation now exceeds capacity — confirms the resource was genuinely full.
+    let err = engine
+        .confirm_booking(Ulid::new(), rid, Span::new(10, 20), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::CapacityExceeded(_)));
+}
+
+#[tokio::test]
+async fn engine_commit_hold_with_buffer_books_the_held_span() {
+    // With a turnaround buffer on the resource, commit_hold still books exactly the held span, and
+    // the buffer-extended conflict check excludes the hold itself (no false self-conflict).
+    let path = test_wal_path("commit_hold_buffer.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, Some(5)).await.unwrap();
+
+    let hid = Ulid::new();
+    engine
+        .place_hold(hid, rid, Span::new(100, 200), now_ms() + H)
+        .await
+        .unwrap();
+    engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
+
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert_eq!(bookings.len(), 1);
+    assert_eq!((bookings[0].start, bookings[0].end), (100, 200));
+    assert!(engine.get_holds(rid).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn engine_commit_hold_notifies_resource_and_ancestors() {
+    // commit_hold emits HoldReleased then BookingConfirmed on the resource's channel and bubbles
+    // both to ancestors, so a subscriber on the resource AND one on its parent each see both, in
+    // order.
+    let path = test_wal_path("commit_hold_notify.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let parent = Ulid::new();
+    let child = Ulid::new();
+    engine.create_resource(parent, None, None, 1, None).await.unwrap();
+    engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
+
+    let hid = Ulid::new();
+    engine
+        .place_hold(hid, child, Span::new(10, 20), now_ms() + H)
+        .await
+        .unwrap();
+
+    // Subscribe after the setup mutations so only the commit's events are observed.
+    let mut on_child = engine.notify.subscribe(child);
+    let mut on_parent = engine.notify.subscribe(parent);
+
+    engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
+
+    assert!(matches!(on_child.recv().await.unwrap(), Event::HoldReleased { .. }));
+    assert!(matches!(on_child.recv().await.unwrap(), Event::BookingConfirmed { .. }));
+    assert!(matches!(on_parent.recv().await.unwrap(), Event::HoldReleased { .. }));
+    assert!(matches!(on_parent.recv().await.unwrap(), Event::BookingConfirmed { .. }));
+}
+
 // ══════════════════════════════════════════════════════════════
 // Pure function edge cases
 // ══════════════════════════════════════════════════════════════
