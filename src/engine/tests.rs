@@ -774,6 +774,29 @@ async fn engine_commit_hold_notifies_resource_and_ancestors() {
     assert!(matches!(on_parent.recv().await.unwrap(), Event::BookingConfirmed { .. }));
 }
 
+#[tokio::test]
+async fn engine_availability_multi_tags_each_resource_and_dedups() {
+    let path = test_wal_path("availability_multi.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let a = Ulid::new();
+    let b = Ulid::new();
+    engine.create_resource(a, None, None, 1, None).await.unwrap();
+    engine.create_resource(b, None, None, 1, None).await.unwrap();
+    // Distinct open windows so the per-resource breakdown is observable (a merged intersection
+    // would lose this).
+    engine.add_rule(Ulid::new(), a, Span::new(0, 10 * H), false).await.unwrap();
+    engine.add_rule(Ulid::new(), b, Span::new(0, 5 * H), false).await.unwrap();
+
+    // The duplicate `a` in the list must be deduped (one resource's rows, not two).
+    let rows = engine.get_availability_multi(&[a, b, a], 0, 24 * H, None).await.unwrap();
+    let a_rows: Vec<_> = rows.iter().filter(|(rid, _)| *rid == a).collect();
+    let b_rows: Vec<_> = rows.iter().filter(|(rid, _)| *rid == b).collect();
+    assert_eq!(a_rows.len(), 1, "a deduped to one free span");
+    assert_eq!(b_rows.len(), 1);
+    assert_eq!((a_rows[0].1.start, a_rows[0].1.end), (0, 10 * H));
+    assert_eq!((b_rows[0].1.start, b_rows[0].1.end), (0, 5 * H));
+}
+
 // ══════════════════════════════════════════════════════════════
 // Pure function edge cases
 // ══════════════════════════════════════════════════════════════

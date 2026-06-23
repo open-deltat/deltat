@@ -94,6 +94,14 @@ pub enum Command {
         min_available: usize,
         min_duration: Option<Ms>,
     },
+    /// Per-resource availability for several resources in one request: each row keeps its own
+    /// resource_id so the caller can regroup (unlike SelectMultiAvailability, which merges).
+    SelectAvailabilityMulti {
+        resource_ids: Vec<Ulid>,
+        start: Ms,
+        end: Ms,
+        min_duration: Option<Ms>,
+    },
     SelectBookingsMulti {
         resource_ids: Vec<Ulid>,
     },
