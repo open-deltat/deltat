@@ -684,6 +684,37 @@ fn substitute_params(portal: &Portal<String>) -> String {
 
 // ── Custom connection loop with LISTEN/NOTIFY ────────────────────
 
+/// Forward one resource's broadcast events to the connection's notification channel as pgwire
+/// `NotificationResponse`s.
+///
+/// A `Lagged` error means the subscriber briefly fell behind the bounded broadcast ring and lost
+/// some events — it must NOT end the subscription. Ending it would let a transient burst silently
+/// kill the live stream forever; instead we keep forwarding subsequent events (the listener
+/// re-reads authoritative state on the next one — availability is never derived from the stream).
+/// Only `Closed` (all senders dropped, e.g. the resource was deleted) ends the forwarder.
+async fn forward_resource_events(
+    mut rx: tokio::sync::broadcast::Receiver<Event>,
+    tx: mpsc::UnboundedSender<NotificationResponse>,
+    channel: String,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let payload = serde_json::to_string(&event).unwrap_or_default();
+                if tx
+                    .send(NotificationResponse::new(0, channel.clone(), payload))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => break,
+        }
+    }
+}
+
 pub async fn process_connection(
     tcp_socket: TcpStream,
     tenant_manager: Arc<TenantManager>,
@@ -841,23 +872,10 @@ pub async fn process_connection(
                                 Ok(e) => e,
                                 Err(_) => continue,
                             };
-                            let mut rx = engine.notify.subscribe(rid);
+                            let rx = engine.notify.subscribe(rid);
                             let tx = notify_tx.clone();
                             let channel = format!("resource_{rid}");
-                            forwarders.insert(
-                                rid,
-                                tokio::spawn(async move {
-                                    while let Ok(event) = rx.recv().await {
-                                        let payload =
-                                            serde_json::to_string(&event).unwrap_or_default();
-                                        let notif =
-                                            NotificationResponse::new(0, channel.clone(), payload);
-                                        if tx.send(notif).is_err() {
-                                            break;
-                                        }
-                                    }
-                                }),
-                            );
+                            forwarders.insert(rid, tokio::spawn(forward_resource_events(rx, tx, channel)));
                         }
                         SubscriptionCommand::Unsubscribe(rid) => {
                             if let Some(handle) = forwarders.remove(&rid) {
@@ -980,6 +998,37 @@ fn sql_err(e: crate::sql::SqlError) -> PgWireError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── forward_resource_events ──────────────────────────────────
+
+    #[tokio::test]
+    async fn forwarder_survives_broadcast_lag() {
+        use tokio::sync::broadcast;
+        // A cap-1 ring lets us force a Lagged deterministically: the receiver is subscribed at
+        // channel() time, then three sends overflow the ring before the forwarder drains, leaving
+        // it two behind. The old `while let Ok(..)` ended the task on that Lagged and dropped the
+        // stream forever; the fix continues and still forwards the surviving event.
+        let (btx, brx) = broadcast::channel::<Event>(1);
+        let (mtx, mut mrx) = mpsc::unbounded_channel();
+        let mk = || Event::BookingConfirmed {
+            id: Ulid::new(),
+            resource_id: Ulid::new(),
+            span: Span::new(1000, 2000),
+            label: None,
+        };
+        btx.send(mk()).unwrap();
+        btx.send(mk()).unwrap();
+        btx.send(mk()).unwrap(); // receiver now 2 behind a cap-1 ring → next recv() is Lagged
+
+        tokio::spawn(forward_resource_events(brx, mtx, "resource_x".into()));
+
+        let got = tokio::time::timeout(Duration::from_secs(1), mrx.recv())
+            .await
+            .expect("forwarder must not hang");
+        // Some(_) only if the forwarder survived the Lagged; the old behavior dropped the sender
+        // and recv() would return None.
+        assert!(got.is_some(), "forwarder must survive a broadcast Lagged and keep forwarding");
+    }
 
     // ── count_params ─────────────────────────────────────────────
 
