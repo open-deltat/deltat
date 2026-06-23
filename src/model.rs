@@ -4,6 +4,9 @@ use ulid::Ulid;
 /// Unix milliseconds — the only time type.
 pub type Ms = i64;
 
+/// One resource as carried by a (batch) create: `(id, parent_id, name, capacity, buffer_after)`.
+pub type ResourceRow = (Ulid, Option<Ulid>, Option<String>, u32, Option<Ms>);
+
 /// Half-open interval `[start, end)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
