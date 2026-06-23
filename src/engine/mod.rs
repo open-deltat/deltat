@@ -34,9 +34,13 @@ pub(super) enum WalCommand {
         event: Event,
         response: oneshot::Sender<io::Result<()>>,
     },
-    /// Append several events under a single fsync: the realistic failure (fsync errors) leaves
-    /// none of them durable, so the group is atomic across a crash. Used by `commit_hold` to write
-    /// HoldReleased + BookingConfirmed as one unit.
+    /// Append several events under a single fsync. An fsync error, or a crash before the flush,
+    /// leaves none of them durable. They remain independent length+CRC records, so this does NOT
+    /// guarantee both-or-neither against a torn write between them (a power loss or write error
+    /// after one record's bytes reach disk but before the next's): replay discards the torn tail
+    /// and keeps the prefix. Callers must therefore order events so that losing the tail is the
+    /// safe outcome — `commit_hold` writes HoldReleased before BookingConfirmed, so a torn pair
+    /// loses the booking (a re-bookable slot), never leaves a hold plus a booking.
     AppendAtomic {
         events: Vec<Event>,
         response: oneshot::Sender<io::Result<()>>,
