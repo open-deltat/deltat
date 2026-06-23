@@ -674,6 +674,11 @@ pub async fn process_connection(
     tenant_manager: Arc<TenantManager>,
     password: String,
     tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
+    // Post-auth lifetime guards in ms (0 = disabled). They bound a client that opens a LISTEN and
+    // then squats — the only thing that reclaims a connection slot once the global semaphore is
+    // full, so they are the real defense against connection-exhaustion DoS.
+    max_conn_age_ms: u64,
+    max_idle_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Negotiate TLS
     let mut socket: Framed<
@@ -703,6 +708,16 @@ pub async fn process_connection(
     let mut forwarders: HashMap<Ulid, JoinHandle<()>> = HashMap::new();
     let startup_deadline = tokio::time::sleep(Duration::from_secs(60));
     tokio::pin!(startup_deadline);
+
+    // Post-auth guards. A disabled (0) guard sleeps ~never so its select arm stays inert; an
+    // enabled one fires and breaks the loop, running the same forwarder cleanup as any other exit.
+    const NEVER: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 30);
+    let max_age = if max_conn_age_ms == 0 { NEVER } else { Duration::from_millis(max_conn_age_ms) };
+    let idle = if max_idle_ms == 0 { NEVER } else { Duration::from_millis(max_idle_ms) };
+    let max_age_deadline = tokio::time::sleep(max_age);
+    tokio::pin!(max_age_deadline);
+    let idle_deadline = tokio::time::sleep(idle);
+    tokio::pin!(idle_deadline);
 
     // 5. Main loop
     loop {
@@ -754,6 +769,14 @@ pub async fn process_connection(
             }
 
             let action = tokio::select! {
+                _ = &mut max_age_deadline => {
+                    tracing::info!("closing connection: max age reached");
+                    break;
+                }
+                _ = &mut idle_deadline => {
+                    tracing::info!("closing connection: idle timeout");
+                    break;
+                }
                 msg = socket.next() => Action::Message(msg),
                 cmd = subscribe_rx.recv() => Action::Subscribe(cmd),
                 notif = notify_rx.recv() => Action::Notify(notif),
@@ -761,6 +784,8 @@ pub async fn process_connection(
 
             match action {
                 Action::Message(Some(Ok(msg))) => {
+                    // Client activity resets the idle clock; the max-age clock is never reset.
+                    idle_deadline.as_mut().reset(tokio::time::Instant::now() + idle);
                     let is_extended = match socket.state() {
                         PgWireConnectionState::CopyInProgress(ext) => ext,
                         _ => msg.is_extended_query(),
