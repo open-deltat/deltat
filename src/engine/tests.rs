@@ -645,13 +645,50 @@ async fn engine_commit_hold_persists_across_replay() {
         engine.commit_hold(hid, bid, None).await.unwrap();
     }
 
-    // Reopen from the WAL: the hold is gone and the booking survives — both halves of the atomic
-    // commit are durable.
+    // Reopen from the WAL after a clean shutdown: the hold is gone and the booking survives — both
+    // halves of the commit are durable.
     let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
     assert!(engine.get_holds(rid).await.unwrap().is_empty());
     let bookings = engine.get_bookings(rid).await.unwrap();
     assert_eq!(bookings.len(), 1);
     assert_eq!(bookings[0].id, bid);
+}
+
+#[tokio::test]
+async fn engine_commit_hold_torn_write_never_overbooks() {
+    // commit_hold writes HoldReleased + BookingConfirmed as two records under one fsync, so a torn
+    // write (power loss / IO error after the first record's bytes reach disk but before the
+    // second's) can persist HoldReleased and lose BookingConfirmed. Replay discards the torn tail.
+    // Because release is written BEFORE confirm, the worst a crash can leave is a freed (re-bookable)
+    // slot — never a live hold AND a booking on the span (never an overbook, INV-01). This locks
+    // that safe direction; it is the durability posture AVAIL-07 actually provides.
+    let path = test_wal_path("commit_hold_torn.wal");
+    let rid = Ulid::new();
+    {
+        let engine = Engine::new(path.clone(), Arc::new(NotifyHub::new())).unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+        let hid = Ulid::new();
+        engine
+            .place_hold(hid, rid, Span::new(1000, 2000), now_ms() + H)
+            .await
+            .unwrap();
+        engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
+    }
+
+    // Tear the trailing record (BookingConfirmed) by lopping off its tail; the HoldReleased record
+    // before it stays intact, so replay applies the release and rejects the truncated booking.
+    let len = std::fs::metadata(&path).unwrap().len();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(len - 8).unwrap();
+    drop(file);
+
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let holds = engine.get_holds(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    // The booking was lost, but the unsafe outcome (a lingering hold AND a booking) never occurs:
+    // the span is simply free again.
+    assert!(bookings.is_empty(), "a torn commit must not leave a booking");
+    assert!(holds.is_empty(), "release was durable, so no hold lingers");
 }
 
 // ══════════════════════════════════════════════════════════════
