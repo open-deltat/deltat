@@ -37,6 +37,9 @@ pub enum Command {
         end: Ms,
         blocking: bool,
     },
+    BatchInsertRules {
+        rules: Vec<(Ulid, Ulid, Ms, Ms, bool)>, // (id, resource_id, start, end, blocking)
+    },
     UpdateRule {
         id: Ulid,
         start: Ms,
