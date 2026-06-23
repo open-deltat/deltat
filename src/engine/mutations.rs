@@ -68,6 +68,24 @@ impl Engine {
         Ok(())
     }
 
+    /// Create several resources in one request. Each goes through the single-resource path with its
+    /// full validation (parent existence, hierarchy depth, cycle, limits). Applied in list order, so
+    /// a row may reference a parent created earlier in the same batch. The win is collapsing N client
+    /// round-trips into one Command; semantics match the SDK's prior per-row creates, including that
+    /// a mid-batch failure leaves earlier resources created.
+    pub async fn batch_create_resources(
+        &self,
+        resources: Vec<ResourceRow>,
+    ) -> Result<(), EngineError> {
+        if resources.len() > MAX_BATCH_SIZE {
+            return Err(EngineError::LimitExceeded("batch too large"));
+        }
+        for (id, parent_id, name, capacity, buffer_after) in resources {
+            self.create_resource(id, parent_id, name, capacity, buffer_after).await?;
+        }
+        Ok(())
+    }
+
     pub async fn delete_resource(&self, id: Ulid) -> Result<(), EngineError> {
         if !self.store.contains_resource(&id) {
             return Err(EngineError::NotFound(id));
