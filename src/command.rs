@@ -21,6 +21,9 @@ pub enum Command {
         capacity: u32,
         buffer_after: Option<Ms>,
     },
+    BatchInsertResources {
+        resources: Vec<ResourceRow>,
+    },
     UpdateResource {
         id: Ulid,
         name: Option<String>,
