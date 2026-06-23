@@ -269,6 +269,36 @@ impl DeltaTHandler {
                     stream::iter(rows),
                 ))])
             }
+            Command::SelectAvailabilityMulti {
+                resource_ids,
+                start,
+                end,
+                min_duration,
+            } => {
+                let slots = engine
+                    .get_availability_multi(&resource_ids, start, end, min_duration)
+                    .await
+                    .map_err(engine_err)?;
+
+                // Per-resource rows reuse the single-availability schema (resource_id, start, end).
+                let schema = Arc::new(availability_schema());
+
+                let rows: Vec<PgWireResult<_>> = slots
+                    .into_iter()
+                    .map(|(rid, slot)| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        encoder.encode_field(&rid.to_string())?;
+                        encoder.encode_field(&slot.start)?;
+                        encoder.encode_field(&slot.end)?;
+                        Ok(encoder.take_row())
+                    })
+                    .collect();
+
+                Ok(vec![Response::Query(QueryResponse::new(
+                    schema,
+                    stream::iter(rows),
+                ))])
+            }
             Command::UpdateResource { id, name, capacity, buffer_after } => {
                 engine
                     .update_resource(id, name, capacity, buffer_after)
@@ -941,9 +971,14 @@ fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
     // of `BOOKINGS` returns the same schema the query will produce.
     match table.value.to_lowercase().as_str() {
         "availability" => {
-            // Multi-resource availability (resource_id IN (...)) merges resources, so it has a
-            // narrower schema than the single-resource form.
-            if select.selection.as_ref().is_some_and(selection_has_in_list) {
+            // Only the MERGED form (resource_id IN (...) AND min_available = N) drops resource_id
+            // for the narrower combined schema. The per-resource IN form (no min_available) and the
+            // single-resource form both carry resource_id.
+            let merged = select
+                .selection
+                .as_ref()
+                .is_some_and(|s| selection_has_in_list(s) && selection_references_min_available(s));
+            if merged {
                 multi_availability_schema()
             } else {
                 availability_schema()
@@ -965,6 +1000,21 @@ fn selection_has_in_list(expr: &sqlparser::ast::Expr) -> bool {
             selection_has_in_list(left) || selection_has_in_list(right)
         }
         Expr::Nested(inner) => selection_has_in_list(inner),
+        _ => false,
+    }
+}
+
+/// True if the WHERE clause references the `min_available` pseudo-column — the marker that
+/// distinguishes a merged multi-resource availability query from a per-resource one.
+fn selection_references_min_available(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(id) => id.value.eq_ignore_ascii_case("min_available"),
+        Expr::BinaryOp { left, right, .. } => {
+            selection_references_min_available(left) || selection_references_min_available(right)
+        }
+        Expr::Nested(inner) => selection_references_min_available(inner),
+        Expr::InList { expr, .. } => selection_references_min_available(expr),
         _ => false,
     }
 }
@@ -1077,9 +1127,17 @@ mod tests {
 
     #[test]
     fn schema_for_select_multi_availability() {
-        let schema = schema_for_sql("SELECT * FROM availability WHERE resource_id IN ($1, $2)");
-        assert_eq!(schema.len(), 2); // multi-availability has just start, end
-        assert_eq!(schema[0].name(), "start");
+        // Merged form (min_available) drops resource_id → just start, end.
+        let merged = schema_for_sql(
+            "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND min_available = $3",
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name(), "start");
+        // Per-resource form (no min_available) keeps resource_id so the caller can regroup.
+        let per_resource =
+            schema_for_sql("SELECT * FROM availability WHERE resource_id IN ($1, $2)");
+        assert_eq!(per_resource.len(), 3);
+        assert_eq!(per_resource[0].name(), "resource_id");
     }
 
     #[test]
@@ -1119,7 +1177,9 @@ mod tests {
         assert_eq!(single.len(), 5);
         assert_eq!(single[4].name(), "label");
 
-        let multi = schema_for_sql("SELECT * FROM Availability WHERE resource_id IN ($1, $2)");
+        let multi = schema_for_sql(
+            "SELECT * FROM Availability WHERE resource_id IN ($1, $2) AND min_available = $3",
+        );
         assert_eq!(multi.len(), 2);
     }
 
