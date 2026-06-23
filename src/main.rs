@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gc_retention_ms: i64 = std::env::var("DELTAT_GC_RETENTION_MS")
         .ok()
         .and_then(|s| s.parse().ok())
+        .filter(|v| *v >= 0) // a negative retention would push the GC cutoff into the future
         .unwrap_or(604_800_000); // 7 days
     // Post-auth connection lifetime guards (0 = disabled, the default — long-lived LISTEN is a
     // legitimate product use). A public deployment sets these to bound idle/squatting streams.

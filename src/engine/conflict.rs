@@ -84,8 +84,14 @@ pub(crate) fn check_batch_capacity(
     now: Ms,
 ) -> Result<(), EngineError> {
     let buffer = rs.buffer_after.unwrap_or(0);
-    let lo = spans.iter().map(|s| s.start).min().unwrap_or(0);
-    let hi = spans.iter().map(|s| s.end.saturating_add(buffer)).max().unwrap_or(lo + 1);
+    // Empty batches have nothing to check; deriving the window also avoids an unreachable
+    // arithmetic default for the bounds.
+    let (Some(lo), Some(hi)) = (
+        spans.iter().map(|s| s.start).min(),
+        spans.iter().map(|s| s.end.saturating_add(buffer)).max(),
+    ) else {
+        return Ok(());
+    };
     let window = Span::new(lo.saturating_sub(buffer).max(0), hi);
 
     // Combine already-committed active allocations (buffer-extended) with all batch members,

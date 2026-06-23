@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use pgwire::api::auth::{AuthSource, LoginInfo, Password};
 use pgwire::error::PgWireResult;
 
-#[derive(Debug)]
 pub struct DeltaTAuthSource {
     password: String,
 }
@@ -10,6 +9,13 @@ pub struct DeltaTAuthSource {
 impl DeltaTAuthSource {
     pub fn new(password: String) -> Self {
         Self { password }
+    }
+}
+
+// Redact the shared password so it can never reach a log line through a derived Debug.
+impl std::fmt::Debug for DeltaTAuthSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeltaTAuthSource").finish_non_exhaustive()
     }
 }
 

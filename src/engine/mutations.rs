@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, RwLock};
@@ -75,7 +75,11 @@ impl Engine {
             return Err(EngineError::HasChildren(id));
         }
 
-        let rs = self.get_resource(&id).unwrap();
+        // The contains_resource check above can race a concurrent delete of the same id, so
+        // resolve through Option rather than unwrapping a value that may already be gone.
+        let Some(rs) = self.get_resource(&id) else {
+            return Err(EngineError::NotFound(id));
+        };
         let guard = rs.read().await;
         let parent_id = guard.parent_id;
         if let Some(pid) = parent_id {
@@ -88,6 +92,9 @@ impl Engine {
         self.store.remove_resource(&id);
         self.notify.send(id, &event);
         self.notify_ancestors(parent_id, &event);
+        // Deliver the deletion to current listeners above, then reclaim the channel so a
+        // long-lived tenant does not leak one broadcast sender per ever-deleted resource.
+        self.notify.remove(&id);
         Ok(())
     }
 
@@ -344,7 +351,9 @@ impl Engine {
     /// Rules are never collected. Skips locked resources (best-effort).
     /// Returns count of collected intervals.
     pub fn gc_past_intervals(&self, now: Ms, retention_ms: Ms) -> usize {
-        let cutoff = now - retention_ms;
+        // retention_ms is operator-configured and unbounded, so subtract saturating: a huge
+        // value floors the cutoff at i64::MIN (nothing is older) instead of underflowing.
+        let cutoff = now.saturating_sub(retention_ms);
         let mut collected = 0usize;
 
         for rid in self.store.resource_ids() {
@@ -383,69 +392,45 @@ impl Engine {
 
     /// Compact the WAL by rewriting it with only the events needed to recreate the current state.
     pub async fn compact_wal(&self) -> Result<(), EngineError> {
-        let mut events = Vec::new();
-        let mut visited = HashSet::new();
-
-        fn emit_resource(
-            id: Ulid,
-            store: &super::InMemoryStore,
-            events: &mut Vec<Event>,
-            visited: &mut HashSet<Ulid>,
-        ) {
-            if !visited.insert(id) {
-                return;
-            }
-            let rs = match store.get_resource(&id) {
-                Some(rs) => rs,
-                None => return,
+        // Snapshot each resource under an awaited read lock. A resource mid-mutation holds its
+        // write lock across an awaited WAL append, so try_read would fail; unwrapping it panics
+        // the compactor and skipping it would drop the resource from the rewritten WAL. Await
+        // the lock, copy the state, release, then build the event list outside any lock.
+        let mut snapshots: Vec<ResourceSnapshot> = Vec::new();
+        for id in self.store.resource_ids() {
+            let Some(rs) = self.store.get_resource(&id) else {
+                continue;
             };
-            let guard = rs.try_read().expect("compact: uncontended read");
-
-            if let Some(pid) = guard.parent_id {
-                emit_resource(pid, store, events, visited);
-            }
-
-            events.push(Event::ResourceCreated {
+            let guard = rs.read().await;
+            snapshots.push(ResourceSnapshot {
                 id: guard.id,
                 parent_id: guard.parent_id,
                 name: guard.name.clone(),
                 capacity: guard.capacity,
                 buffer_after: guard.buffer_after,
+                intervals: guard.intervals.clone(),
             });
-
-            for interval in &guard.intervals {
-                match &interval.kind {
-                    IntervalKind::NonBlocking => events.push(Event::RuleAdded {
-                        id: interval.id,
-                        resource_id: guard.id,
-                        span: interval.span,
-                        blocking: false,
-                    }),
-                    IntervalKind::Blocking => events.push(Event::RuleAdded {
-                        id: interval.id,
-                        resource_id: guard.id,
-                        span: interval.span,
-                        blocking: true,
-                    }),
-                    IntervalKind::Hold { expires_at } => events.push(Event::HoldPlaced {
-                        id: interval.id,
-                        resource_id: guard.id,
-                        span: interval.span,
-                        expires_at: *expires_at,
-                    }),
-                    IntervalKind::Booking { label } => events.push(Event::BookingConfirmed {
-                        id: interval.id,
-                        resource_id: guard.id,
-                        span: interval.span,
-                        label: label.clone(),
-                    }),
-                }
-            }
         }
 
-        let resource_ids = self.store.resource_ids();
-        for id in resource_ids {
-            emit_resource(id, &self.store, &mut events, &mut visited);
+        // Emit ancestors before descendants by tree depth, matching the order the live create path
+        // enforces and the original WAL preserved. Replay applies events directly so it tolerates
+        // any order, but keeping this order leaves the compacted WAL self-consistent.
+        let parent_of: HashMap<Ulid, Option<Ulid>> =
+            snapshots.iter().map(|s| (s.id, s.parent_id)).collect();
+        snapshots.sort_by_key(|s| resource_depth(s.id, &parent_of));
+
+        let mut events = Vec::new();
+        for snap in &snapshots {
+            events.push(Event::ResourceCreated {
+                id: snap.id,
+                parent_id: snap.parent_id,
+                name: snap.name.clone(),
+                capacity: snap.capacity,
+                buffer_after: snap.buffer_after,
+            });
+            for interval in &snap.intervals {
+                events.push(interval_to_event(snap.id, interval));
+            }
         }
 
         let (tx, rx) = oneshot::channel();
@@ -469,5 +454,61 @@ impl Engine {
             return 0;
         }
         rx.await.unwrap_or(0)
+    }
+}
+
+/// A point-in-time copy of a resource's compactable state, taken under a read lock so the
+/// rewritten WAL is built without holding any lock.
+struct ResourceSnapshot {
+    id: Ulid,
+    parent_id: Option<Ulid>,
+    name: Option<String>,
+    capacity: u32,
+    buffer_after: Option<Ms>,
+    intervals: Vec<Interval>,
+}
+
+/// Depth of a resource in the tree (root = 0), used to order ancestors before descendants.
+/// Bounded by MAX_HIERARCHY_DEPTH; the tree is acyclic by construction (INV-10).
+fn resource_depth(id: Ulid, parent_of: &HashMap<Ulid, Option<Ulid>>) -> usize {
+    let mut depth = 0usize;
+    let mut current = id;
+    while let Some(Some(pid)) = parent_of.get(&current) {
+        depth += 1;
+        if depth > MAX_HIERARCHY_DEPTH {
+            break;
+        }
+        current = *pid;
+    }
+    depth
+}
+
+/// The single WAL event that recreates one live interval.
+fn interval_to_event(resource_id: Ulid, interval: &Interval) -> Event {
+    match &interval.kind {
+        IntervalKind::NonBlocking => Event::RuleAdded {
+            id: interval.id,
+            resource_id,
+            span: interval.span,
+            blocking: false,
+        },
+        IntervalKind::Blocking => Event::RuleAdded {
+            id: interval.id,
+            resource_id,
+            span: interval.span,
+            blocking: true,
+        },
+        IntervalKind::Hold { expires_at } => Event::HoldPlaced {
+            id: interval.id,
+            resource_id,
+            span: interval.span,
+            expires_at: *expires_at,
+        },
+        IntervalKind::Booking { label } => Event::BookingConfirmed {
+            id: interval.id,
+            resource_id,
+            span: interval.span,
+            label: label.clone(),
+        },
     }
 }
