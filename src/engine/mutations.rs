@@ -9,7 +9,8 @@ use crate::model::*;
 
 use super::availability::subtract_intervals;
 use super::conflict::{
-    check_batch_capacity, check_no_conflict, validate_buffer, validate_span, validate_timestamp,
+    check_batch_capacity, check_no_conflict, check_no_conflict_excluding, validate_buffer,
+    validate_span, validate_timestamp,
 };
 use super::{Engine, EngineError, WalCommand};
 
@@ -168,6 +169,51 @@ impl Engine {
         let event = Event::HoldReleased { id, resource_id };
         self.persist_and_apply(resource_id, &mut guard, &event).await?;
         Ok(resource_id)
+    }
+
+    /// Atomically convert a live hold into a booking on the same span (AVAIL-07). The whole
+    /// operation runs under one resource write lock, and the hold being committed is excluded
+    /// from the conflict check — it is the caller's own reservation — so there is no
+    /// release-then-rebook gap where a competing booker could win the span in between.
+    pub async fn commit_hold(
+        &self,
+        hold_id: Ulid,
+        booking_id: Ulid,
+        label: Option<String>,
+    ) -> Result<(), EngineError> {
+        if let Some(ref l) = label
+            && l.len() > MAX_LABEL_LEN {
+                return Err(EngineError::LimitExceeded("label too long"));
+            }
+        let (resource_id, mut guard) = self.resolve_entity_write(&hold_id).await?;
+
+        // The entity must be a hold; a booking/rule id (or one already reaped) means there is no
+        // hold to commit. The booking takes exactly the held span.
+        let span = match guard.intervals.iter().find(|i| i.id == hold_id) {
+            Some(i) if matches!(i.kind, IntervalKind::Hold { .. }) => i.span,
+            _ => return Err(EngineError::NotFound(hold_id)),
+        };
+
+        check_no_conflict_excluding(&guard, &span, self.now_ms(), Some(hold_id))?;
+
+        // Release + confirm share one fsync (WalCommand::AppendAtomic): an fsync error or a crash
+        // before the flush leaves neither durable. They are still two WAL records, so a torn write
+        // between them can lose the booking — but release is written before confirm, so the worst
+        // case a crash can leave is a freed (re-bookable) slot, never a live hold AND booking, i.e.
+        // never an overbook (INV-01 holds). Apply only after the append is durable, like
+        // persist_and_apply. (This closes the in-memory release-then-book TOCTOU; it is not a
+        // claim of torn-write crash atomicity — see WalCommand::AppendAtomic.)
+        let release = Event::HoldReleased { id: hold_id, resource_id };
+        let book = Event::BookingConfirmed { id: booking_id, resource_id, span, label };
+        self.wal_append_atomic(&[release.clone(), book.clone()]).await?;
+        self.store.apply_event(&mut guard, &release);
+        self.store.apply_event(&mut guard, &book);
+        let parent_id = guard.parent_id;
+        self.notify.send(resource_id, &release);
+        self.notify.send(resource_id, &book);
+        self.notify_ancestors(parent_id, &release);
+        self.notify_ancestors(parent_id, &book);
+        Ok(())
     }
 
     pub async fn confirm_booking(

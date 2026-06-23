@@ -514,6 +514,266 @@ async fn engine_hold_release() {
     }
 }
 
+#[tokio::test]
+async fn engine_commit_hold_converts_hold_to_booking() {
+    let path = test_wal_path("commit_hold_convert.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    let hid = Ulid::new();
+    engine
+        .place_hold(hid, rid, Span::new(1000, 2000), now_ms() + H)
+        .await
+        .unwrap();
+
+    let bid = Ulid::new();
+    engine.commit_hold(hid, bid, Some("seat-14F".into())).await.unwrap();
+
+    // The hold is gone; exactly one booking covers the held span.
+    assert!(engine.get_holds(rid).await.unwrap().is_empty());
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert_eq!(bookings.len(), 1);
+    assert_eq!(bookings[0].id, bid);
+    assert_eq!((bookings[0].start, bookings[0].end), (1000, 2000));
+
+    // The span is now booked: a fresh booking attempt on it conflicts.
+    let err = engine
+        .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn engine_commit_hold_excludes_its_own_hold() {
+    let path = test_wal_path("commit_hold_exclude.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    let hid = Ulid::new();
+    engine
+        .place_hold(hid, rid, Span::new(1000, 2000), now_ms() + H)
+        .await
+        .unwrap();
+
+    // Booking the held span the naive way (without releasing first) conflicts with the hold...
+    let naive = engine
+        .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
+        .await;
+    assert!(matches!(naive, Err(EngineError::Conflict(_))));
+
+    // ...but committing the hold books that exact span, because the hold is excluded from its own
+    // conflict check. No release-then-rebook gap.
+    engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    assert!(engine.get_holds(rid).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn engine_commit_hold_unknown_id_not_found() {
+    let path = test_wal_path("commit_hold_notfound.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let err = engine
+        .commit_hold(Ulid::new(), Ulid::new(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn engine_commit_hold_on_booking_is_not_found() {
+    let path = test_wal_path("commit_hold_wrongkind.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    let bid = Ulid::new();
+    engine
+        .confirm_booking(bid, rid, Span::new(1000, 2000), None)
+        .await
+        .unwrap();
+
+    // bid is a booking, not a hold → there is no hold to commit.
+    let err = engine.commit_hold(bid, Ulid::new(), None).await.unwrap_err();
+    assert!(matches!(err, EngineError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn engine_commit_hold_rejects_when_span_booked_after_expiry() {
+    let path = test_wal_path("commit_hold_expired.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    // A hold that is already expired does not protect its span...
+    let hid = Ulid::new();
+    engine
+        .place_hold(hid, rid, Span::new(1000, 2000), 1)
+        .await
+        .unwrap();
+
+    // ...so a competitor books it.
+    engine
+        .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
+        .await
+        .unwrap();
+
+    // Committing the lapsed hold must NOT double-book: the conflict check (excluding the hold)
+    // still sees the competitor's booking.
+    let err = engine.commit_hold(hid, Ulid::new(), None).await.unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)));
+    // And nothing partially applied: still exactly one booking, and the lapsed hold is untouched.
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_holds(rid).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn engine_commit_hold_persists_across_replay() {
+    let path = test_wal_path("commit_hold_replay.wal");
+    let rid = Ulid::new();
+    let bid = Ulid::new();
+    {
+        let engine = Engine::new(path.clone(), Arc::new(NotifyHub::new())).unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+        let hid = Ulid::new();
+        engine
+            .place_hold(hid, rid, Span::new(1000, 2000), now_ms() + H)
+            .await
+            .unwrap();
+        engine.commit_hold(hid, bid, None).await.unwrap();
+    }
+
+    // Reopen from the WAL after a clean shutdown: the hold is gone and the booking survives — both
+    // halves of the commit are durable.
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    assert!(engine.get_holds(rid).await.unwrap().is_empty());
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert_eq!(bookings.len(), 1);
+    assert_eq!(bookings[0].id, bid);
+}
+
+#[tokio::test]
+async fn engine_commit_hold_torn_write_never_overbooks() {
+    // commit_hold writes HoldReleased + BookingConfirmed as two records under one fsync, so a torn
+    // write (power loss / IO error after the first record's bytes reach disk but before the
+    // second's) can persist HoldReleased and lose BookingConfirmed. Replay discards the torn tail.
+    // Because release is written BEFORE confirm, the worst a crash can leave is a freed (re-bookable)
+    // slot — never a live hold AND a booking on the span (never an overbook, INV-01). This locks
+    // that safe direction; it is the durability posture AVAIL-07 actually provides.
+    let path = test_wal_path("commit_hold_torn.wal");
+    let rid = Ulid::new();
+    {
+        let engine = Engine::new(path.clone(), Arc::new(NotifyHub::new())).unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+        let hid = Ulid::new();
+        engine
+            .place_hold(hid, rid, Span::new(1000, 2000), now_ms() + H)
+            .await
+            .unwrap();
+        engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
+    }
+
+    // Tear the trailing record (BookingConfirmed) by lopping off its tail; the HoldReleased record
+    // before it stays intact, so replay applies the release and rejects the truncated booking.
+    let len = std::fs::metadata(&path).unwrap().len();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(len - 8).unwrap();
+    drop(file);
+
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let holds = engine.get_holds(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    // The booking was lost, but the unsafe outcome (a lingering hold AND a booking) never occurs:
+    // the span is simply free again.
+    assert!(bookings.is_empty(), "a torn commit must not leave a booking");
+    assert!(holds.is_empty(), "release was durable, so no hold lingers");
+}
+
+#[tokio::test]
+async fn engine_commit_hold_excludes_own_hold_on_capacity_n() {
+    // On a capacity-2 resource already holding two overlapping allocations, committing one must
+    // succeed: excluding the committed hold from its own conflict check leaves only the other
+    // allocation (1 < 2). Without the exclusion the sweep would count both holds (= capacity) and
+    // reject the new booking — so this exercises the capacity>1 exclusion path through
+    // collect_active_allocs_with_buffer, distinct from the capacity-1 fast path.
+    let path = test_wal_path("commit_hold_cap_n.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 2, None).await.unwrap();
+
+    let far = now_ms() + H;
+    let a = Ulid::new();
+    let b = Ulid::new();
+    engine.place_hold(a, rid, Span::new(10, 20), far).await.unwrap();
+    engine.place_hold(b, rid, Span::new(10, 20), far).await.unwrap(); // 2/2 on [10,20]
+
+    // Convert A's slot in place: booking A + hold B = 2 ≤ capacity.
+    engine.commit_hold(a, Ulid::new(), None).await.unwrap();
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_holds(rid).await.unwrap().len(), 1);
+
+    // A third overlapping allocation now exceeds capacity — confirms the resource was genuinely full.
+    let err = engine
+        .confirm_booking(Ulid::new(), rid, Span::new(10, 20), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::CapacityExceeded(_)));
+}
+
+#[tokio::test]
+async fn engine_commit_hold_with_buffer_books_the_held_span() {
+    // With a turnaround buffer on the resource, commit_hold still books exactly the held span, and
+    // the buffer-extended conflict check excludes the hold itself (no false self-conflict).
+    let path = test_wal_path("commit_hold_buffer.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, Some(5)).await.unwrap();
+
+    let hid = Ulid::new();
+    engine
+        .place_hold(hid, rid, Span::new(100, 200), now_ms() + H)
+        .await
+        .unwrap();
+    engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
+
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert_eq!(bookings.len(), 1);
+    assert_eq!((bookings[0].start, bookings[0].end), (100, 200));
+    assert!(engine.get_holds(rid).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn engine_commit_hold_notifies_resource_and_ancestors() {
+    // commit_hold emits HoldReleased then BookingConfirmed on the resource's channel and bubbles
+    // both to ancestors, so a subscriber on the resource AND one on its parent each see both, in
+    // order.
+    let path = test_wal_path("commit_hold_notify.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let parent = Ulid::new();
+    let child = Ulid::new();
+    engine.create_resource(parent, None, None, 1, None).await.unwrap();
+    engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
+
+    let hid = Ulid::new();
+    engine
+        .place_hold(hid, child, Span::new(10, 20), now_ms() + H)
+        .await
+        .unwrap();
+
+    // Subscribe after the setup mutations so only the commit's events are observed.
+    let mut on_child = engine.notify.subscribe(child);
+    let mut on_parent = engine.notify.subscribe(parent);
+
+    engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
+
+    assert!(matches!(on_child.recv().await.unwrap(), Event::HoldReleased { .. }));
+    assert!(matches!(on_child.recv().await.unwrap(), Event::BookingConfirmed { .. }));
+    assert!(matches!(on_parent.recv().await.unwrap(), Event::HoldReleased { .. }));
+    assert!(matches!(on_parent.recv().await.unwrap(), Event::BookingConfirmed { .. }));
+}
+
 // ══════════════════════════════════════════════════════════════
 // Pure function edge cases
 // ══════════════════════════════════════════════════════════════
