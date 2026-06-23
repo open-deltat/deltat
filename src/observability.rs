@@ -64,6 +64,8 @@ pub fn command_label(cmd: &Command) -> &'static str {
         Command::SelectHolds { .. } => "select_holds",
         Command::SelectAvailability { .. } => "select_availability",
         Command::SelectMultiAvailability { .. } => "select_multi_availability",
+        Command::SelectBookingsMulti { .. } => "select_bookings_multi",
+        Command::SelectHoldsMulti { .. } => "select_holds_multi",
         Command::Listen { .. } => "listen",
         Command::Unlisten { .. } => "unlisten",
         Command::UnlistenAll => "unlisten_all",
