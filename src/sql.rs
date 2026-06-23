@@ -4,7 +4,7 @@ use sqlparser::parser::Parser;
 use ulid::Ulid;
 
 use crate::command::Command;
-use crate::limits::MAX_IN_CLAUSE_IDS;
+use crate::limits::{MAX_BATCH_SIZE, MAX_IN_CLAUSE_IDS};
 use crate::model::*;
 
 pub fn parse_sql(sql: &str) -> Result<Command, SqlError> {
@@ -108,11 +108,14 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
 
             if all_rows.len() == 1 {
                 let values = &all_rows[0];
+                if !columns.is_empty() && values.len() != columns.len() {
+                    return Err(SqlError::WrongArity("bookings", columns.len(), values.len()));
+                }
                 if values.len() < 4 {
                     return Err(SqlError::WrongArity("bookings", 4, values.len()));
                 }
-                let label = label_idx
-                    .map(|i| parse_string_or_null(&values[i]))
+                let label = cell(values, label_idx)
+                    .map(parse_string_or_null)
                     .transpose()?
                     .flatten();
                 Ok(Command::InsertBooking {
@@ -125,11 +128,14 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
             } else {
                 let mut bookings = Vec::with_capacity(all_rows.len());
                 for (i, row) in all_rows.iter().enumerate() {
+                    if !columns.is_empty() && row.len() != columns.len() {
+                        return Err(SqlError::WrongArity("bookings row", columns.len(), row.len()));
+                    }
                     if row.len() < 4 {
                         return Err(SqlError::WrongArity("bookings row", 4, row.len()));
                     }
-                    let label = label_idx
-                        .map(|j| parse_string_or_null(&row[j]).map_err(|e| SqlError::Parse(format!("row {i}: {e}"))))
+                    let label = cell(row, label_idx)
+                        .map(|e| parse_string_or_null(e).map_err(|e| SqlError::Parse(format!("row {i}: {e}"))))
                         .transpose()?
                         .flatten();
                     bookings.push((
@@ -530,35 +536,55 @@ fn extract_insert_values(insert: &ast::Insert) -> Result<Vec<Expr>, SqlError> {
 /// when a column list is present, with the legacy positional order (id, parent_id, capacity,
 /// buffer_after) as the fallback. Shared by the single-row (InsertResource) and multi-row
 /// (BatchInsertResources) paths.
+/// Resolve a declared-column value index against the actual row, returning None when the column was
+/// declared but the row supplied fewer values. sqlparser accepts that column/value arity mismatch,
+/// so indexing it unchecked panics on untrusted SQL — and the SQL boundary must never panic
+/// (PRIN-08 / SEC-09). Optional columns become absent; a missing required column is a WrongArity.
+fn cell(values: &[Expr], idx: Option<usize>) -> Option<&Expr> {
+    idx.filter(|&i| i < values.len()).map(|i| &values[i])
+}
+
 fn parse_resource_row(values: &[Expr], columns: &[String]) -> Result<ResourceRow, SqlError> {
     if values.is_empty() {
         return Err(SqlError::WrongArity("resources", 1, 0));
+    }
+    // A declared column list must match the value count; sqlparser accepts a mismatch, so reject it
+    // cleanly here rather than indexing a column position past the row (the `cell` accesses below
+    // are then bounded either way — defense in depth).
+    if !columns.is_empty() && values.len() != columns.len() {
+        return Err(SqlError::WrongArity("resources", columns.len(), values.len()));
     }
     let col_idx = |name: &str| -> Option<usize> {
         if columns.is_empty() { None } else { columns.iter().position(|c| c == name) }
     };
 
-    let id = parse_ulid(&values[col_idx("id").unwrap_or(0)])?;
-    let parent_id = col_idx("parent_id")
-        .or(if columns.is_empty() && values.len() >= 2 { Some(1) } else { None })
-        .map(|i| parse_ulid_or_null(&values[i]))
+    // id is required: a declared id column with no corresponding value is malformed, not a panic.
+    let id = parse_ulid(
+        cell(values, col_idx("id").or(Some(0)))
+            .ok_or(SqlError::WrongArity("resources", 1, values.len()))?,
+    )?;
+    let parent_id = cell(
+        values,
+        col_idx("parent_id").or(if columns.is_empty() && values.len() >= 2 { Some(1) } else { None }),
+    )
+    .map(parse_ulid_or_null)
+    .transpose()?
+    .flatten();
+    let name = cell(values, col_idx("name"))
+        .map(parse_string_or_null)
         .transpose()?
         .flatten();
-    let name = col_idx("name")
-        .map(|i| parse_string_or_null(&values[i]))
-        .transpose()?
-        .flatten();
-    let capacity = if let Some(i) = col_idx("capacity") {
-        parse_u32(&values[i])?
-    } else if columns.is_empty() {
-        if values.len() >= 3 { parse_u32(&values[2])? } else { 1 }
+    let capacity = if let Some(e) = cell(values, col_idx("capacity")) {
+        parse_u32(e)?
+    } else if columns.is_empty() && values.len() >= 3 {
+        parse_u32(&values[2])?
     } else {
         1
     };
-    let buffer_after = if let Some(i) = col_idx("buffer_after") {
-        parse_i64_or_null(&values[i])?
-    } else if columns.is_empty() {
-        if values.len() >= 4 { parse_i64_or_null(&values[3])? } else { None }
+    let buffer_after = if let Some(e) = cell(values, col_idx("buffer_after")) {
+        parse_i64_or_null(e)?
+    } else if columns.is_empty() && values.len() >= 4 {
+        parse_i64_or_null(&values[3])?
     } else {
         None
     };
@@ -575,6 +601,14 @@ fn extract_all_insert_rows(insert: &ast::Insert) -> Result<Vec<Vec<Expr>>, SqlEr
         SetExpr::Values(values) => {
             if values.rows.is_empty() {
                 return Err(SqlError::Parse("empty VALUES".into()));
+            }
+            // Reject an over-large multi-row INSERT at the boundary (mirrors the IN-clause cap), so
+            // the engine's batch cap isn't reached only after parsing+validating every row.
+            if values.rows.len() > MAX_BATCH_SIZE {
+                return Err(SqlError::Parse(format!(
+                    "INSERT too large: {} rows (max {MAX_BATCH_SIZE})",
+                    values.rows.len()
+                )));
             }
             Ok(values.rows.clone())
         }
@@ -898,6 +932,50 @@ mod tests {
         // A single-row INSERT still produces InsertResource.
         let one = format!("INSERT INTO resources (id) VALUES ('{id1}')");
         assert!(matches!(parse_sql(&one).unwrap(), Command::InsertResource { .. }));
+    }
+
+    #[test]
+    fn parse_resource_insert_column_arity_mismatch_does_not_panic() {
+        // Declared 5 columns, supplied 1 value: sqlparser accepts it; the parser must return a
+        // clean error, never index out of bounds (the SQL boundary is untrusted — PRIN-08/SEC-09).
+        let sql = "INSERT INTO resources (id, parent_id, name, capacity, buffer_after) VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV')";
+        assert!(parse_sql(sql).is_err());
+    }
+
+    #[test]
+    fn parse_booking_insert_label_arity_mismatch_does_not_panic() {
+        // Declared a label column but supplied only 4 values: must not index values[4]. The
+        // declared/value arity mismatch is a clean WrongArity error, never a panic.
+        let sql = r#"INSERT INTO bookings (id, resource_id, start, "end", label) VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW', 1000, 2000)"#;
+        assert!(parse_sql(sql).is_err());
+    }
+
+    #[test]
+    fn parse_over_batch_size_insert_is_rejected() {
+        // A multi-row INSERT beyond the batch cap is rejected at the boundary, not after parsing
+        // and validating every row.
+        let r = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let rows: String = (0..=MAX_BATCH_SIZE)
+            .map(|_| format!("('{r}', '{r}', 0, 1)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES {rows}"#);
+        assert!(parse_sql(&sql).is_err());
+    }
+
+    #[test]
+    fn parse_resource_insert_arity_fuzz_never_panics() {
+        use proptest::prelude::*;
+        let cols = ["id", "parent_id", "name", "capacity", "buffer_after"];
+        // Any declared-column count vs value count must yield Ok or Err — never a panic.
+        proptest!(ProptestConfig::with_cases(400), |(ncols in 1usize..=5, nvals in 0usize..=5)| {
+            let collist = cols[..ncols].join(", ");
+            let vallist = (0..nvals)
+                .map(|_| "'01ARZ3NDEKTSV4RRFFQ69G5FAV'")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = parse_sql(&format!("INSERT INTO resources ({collist}) VALUES ({vallist})"));
+        });
     }
 
     #[test]
