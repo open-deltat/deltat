@@ -43,43 +43,21 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
 
     match table.as_str() {
         "resources" => {
-            if values.is_empty() {
-                return Err(SqlError::WrongArity("resources", 1, 0));
+            let all_rows = extract_all_insert_rows(insert)?;
+            if all_rows.len() == 1 {
+                let (id, parent_id, name, capacity, buffer_after) =
+                    parse_resource_row(&all_rows[0], &columns)?;
+                Ok(Command::InsertResource { id, parent_id, name, capacity, buffer_after })
+            } else {
+                let mut resources = Vec::with_capacity(all_rows.len());
+                for (i, row) in all_rows.iter().enumerate() {
+                    resources.push(
+                        parse_resource_row(row, &columns)
+                            .map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
+                    );
+                }
+                Ok(Command::BatchInsertResources { resources })
             }
-            // Column-aware parsing: map column name → value index
-            let col_idx = |name: &str| -> Option<usize> {
-                if columns.is_empty() { None } else { columns.iter().position(|c| c == name) }
-            };
-
-            let id = parse_ulid(&values[col_idx("id").unwrap_or(0)])?;
-            let parent_id = col_idx("parent_id").or(if columns.is_empty() && values.len() >= 2 { Some(1) } else { None })
-                .map(|i| parse_ulid_or_null(&values[i]))
-                .transpose()?
-                .flatten();
-            let name = col_idx("name")
-                .map(|i| parse_string_or_null(&values[i]))
-                .transpose()?
-                .flatten();
-
-            // For capacity/buffer_after, use column names if present; otherwise use positional
-            // (skipping over name if it wasn't in columns)
-            let capacity = if let Some(i) = col_idx("capacity") {
-                parse_u32(&values[i])?
-            } else if columns.is_empty() {
-                // No columns specified: old positional order (id, parent_id, capacity, buffer_after)
-                if values.len() >= 3 { parse_u32(&values[2])? } else { 1 }
-            } else {
-                1
-            };
-            let buffer_after = if let Some(i) = col_idx("buffer_after") {
-                parse_i64_or_null(&values[i])?
-            } else if columns.is_empty() {
-                if values.len() >= 4 { parse_i64_or_null(&values[3])? } else { None }
-            } else {
-                None
-            };
-
-            Ok(Command::InsertResource { id, parent_id, name, capacity, buffer_after })
         }
         "rules" => {
             let all_rows = extract_all_insert_rows(insert)?;
@@ -548,6 +526,46 @@ fn extract_insert_values(insert: &ast::Insert) -> Result<Vec<Expr>, SqlError> {
     }
 }
 
+/// Parse one resource VALUES row into (id, parent_id, name, capacity, buffer_after). Column-aware
+/// when a column list is present, with the legacy positional order (id, parent_id, capacity,
+/// buffer_after) as the fallback. Shared by the single-row (InsertResource) and multi-row
+/// (BatchInsertResources) paths.
+fn parse_resource_row(values: &[Expr], columns: &[String]) -> Result<ResourceRow, SqlError> {
+    if values.is_empty() {
+        return Err(SqlError::WrongArity("resources", 1, 0));
+    }
+    let col_idx = |name: &str| -> Option<usize> {
+        if columns.is_empty() { None } else { columns.iter().position(|c| c == name) }
+    };
+
+    let id = parse_ulid(&values[col_idx("id").unwrap_or(0)])?;
+    let parent_id = col_idx("parent_id")
+        .or(if columns.is_empty() && values.len() >= 2 { Some(1) } else { None })
+        .map(|i| parse_ulid_or_null(&values[i]))
+        .transpose()?
+        .flatten();
+    let name = col_idx("name")
+        .map(|i| parse_string_or_null(&values[i]))
+        .transpose()?
+        .flatten();
+    let capacity = if let Some(i) = col_idx("capacity") {
+        parse_u32(&values[i])?
+    } else if columns.is_empty() {
+        if values.len() >= 3 { parse_u32(&values[2])? } else { 1 }
+    } else {
+        1
+    };
+    let buffer_after = if let Some(i) = col_idx("buffer_after") {
+        parse_i64_or_null(&values[i])?
+    } else if columns.is_empty() {
+        if values.len() >= 4 { parse_i64_or_null(&values[3])? } else { None }
+    } else {
+        None
+    };
+
+    Ok((id, parent_id, name, capacity, buffer_after))
+}
+
 fn extract_all_insert_rows(insert: &ast::Insert) -> Result<Vec<Vec<Expr>>, SqlError> {
     let body = insert
         .source
@@ -861,6 +879,25 @@ mod tests {
             }
             _ => panic!("expected InsertResource, got {cmd:?}"),
         }
+    }
+
+    #[test]
+    fn parse_multi_row_resources_insert_is_batch() {
+        let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAW";
+        let multi =
+            format!("INSERT INTO resources (id, capacity) VALUES ('{id1}', 5), ('{id2}', 3)");
+        match parse_sql(&multi).unwrap() {
+            Command::BatchInsertResources { resources } => {
+                assert_eq!(resources.len(), 2);
+                assert_eq!(resources[0].3, 5); // capacity
+                assert_eq!(resources[1].3, 3);
+            }
+            other => panic!("expected BatchInsertResources, got {other:?}"),
+        }
+        // A single-row INSERT still produces InsertResource.
+        let one = format!("INSERT INTO resources (id) VALUES ('{id1}')");
+        assert!(matches!(parse_sql(&one).unwrap(), Command::InsertResource { .. }));
     }
 
     #[test]
