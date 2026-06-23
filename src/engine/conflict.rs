@@ -1,3 +1,5 @@
+use ulid::Ulid;
+
 use crate::model::*;
 
 use super::availability::compute_saturated_spans;
@@ -36,6 +38,18 @@ pub(crate) fn validate_timestamp(ts: Ms) -> Result<(), EngineError> {
 }
 
 pub(crate) fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Result<(), EngineError> {
+    check_no_conflict_excluding(rs, span, now, None)
+}
+
+/// Conflict check that ignores one allocation by id. Used by `commit_hold`: a hold being converted
+/// into a booking on the same span must not conflict with *itself* (it is the caller's own
+/// reservation), while still rejecting any other allocation on the span.
+pub(crate) fn check_no_conflict_excluding(
+    rs: &ResourceState,
+    span: &Span,
+    now: Ms,
+    exclude: Option<Ulid>,
+) -> Result<(), EngineError> {
     let buffer = rs.buffer_after.unwrap_or(0);
     // Expand the search window to catch:
     // - Existing allocations whose end + buffer > span.start (search backwards by buffer)
@@ -47,6 +61,9 @@ pub(crate) fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Res
     if rs.capacity <= 1 {
         // Fast path: any overlapping active allocation (with buffer) is a conflict
         for interval in rs.overlapping(&search_span) {
+            if Some(interval.id) == exclude {
+                continue;
+            }
             match &interval.kind {
                 IntervalKind::Hold { expires_at } if *expires_at <= now => continue,
                 IntervalKind::Hold { .. } | IntervalKind::Booking { .. } => {
@@ -61,7 +78,7 @@ pub(crate) fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Res
         }
     } else {
         // Capacity > 1: count overlapping active allocations using sweep line
-        let allocs = collect_active_allocs_with_buffer(rs, &search_span, now, buffer);
+        let allocs = collect_active_allocs_with_buffer(rs, &search_span, now, buffer, exclude);
         let saturated = compute_saturated_spans(&allocs, rs.capacity);
         for sat in &saturated {
             if sat.overlaps(span) {
@@ -96,7 +113,7 @@ pub(crate) fn check_batch_capacity(
 
     // Combine already-committed active allocations (buffer-extended) with all batch members,
     // then look for any region where the concurrent count EXCEEDS capacity (>= capacity + 1).
-    let mut allocs = collect_active_allocs_with_buffer(rs, &window, now, buffer);
+    let mut allocs = collect_active_allocs_with_buffer(rs, &window, now, buffer, None);
     for s in spans {
         allocs.push(Span::new(s.start, s.end.saturating_add(buffer)));
     }
@@ -114,9 +131,13 @@ fn collect_active_allocs_with_buffer(
     query: &Span,
     now: Ms,
     buffer: Ms,
+    exclude: Option<Ulid>,
 ) -> Vec<Span> {
     let mut allocs = Vec::new();
     for interval in rs.overlapping(query) {
+        if Some(interval.id) == exclude {
+            continue;
+        }
         match &interval.kind {
             IntervalKind::Hold { expires_at } if *expires_at <= now => continue,
             IntervalKind::Hold { .. } | IntervalKind::Booking { .. } => {

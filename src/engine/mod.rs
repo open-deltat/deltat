@@ -34,6 +34,13 @@ pub(super) enum WalCommand {
         event: Event,
         response: oneshot::Sender<io::Result<()>>,
     },
+    /// Append several events under a single fsync: the realistic failure (fsync errors) leaves
+    /// none of them durable, so the group is atomic across a crash. Used by `commit_hold` to write
+    /// HoldReleased + BookingConfirmed as one unit.
+    AppendAtomic {
+        events: Vec<Event>,
+        response: oneshot::Sender<io::Result<()>>,
+    },
     Compact {
         events: Vec<Event>,
         response: oneshot::Sender<io::Result<()>>,
@@ -124,6 +131,23 @@ fn respond_batch(batch: &mut Vec<(Event, oneshot::Sender<io::Result<()>>)>, resu
 
 fn handle_non_append(wal: &mut Wal, cmd: WalCommand) {
     match cmd {
+        WalCommand::AppendAtomic { events, response } => {
+            // Buffer every event, then one flush_sync — the same shape as flush_batch but for a
+            // single response. Always flush so partial bytes don't leak into the next write.
+            let mut append_err = None;
+            for event in &events {
+                if let Err(e) = wal.append_buffered(event) {
+                    append_err = Some(e);
+                    break;
+                }
+            }
+            let flush_err = wal.flush_sync().err();
+            let result = match append_err.or(flush_err) {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
+            let _ = response.send(result);
+        }
         WalCommand::Compact { events, response } => {
             let result = Wal::write_compact_file(wal.path(), &events)
                 .and_then(|()| wal.swap_compact_file());
@@ -209,6 +233,21 @@ impl Engine {
         self.wal_tx
             .send(WalCommand::Append {
                 event: event.clone(),
+                response: tx,
+            })
+            .await
+            .map_err(|_| EngineError::WalError("WAL writer shut down".into()))?;
+        rx.await
+            .map_err(|_| EngineError::WalError("WAL writer dropped response".into()))?
+            .map_err(|e| EngineError::WalError(e.to_string()))
+    }
+
+    /// Append several events under one fsync (atomic across a crash). See `WalCommand::AppendAtomic`.
+    async fn wal_append_atomic(&self, events: &[Event]) -> Result<(), EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.wal_tx
+            .send(WalCommand::AppendAtomic {
+                events: events.to_vec(),
                 response: tx,
             })
             .await
