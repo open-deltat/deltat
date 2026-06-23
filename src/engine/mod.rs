@@ -169,6 +169,11 @@ pub struct Engine {
     pub(super) wal_tx: mpsc::Sender<WalCommand>,
     pub notify: Arc<NotifyHub>,
     clock: Arc<dyn Clock>,
+    /// A conservative lower bound on the earliest live hold's `expires_at`. The reaper skips its
+    /// full scan when `now` is below this. `place_hold` lowers it; each full scan recomputes it
+    /// exactly. `i64::MIN` means "unknown — scan" (the initial value, so the first reaper cycle and
+    /// the cycle after any replay scan normally).
+    pub(super) earliest_hold_expiry: std::sync::atomic::AtomicI64,
 }
 
 impl Engine {
@@ -194,6 +199,7 @@ impl Engine {
             wal_tx,
             notify,
             clock,
+            earliest_hold_expiry: std::sync::atomic::AtomicI64::new(i64::MIN),
         };
 
         // Replay events — we're the sole owner of these Arcs, so try_read/try_write
