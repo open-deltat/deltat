@@ -2,6 +2,7 @@ use super::*;
 use super::conflict::{validate_buffer, validate_span, validate_timestamp};
 use crate::clock::{now_ms, TestClock};
 use crate::limits::*;
+use proptest::prelude::*;
 
 const H: Ms = 3_600_000; // 1 hour in ms
 const M: Ms = 60_000; // 1 minute in ms
@@ -4097,7 +4098,8 @@ async fn interval_limit_hold() {
     // Add one non-blocking rule to cover all holds
     engine.add_rule(Ulid::new(), rid, Span::new(0, (MAX_INTERVALS_PER_RESOURCE as i64 + 2) * 10), false).await.unwrap();
 
-    let far_future = i64::MAX / 2;
+    // The largest valid expiry instant; i64::MAX/2 is rejected by validate_timestamp (out of range).
+    let far_future = MAX_VALID_TIMESTAMP_MS;
     for i in 0..MAX_INTERVALS_PER_RESOURCE - 1 {
         let start = (i as i64) * 10;
         engine.place_hold(Ulid::new(), rid, Span::new(start, start + 5), far_future).await.unwrap();
@@ -4704,4 +4706,354 @@ fn store_get_children() {
 fn store_default() {
     let store = InMemoryStore::default();
     assert_eq!(store.resource_count(), 0);
+}
+
+// ── Untrusted-input hardening regressions (OSS review) ──────────────────
+
+#[tokio::test]
+async fn availability_query_with_extreme_bounds_is_rejected_not_panicked() {
+    // start = -1, end = i64::MAX orders correctly (end > start), so the inverted-window
+    // guard passes, but end - start overflows i64. With overflow-checks on, the naive
+    // subtraction panicked the connection task; it must be rejected as a too-wide window.
+    let path = test_wal_path("avail_extreme_bounds.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let id = Ulid::new();
+    engine.create_resource(id, None, None, 1, None).await.unwrap();
+
+    let single = engine.compute_availability(id, -1, i64::MAX, None).await;
+    assert!(matches!(
+        single,
+        Err(EngineError::LimitExceeded("query window too wide"))
+    ));
+
+    let multi = engine
+        .compute_multi_availability(&[id], -1, i64::MAX, 1, None)
+        .await;
+    assert!(matches!(
+        multi,
+        Err(EngineError::LimitExceeded("query window too wide"))
+    ));
+}
+
+#[tokio::test]
+async fn multi_availability_inverted_window_is_empty() {
+    let path = test_wal_path("multi_avail_inverted.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let id = Ulid::new();
+    engine.create_resource(id, None, None, 1, None).await.unwrap();
+
+    let result = engine
+        .compute_multi_availability(&[id], 5_000, 1_000, 1, None)
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn multi_availability_threshold_above_resource_count_is_empty() {
+    // Asking for 2 free out of 1 resource can never be satisfied. This guard also
+    // neutralizes a min_available value that wrapped from a negative SQL literal.
+    let path = test_wal_path("multi_avail_threshold.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let id = Ulid::new();
+    engine.create_resource(id, None, None, 1, None).await.unwrap();
+
+    let result = engine
+        .compute_multi_availability(&[id], 0, 10_000, 2, None)
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn gc_with_unbounded_retention_does_not_underflow() {
+    // retention_ms is operator-configured; now - retention_ms must saturate, not underflow.
+    let path = test_wal_path("gc_unbounded_retention.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let clock = Arc::new(TestClock::new(1_000));
+    let engine = Engine::with_clock(path, notify, clock).unwrap();
+    let id = Ulid::new();
+    engine.create_resource(id, None, None, 1, None).await.unwrap();
+    // A booking that ended well before now, eligible for collection under a normal retention.
+    engine
+        .confirm_booking(Ulid::new(), id, Span::new(10, 20), None)
+        .await
+        .unwrap();
+
+    // A huge retention saturates the cutoff to i64::MIN, so nothing is old enough: collect nothing
+    // rather than panic or over-collect.
+    assert_eq!(engine.gc_past_intervals(engine.now_ms(), i64::MAX), 0);
+    // Zero retention puts the cutoff at now, so the past booking is collected. This proves the
+    // assertion above distinguishes correct saturation from accidental over- or under-collection.
+    assert_eq!(engine.gc_past_intervals(engine.now_ms(), 0), 1);
+}
+
+#[tokio::test]
+async fn delete_resource_reclaims_notify_channel() {
+    // A deleted resource gets no further events, so its broadcast channel is reclaimed:
+    // the delivered ResourceDeleted drains first, then the channel reports closed.
+    let path = test_wal_path("delete_reclaims_notify.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify.clone()).unwrap();
+    let id = Ulid::new();
+    engine.create_resource(id, None, None, 1, None).await.unwrap();
+
+    let mut rx = notify.subscribe(id);
+    engine.delete_resource(id).await.unwrap();
+
+    let delivered = rx.recv().await.unwrap();
+    assert!(matches!(delivered, Event::ResourceDeleted { .. }));
+    assert!(matches!(
+        rx.recv().await,
+        Err(tokio::sync::broadcast::error::RecvError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn compact_wal_waits_for_a_locked_resource() {
+    // Compaction runs on a timer while a mutation holds a resource's write lock across its
+    // awaited WAL append. The old try_read().expect() panicked the compactor; it must wait
+    // for the lock and keep the resource in the rewritten WAL.
+    use std::time::Duration;
+
+    let path = test_wal_path("compact_locked_resource.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+    let id = Ulid::new();
+    engine.create_resource(id, None, None, 1, None).await.unwrap();
+
+    let rs = engine.get_resource(&id).unwrap();
+    let guard = rs.write().await;
+
+    let compactor = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.compact_wal().await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(guard);
+
+    compactor.await.unwrap().unwrap();
+    assert!(engine.get_resource(&id).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_bookings_on_capacity_one_admit_exactly_one() {
+    // INV-09: the per-resource write lock serializes mutations, so racing many bookings for the
+    // same span on a capacity-1 resource admits exactly one and conflicts the rest. Covers the
+    // same-resource race directly (the prior concurrency test uses distinct resources).
+    let path = test_wal_path("concurrent_same_resource.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+    let id = Ulid::new();
+    engine.create_resource(id, None, None, 1, None).await.unwrap();
+
+    let span = Span::new(1_000, 2_000);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let engine = engine.clone();
+        tasks.push(tokio::spawn(async move {
+            engine.confirm_booking(Ulid::new(), id, span, None).await
+        }));
+    }
+
+    let mut admitted = 0;
+    let mut conflicted = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(()) => admitted += 1,
+            Err(EngineError::Conflict(_)) => conflicted += 1,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert_eq!(admitted, 1);
+    assert_eq!(conflicted, 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_bookings_on_capacity_n_admit_exactly_n() {
+    // INV-01 under contention on a capacity pool: racing many bookings for one span on a capacity-N
+    // resource admits exactly N (the capacity sweep, not just the capacity-1 fast path, holds under
+    // the serializing write lock); the rest are rejected as over capacity.
+    let path = test_wal_path("concurrent_capacity_n.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+    let id = Ulid::new();
+    let capacity = 2u32;
+    engine.create_resource(id, None, None, capacity, None).await.unwrap();
+
+    let span = Span::new(1_000, 2_000);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let engine = engine.clone();
+        tasks.push(tokio::spawn(async move {
+            engine.confirm_booking(Ulid::new(), id, span, None).await
+        }));
+    }
+
+    let mut admitted = 0u32;
+    let mut over_capacity = 0u32;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(()) => admitted += 1,
+            Err(EngineError::CapacityExceeded(_)) => over_capacity += 1,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert_eq!(admitted, capacity);
+    assert_eq!(over_capacity, 8 - capacity);
+}
+
+#[test]
+fn availability_never_panics_on_arbitrary_query_bounds() {
+    // PRIN-08: the read path must never panic on untrusted bounds, however extreme. Drive both
+    // availability functions with arbitrary i64 windows and arbitrary usize thresholds against a
+    // non-trivial resource. Any Ok or Err is acceptable; a panic fails the test.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (engine, id) = rt.block_on(async {
+        let path = test_wal_path("fuzz_avail_bounds.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+        let id = Ulid::new();
+        engine.create_resource(id, None, None, 3, None).await.unwrap();
+        engine
+            .add_rule(Ulid::new(), id, Span::new(0, 100_000_000), false)
+            .await
+            .unwrap();
+        engine
+            .confirm_booking(Ulid::new(), id, Span::new(1_000, 2_000), None)
+            .await
+            .unwrap();
+        (engine, id)
+    });
+
+    proptest!(
+        ProptestConfig::with_cases(1000),
+        |(start in any::<i64>(), end in any::<i64>(), min_av in any::<usize>())| {
+            let _ = rt.block_on(engine.compute_availability(id, start, end, None));
+            let _ = rt.block_on(engine.compute_multi_availability(&[id], start, end, min_av, None));
+        }
+    );
+}
+
+#[test]
+fn engine_never_exceeds_capacity_through_command_path() {
+    // INV-01 through the real mutation path (the spec's pending TEST-02, focused form): apply an
+    // arbitrary booking sequence to a capacity-K resource. The engine accepts some and rejects any
+    // that would breach capacity, so no instant may end up with more than K active bookings.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    proptest!(
+        ProptestConfig::with_cases(64),
+        |(raw in prop::collection::vec((0i64..20, 1i64..15), 1..25), capacity in 1u32..4)| {
+            let accepted: Vec<Span> = rt.block_on(async {
+                let path = test_wal_path(&format!("stateful_capacity_{}.wal", Ulid::new()));
+                let notify = Arc::new(NotifyHub::new());
+                let engine = Engine::new(path, notify).unwrap();
+                let id = Ulid::new();
+                engine
+                    .create_resource(id, None, None, capacity, None)
+                    .await
+                    .unwrap();
+                let mut accepted = Vec::new();
+                for (start_h, len_h) in &raw {
+                    let span = Span::new(start_h * H, (start_h + len_h) * H);
+                    if engine
+                        .confirm_booking(Ulid::new(), id, span, None)
+                        .await
+                        .is_ok()
+                    {
+                        accepted.push(span);
+                    }
+                }
+                accepted
+            });
+
+            for t in 0..40i64 {
+                let instant = t * H;
+                let active = accepted.iter().filter(|s| s.contains_instant(instant)).count() as u32;
+                prop_assert!(
+                    active <= capacity,
+                    "instant {instant}: {active} active exceeds capacity {capacity}"
+                );
+            }
+        }
+    );
+}
+
+#[test]
+fn multi_availability_never_panics_on_arbitrary_inputs() {
+    // Extends the no-panic guarantee to the multi-resource sweep over several occupied resources:
+    // arbitrary thresholds and windows must never panic. In particular the segment-close guard must
+    // never construct a zero-width Span when coverage opens and closes at the same instant.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (engine, ids) = rt.block_on(async {
+        let path = test_wal_path("fuzz_multi_avail.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+        let mut ids = Vec::new();
+        for k in 0..4i64 {
+            let id = Ulid::new();
+            engine.create_resource(id, None, None, 2, None).await.unwrap();
+            engine
+                .add_rule(Ulid::new(), id, Span::new(0, 10_000), false)
+                .await
+                .unwrap();
+            let base = k * 1_000;
+            engine
+                .confirm_booking(Ulid::new(), id, Span::new(base, base + 1_500), None)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        (engine, ids)
+    });
+
+    proptest!(
+        ProptestConfig::with_cases(1500),
+        |(start in 0i64..6_000, end in 0i64..6_000, min_av in 1usize..=4, n in 1usize..=4)| {
+            let subset = &ids[..n.min(ids.len())];
+            let _ = rt.block_on(engine.compute_multi_availability(subset, start, end, min_av, None));
+        }
+    );
+}
+
+#[tokio::test]
+async fn availability_bounds_a_corrupt_over_deep_hierarchy() {
+    // create_resource caps depth, but WAL replay inserts resources directly without that check, so
+    // a crafted or corrupt store could exceed MAX_HIERARCHY_DEPTH. collect_inherited_rules must
+    // still bound its ancestor walk and reject it rather than loop unbounded.
+    let path = test_wal_path("corrupt_deep_hierarchy.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let mut parent = None;
+    let mut deepest = Ulid::new();
+    for _ in 0..MAX_HIERARCHY_DEPTH + 5 {
+        let id = Ulid::new();
+        engine.store.insert_resource(
+            id,
+            Arc::new(tokio::sync::RwLock::new(ResourceState::new(id, parent, None, 1, None))),
+        );
+        parent = Some(id);
+        deepest = id;
+    }
+
+    let result = engine.compute_availability(deepest, 0, 1_000, None).await;
+    assert!(matches!(
+        result,
+        Err(EngineError::LimitExceeded("hierarchy too deep"))
+    ));
 }

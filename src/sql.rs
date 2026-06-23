@@ -263,6 +263,11 @@ fn extract_availability_filters(
                     f.min_duration = Some(parse_i64_expr(right)?);
                 } else if col.as_deref() == Some("min_available") {
                     let v = parse_i64_expr(right)?;
+                    if v < 0 {
+                        return Err(SqlError::Unsupported(
+                            "min_available must be non-negative".into(),
+                        ));
+                    }
                     f.min_available = Some(v as usize);
                 }
             }
@@ -596,7 +601,11 @@ fn parse_i64_expr(expr: &Expr) -> Result<i64, SqlError> {
         expr,
     } = expr
     {
-        Ok(-parse_i64_expr(expr)?)
+        // checked_neg so negating i64::MIN cannot overflow-panic. (The inner literal parse already
+        // rejects i64::MAX+1, so this is belt-and-suspenders, but it makes the safety self-evident.)
+        parse_i64_expr(expr)?
+            .checked_neg()
+            .ok_or_else(|| SqlError::Parse("integer literal out of range".into()))
     } else {
         Err(SqlError::Parse(format!("expected value, got {expr:?}")))
     }
@@ -709,6 +718,29 @@ impl std::error::Error for SqlError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_sql_handles_extreme_integer_literals_without_panicking() {
+        // Integer literals beyond i64 range must produce a clean parse error, not an overflow
+        // panic (parse_i64_expr uses checked .parse()).
+        for sql in [
+            "SELECT * FROM availability WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND start >= 99999999999999999999999999",
+            "SELECT * FROM availability WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND start >= -99999999999999999999999999",
+            r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW', 9223372036854775808, 1)"#,
+        ] {
+            let _ = parse_sql(sql);
+        }
+    }
+
+    #[test]
+    fn parse_sql_never_panics_on_arbitrary_input() {
+        use proptest::prelude::*;
+        // The SQL boundary is untrusted: parse_sql must return Ok or Err for ANY input, never
+        // panic. Bias the strategy toward SQL-ish tokens, quotes, $-placeholders, and digit runs.
+        proptest!(ProptestConfig::with_cases(2000), |(s in r#"[A-Za-z0-9 '"$(),=*;_-]{0,64}"#)| {
+            let _ = parse_sql(&s);
+        });
+    }
 
     #[test]
     fn parse_insert_resource() {
