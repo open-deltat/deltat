@@ -185,14 +185,24 @@ fn parse_select(query: &ast::Query) -> Result<Command, SqlError> {
             let end = filters.end.ok_or(SqlError::MissingFilter("end"))?;
 
             if !filters.resource_ids.is_empty() {
-                let count = filters.resource_ids.len();
-                Ok(Command::SelectMultiAvailability {
-                    resource_ids: filters.resource_ids,
-                    start,
-                    end,
-                    min_available: filters.min_available.unwrap_or(count),
-                    min_duration: filters.min_duration,
-                })
+                // min_available present => merged intersection across the set (getCombined).
+                // Absent => per-resource availability, each row tagged with its resource_id
+                // (getMany), mirroring bookings/holds IN-list reads.
+                match filters.min_available {
+                    Some(min_available) => Ok(Command::SelectMultiAvailability {
+                        resource_ids: filters.resource_ids,
+                        start,
+                        end,
+                        min_available,
+                        min_duration: filters.min_duration,
+                    }),
+                    None => Ok(Command::SelectAvailabilityMulti {
+                        resource_ids: filters.resource_ids,
+                        start,
+                        end,
+                        min_duration: filters.min_duration,
+                    }),
+                }
             } else {
                 Ok(Command::SelectAvailability {
                     resource_id: filters.resource_id.ok_or(SqlError::MissingFilter("resource_id"))?,
@@ -739,6 +749,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_availability_in_list_routes_by_min_available() {
+        let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let b = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+
+        // IN list WITHOUT min_available => per-resource (rows tagged with resource_id).
+        let per_resource = format!(
+            "SELECT * FROM availability WHERE resource_id IN ('{a}', '{b}') AND start >= 0 AND end <= 100"
+        );
+        match parse_sql(&per_resource).unwrap() {
+            Command::SelectAvailabilityMulti { resource_ids, .. } => {
+                assert_eq!(resource_ids.len(), 2);
+            }
+            other => panic!("expected SelectAvailabilityMulti, got {other:?}"),
+        }
+
+        // IN list WITH min_available => merged intersection.
+        let merged = format!(
+            "SELECT * FROM availability WHERE resource_id IN ('{a}', '{b}') AND start >= 0 AND end <= 100 AND min_available = 2"
+        );
+        match parse_sql(&merged).unwrap() {
+            Command::SelectMultiAvailability { min_available, .. } => {
+                assert_eq!(min_available, 2);
+            }
+            other => panic!("expected SelectMultiAvailability, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_insert_resource() {
         let sql = "INSERT INTO resources (id) VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV')";
         let cmd = parse_sql(sql).unwrap();
@@ -949,7 +987,7 @@ mod tests {
         let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAV";
         let sql = format!(
-            "SELECT * FROM availability WHERE resource_id IN ('{id1}', '{id2}') AND start >= 1000 AND \"end\" <= 2000"
+            "SELECT * FROM availability WHERE resource_id IN ('{id1}', '{id2}') AND start >= 1000 AND \"end\" <= 2000 AND min_available = 2"
         );
         let cmd = parse_sql(&sql).unwrap();
         match cmd {
@@ -965,7 +1003,7 @@ mod tests {
                 assert_eq!(resource_ids[1].to_string(), id2);
                 assert_eq!(start, 1000);
                 assert_eq!(end, 2000);
-                assert_eq!(min_available, 2); // default = ALL
+                assert_eq!(min_available, 2); // explicit min_available => merged intersection
                 assert_eq!(min_duration, None);
             }
             _ => panic!("expected SelectMultiAvailability, got {cmd:?}"),
@@ -995,23 +1033,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_select_multi_availability_single_id_in_list() {
-        // Single ID in IN list should still produce SelectMultiAvailability
+    fn parse_select_single_id_in_list_is_per_resource() {
+        // A single id in an IN list with no min_available is the per-resource form (tagged rows),
+        // same routing as a multi-id IN list.
         let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let sql = format!(
             "SELECT * FROM availability WHERE resource_id IN ('{id1}') AND start >= 0 AND \"end\" <= 10000"
         );
         let cmd = parse_sql(&sql).unwrap();
         match cmd {
-            Command::SelectMultiAvailability {
-                resource_ids,
-                min_available,
-                ..
-            } => {
+            Command::SelectAvailabilityMulti { resource_ids, .. } => {
                 assert_eq!(resource_ids.len(), 1);
-                assert_eq!(min_available, 1); // default = count = 1
             }
-            _ => panic!("expected SelectMultiAvailability, got {cmd:?}"),
+            _ => panic!("expected SelectAvailabilityMulti, got {cmd:?}"),
         }
     }
 
