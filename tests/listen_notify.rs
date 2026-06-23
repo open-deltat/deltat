@@ -142,6 +142,58 @@ async fn inverted_span_errors_without_panicking() {
 }
 
 #[tokio::test]
+async fn extreme_availability_window_survives_through_wire() {
+    // ENG-1: an availability window from a negative start to i64::MAX overflows the naive width
+    // subtraction. parse_i64_expr accepts the negative literal, so this is reachable from untrusted
+    // SQL. Through the real wire it must return a clean error and keep the connection alive.
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let rid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+
+    let extreme = client
+        .simple_query(&format!(
+            r#"SELECT * FROM availability WHERE resource_id = '{rid}' AND start >= -1 AND "end" <= 9223372036854775807"#
+        ))
+        .await;
+    assert!(extreme.is_err(), "extreme-width window should error, not panic");
+
+    let rows = client.simple_query("SELECT * FROM resources").await.unwrap();
+    assert!(!rows.is_empty(), "connection survived the extreme-bounds query");
+}
+
+#[tokio::test]
+async fn negative_min_available_survives_through_wire() {
+    // A negative min_available would wrap through usize into a garbage threshold. The SQL boundary
+    // must reject it cleanly and keep the connection alive.
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let a = Ulid::new();
+    let b = Ulid::new();
+    for id in [a, b] {
+        client
+            .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{id}')"))
+            .await
+            .unwrap();
+    }
+
+    let negative = client
+        .simple_query(&format!(
+            r#"SELECT * FROM availability WHERE resource_id IN ('{a}', '{b}') AND start >= 0 AND "end" <= 1000 AND min_available = -1"#
+        ))
+        .await;
+    assert!(negative.is_err(), "negative min_available should error, not produce garbage");
+
+    let rows = client.simple_query("SELECT * FROM resources").await.unwrap();
+    assert!(!rows.is_empty(), "connection survived the negative min_available query");
+}
+
+#[tokio::test]
 async fn listen_receives_notification() {
     let (addr, _tm) = start_test_server().await;
 

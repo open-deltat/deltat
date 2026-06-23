@@ -4,7 +4,6 @@ use ulid::Ulid;
 
 use crate::model::Event;
 
-#[allow(dead_code)]
 const CHANNEL_CAPACITY: usize = 256;
 
 /// Broadcast hub for LISTEN/NOTIFY per resource.
@@ -26,7 +25,6 @@ impl NotifyHub {
     }
 
     /// Subscribe to notifications for a resource. Creates the channel if needed.
-    #[allow(dead_code)]
     pub fn subscribe(&self, resource_id: Ulid) -> broadcast::Receiver<Event> {
         let sender = self
             .channels
@@ -42,8 +40,7 @@ impl NotifyHub {
         }
     }
 
-    /// Remove a channel (e.g. when resource is deleted).
-    #[allow(dead_code)]
+    /// Remove a channel when its resource is deleted.
     pub fn remove(&self, resource_id: &Ulid) {
         self.channels.remove(resource_id);
     }

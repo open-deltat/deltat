@@ -601,21 +601,36 @@ impl ExtendedQueryHandler for DeltaTHandler {
     }
 }
 
+/// Parse a `$N` placeholder index: the run of ASCII digits starting at `digit_start` in `chars`.
+/// Returns the parsed index (None when the run overflows usize, so an untrusted huge run is never
+/// fatal) and the position just past the digits.
+fn parse_param_index(chars: &[char], digit_start: usize) -> (Option<usize>, usize) {
+    let mut j = digit_start;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    let n = chars[digit_start..j]
+        .iter()
+        .collect::<String>()
+        .parse::<usize>()
+        .ok();
+    (n, j)
+}
+
 /// Count the highest $N parameter placeholder in the SQL string.
 fn count_params(sql: &str) -> usize {
+    let chars: Vec<char> = sql.chars().collect();
     let mut max = 0usize;
-    let bytes = sql.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            i += 1;
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i > start && let Ok(n) = sql[start..i].parse::<usize>() && n > max {
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            let (n, j) = parse_param_index(&chars, i + 1);
+            if let Some(n) = n
+                && n > max
+            {
                 max = n;
             }
+            i = j;
         } else {
             i += 1;
         }
@@ -640,13 +655,13 @@ fn substitute_params(portal: &Portal<String>) -> String {
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
-            let mut j = i + 1;
-            let mut n: usize = 0;
-            while j < chars.len() && chars[j].is_ascii_digit() {
-                n = n * 10 + (chars[j] as usize - '0' as usize);
-                j += 1;
-            }
-            if n >= 1 && n <= params.len() {
+            // Checked parse via the shared helper: a huge out-of-range index from untrusted input
+            // becomes None and is left as a literal, never overflowing usize and panicking the task.
+            let (n, j) = parse_param_index(&chars, i + 1);
+            if let Some(n) = n
+                && n >= 1
+                && n <= params.len()
+            {
                 match &params[n - 1] {
                     Some(bytes) => {
                         let text = String::from_utf8_lossy(bytes);
@@ -876,27 +891,63 @@ pub async fn process_connection(
     Ok(())
 }
 
+/// Result-column schema for a Describe, derived from the parsed SQL rather than scanning the
+/// text. This runs at Describe time when `$N` placeholders are still unbound, so the statement
+/// cannot be value-parsed into a Command yet; inspecting the AST's target table avoids both
+/// that limitation and the false matches a substring scan would make against string literals.
 fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
-    let upper = sql.to_uppercase();
-    if !upper.contains("SELECT") {
+    use sqlparser::ast::{ObjectNamePart, SetExpr, Statement, TableFactor};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
         return vec![];
-    }
-    if upper.contains("AVAILABILITY") {
-        if upper.contains(" IN ") {
-            multi_availability_schema()
-        } else {
-            availability_schema()
+    };
+    let Some(Statement::Query(query)) = statements.first() else {
+        return vec![];
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return vec![];
+    };
+    let Some(from) = select.from.first() else {
+        return vec![];
+    };
+    let TableFactor::Table { name, .. } = &from.relation else {
+        return vec![];
+    };
+    let Some(ObjectNamePart::Identifier(table)) = name.0.last() else {
+        return vec![];
+    };
+
+    // Fold case to match the execution path, which lowercases identifiers (sql.rs), so a Describe
+    // of `BOOKINGS` returns the same schema the query will produce.
+    match table.value.to_lowercase().as_str() {
+        "availability" => {
+            // Multi-resource availability (resource_id IN (...)) merges resources, so it has a
+            // narrower schema than the single-resource form.
+            if select.selection.as_ref().is_some_and(selection_has_in_list) {
+                multi_availability_schema()
+            } else {
+                availability_schema()
+            }
         }
-    } else if upper.contains("RESOURCES") {
-        resources_schema()
-    } else if upper.contains("RULES") {
-        rules_schema()
-    } else if upper.contains("BOOKINGS") {
-        bookings_schema()
-    } else if upper.contains("HOLDS") {
-        holds_schema()
-    } else {
-        vec![]
+        "resources" => resources_schema(),
+        "rules" => rules_schema(),
+        "bookings" => bookings_schema(),
+        "holds" => holds_schema(),
+        _ => vec![],
+    }
+}
+
+fn selection_has_in_list(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::InList { .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            selection_has_in_list(left) || selection_has_in_list(right)
+        }
+        Expr::Nested(inner) => selection_has_in_list(inner),
+        _ => false,
     }
 }
 
@@ -1009,6 +1060,48 @@ mod tests {
         let schema = schema_for_sql("SELECT * FROM holds WHERE resource_id = $1");
         assert_eq!(schema.len(), 5);
         assert_eq!(schema[4].name(), "expires_at");
+    }
+
+    #[test]
+    fn schema_for_select_is_case_insensitive() {
+        // The execution path lowercases identifiers, so a Describe of a mixed or upper-case table
+        // must return the same schema the query will produce, not an empty one.
+        let single = schema_for_sql("SELECT * FROM BOOKINGS WHERE resource_id = $1");
+        assert_eq!(single.len(), 5);
+        assert_eq!(single[4].name(), "label");
+
+        let multi = schema_for_sql("SELECT * FROM Availability WHERE resource_id IN ($1, $2)");
+        assert_eq!(multi.len(), 2);
+    }
+
+    #[test]
+    fn parse_param_index_handles_overflow_and_normal_runs() {
+        // A digit run that overflows usize must yield None, never panic the connection task.
+        let overflow: Vec<char> = "$99999999999999999999".chars().collect();
+        let (n, end) = parse_param_index(&overflow, 1);
+        assert_eq!(n, None::<usize>);
+        assert_eq!(end, overflow.len());
+
+        let normal: Vec<char> = "$12 rest".chars().collect();
+        let (n, end) = parse_param_index(&normal, 1);
+        assert_eq!(n, Some(12));
+        assert_eq!(end, 3);
+    }
+
+    #[test]
+    fn count_params_ignores_overflowing_placeholder() {
+        assert_eq!(count_params("SELECT 1"), 0);
+        assert_eq!(count_params("WHERE a = $1 AND b = $3 AND c = $2"), 3);
+        // An out-of-range run is not a valid index, so it must not inflate the count or panic.
+        assert_eq!(count_params("WHERE id = $1 OR id = $99999999999999999999"), 1);
+    }
+
+    #[test]
+    fn count_params_never_panics_on_arbitrary_input() {
+        use proptest::prelude::*;
+        proptest!(ProptestConfig::with_cases(2000), |(s in r"[\$0-9A-Za-z ]{0,48}")| {
+            let _ = count_params(&s);
+        });
     }
 
     #[test]

@@ -80,13 +80,14 @@ impl Engine {
         query_end: Ms,
         min_duration_ms: Option<Ms>,
     ) -> Result<Vec<Span>, EngineError> {
-        // An empty or inverted window has no availability — return empty rather than letting
-        // Span::new panic on untrusted query bounds (the query check below is signed, so a
-        // negative width passes it).
+        // Untrusted query bounds: reject inverted/empty windows before Span::new (which
+        // asserts start < end), and take the width with saturating_sub so an enormous
+        // start..end span cannot overflow i64 and panic the task. It is rejected as too
+        // wide instead.
         if query_end <= query_start {
             return Ok(vec![]);
         }
-        if query_end - query_start > MAX_QUERY_WINDOW_MS {
+        if query_end.saturating_sub(query_start) > MAX_QUERY_WINDOW_MS {
             return Err(EngineError::LimitExceeded("query window too wide"));
         }
         let rs = match self.get_resource(&resource_id) {
@@ -124,13 +125,22 @@ impl Engine {
         min_available: usize,
         min_duration_ms: Option<Ms>,
     ) -> Result<Vec<Span>, EngineError> {
-        if query_end - query_start > MAX_QUERY_WINDOW_MS {
+        // Same untrusted-bounds guards as compute_availability: inverted window is empty,
+        // saturating width cannot overflow.
+        if query_end <= query_start {
+            return Ok(Vec::new());
+        }
+        if query_end.saturating_sub(query_start) > MAX_QUERY_WINDOW_MS {
             return Err(EngineError::LimitExceeded("query window too wide"));
         }
         if resource_ids.len() > MAX_IN_CLAUSE_IDS {
             return Err(EngineError::LimitExceeded("too many resource IDs"));
         }
-        if resource_ids.is_empty() || min_available == 0 {
+        // Each listed id contributes at most +1 to the concurrent count (a duplicate id counts
+        // twice, by design, see multi_avail_duplicate_resource_id), so a threshold above the
+        // number of listed ids can never be met. This also rejects a value that wrapped from a
+        // negative SQL literal into a huge usize.
+        if resource_ids.is_empty() || min_available == 0 || min_available > resource_ids.len() {
             return Ok(Vec::new());
         }
 
@@ -160,6 +170,10 @@ impl Engine {
                 seg_start = Some(*time);
             } else if prev >= threshold && count < threshold
                 && let Some(start) = seg_start.take()
+                // Events are sorted (time, then delta with -1 before +1), so at any shared instant
+                // every close is processed before any open. A segment therefore always closes at a
+                // strictly later time than it opened, and `*time > start` holds. The guard keeps
+                // Span::new (which requires start < end) total even if that ordering ever changed.
                 && *time > start {
                     segments.push(Span::new(start, *time));
                 }
