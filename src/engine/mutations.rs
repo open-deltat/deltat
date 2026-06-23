@@ -196,8 +196,13 @@ impl Engine {
 
         check_no_conflict_excluding(&guard, &span, self.now_ms(), Some(hold_id))?;
 
-        // Release + confirm in one WAL record: a crash leaves both or neither, never a freed-but-
-        // unbooked span. Apply only after the append is durable, matching persist_and_apply.
+        // Release + confirm share one fsync (WalCommand::AppendAtomic): an fsync error or a crash
+        // before the flush leaves neither durable. They are still two WAL records, so a torn write
+        // between them can lose the booking — but release is written before confirm, so the worst
+        // case a crash can leave is a freed (re-bookable) slot, never a live hold AND booking, i.e.
+        // never an overbook (INV-01 holds). Apply only after the append is durable, like
+        // persist_and_apply. (This closes the in-memory release-then-book TOCTOU; it is not a
+        // claim of torn-write crash atomicity — see WalCommand::AppendAtomic.)
         let release = Event::HoldReleased { id: hold_id, resource_id };
         let book = Event::BookingConfirmed { id: booking_id, resource_id, span, label };
         self.wal_append_atomic(&[release.clone(), book.clone()]).await?;
