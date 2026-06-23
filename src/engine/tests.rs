@@ -840,6 +840,25 @@ async fn engine_batch_create_resources_creates_all_with_intra_batch_parent() {
     assert_eq!(children, 2);
 }
 
+#[tokio::test]
+async fn engine_reaper_watermark_skips_but_still_reaps() {
+    let path = test_wal_path("reaper_watermark.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    let hid = Ulid::new();
+    engine.place_hold(hid, rid, Span::new(0, 100), 2_000_000).await.unwrap();
+
+    // First scan establishes the watermark (earliest live expiry = 2_000_000) and finds nothing due.
+    assert!(engine.collect_expired_holds(1_500_000).is_empty());
+    // Now strictly below the watermark → the scan is skipped, still nothing.
+    assert!(engine.collect_expired_holds(1_600_000).is_empty());
+    // At expiry → the hold is reaped (the watermark never causes a missed expiry).
+    let expired = engine.collect_expired_holds(2_000_000);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].0, hid);
+}
+
 // ══════════════════════════════════════════════════════════════
 // Pure function edge cases
 // ══════════════════════════════════════════════════════════════
