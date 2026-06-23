@@ -33,6 +33,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(604_800_000); // 7 days
+    // Post-auth connection lifetime guards (0 = disabled, the default — long-lived LISTEN is a
+    // legitimate product use). A public deployment sets these to bound idle/squatting streams.
+    let max_conn_age_ms: u64 = std::env::var("DELTAT_MAX_CONN_AGE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let max_idle_ms: u64 = std::env::var("DELTAT_MAX_IDLE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let tls_cert = std::env::var("DELTAT_TLS_CERT").ok();
     let tls_key = std::env::var("DELTAT_TLS_KEY").ok();
@@ -103,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 tokio::spawn(async move {
                     let _permit = permit; // held until connection closes
-                    if let Err(e) = wire::process_connection(socket, tm, pw, tls).await {
+                    if let Err(e) = wire::process_connection(socket, tm, pw, tls, max_conn_age_ms, max_idle_ms).await {
                         tracing::error!("connection error from {peer}: {e}");
                     }
                     metrics::gauge!(deltat::observability::CONNECTIONS_ACTIVE).decrement(1.0);
