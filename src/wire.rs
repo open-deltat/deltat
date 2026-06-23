@@ -154,6 +154,19 @@ impl DeltaTHandler {
                     .map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
             }
+            Command::BatchInsertRules { rules } => {
+                let count = rules.len();
+                let batch: Vec<_> = rules
+                    .into_iter()
+                    .map(|(id, resource_id, start, end, blocking)| {
+                        Span::try_new(start, end)
+                            .map(|span| (id, resource_id, span, blocking))
+                            .map_err(span_err)
+                    })
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                engine.batch_add_rules(batch).await.map_err(engine_err)?;
+                Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
+            }
             Command::DeleteRule { id } => {
                 engine.remove_rule(id).await.map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
