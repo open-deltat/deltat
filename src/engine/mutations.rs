@@ -134,6 +134,24 @@ impl Engine {
         self.persist_and_apply(resource_id, &mut guard, &event).await
     }
 
+    /// Add several rules in one request. Rules are independent — they carry no capacity/conflict
+    /// interaction with each other (unlike batch bookings), so each is applied via the single-rule
+    /// path with its full validation (span, parent coverage, interval limit). The win is collapsing
+    /// N client round-trips into one Command; semantics match the SDK's prior per-row inserts,
+    /// including that a mid-batch failure leaves earlier rules applied.
+    pub async fn batch_add_rules(
+        &self,
+        rules: Vec<(Ulid, Ulid, Span, bool)>,
+    ) -> Result<(), EngineError> {
+        if rules.len() > MAX_BATCH_SIZE {
+            return Err(EngineError::LimitExceeded("batch too large"));
+        }
+        for (id, resource_id, span, blocking) in rules {
+            self.add_rule(id, resource_id, span, blocking).await?;
+        }
+        Ok(())
+    }
+
     pub async fn remove_rule(&self, id: Ulid) -> Result<Ulid, EngineError> {
         let (resource_id, mut guard) = self.resolve_entity_write(&id).await?;
         let event = Event::RuleRemoved { id, resource_id };

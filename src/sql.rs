@@ -82,16 +82,35 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
             Ok(Command::InsertResource { id, parent_id, name, capacity, buffer_after })
         }
         "rules" => {
-            if values.len() < 5 {
-                return Err(SqlError::WrongArity("rules", 5, values.len()));
+            let all_rows = extract_all_insert_rows(insert)?;
+            if all_rows.len() == 1 {
+                let values = &all_rows[0];
+                if values.len() < 5 {
+                    return Err(SqlError::WrongArity("rules", 5, values.len()));
+                }
+                Ok(Command::InsertRule {
+                    id: parse_ulid(&values[0])?,
+                    resource_id: parse_ulid(&values[1])?,
+                    start: parse_i64(&values[2])?,
+                    end: parse_i64(&values[3])?,
+                    blocking: parse_bool(&values[4])?,
+                })
+            } else {
+                let mut rules = Vec::with_capacity(all_rows.len());
+                for (i, row) in all_rows.iter().enumerate() {
+                    if row.len() < 5 {
+                        return Err(SqlError::WrongArity("rules row", 5, row.len()));
+                    }
+                    rules.push((
+                        parse_ulid(&row[0]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
+                        parse_ulid(&row[1]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
+                        parse_i64(&row[2]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
+                        parse_i64(&row[3]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
+                        parse_bool(&row[4]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
+                    ));
+                }
+                Ok(Command::BatchInsertRules { rules })
             }
-            Ok(Command::InsertRule {
-                id: parse_ulid(&values[0])?,
-                resource_id: parse_ulid(&values[1])?,
-                start: parse_i64(&values[2])?,
-                end: parse_i64(&values[3])?,
-                blocking: parse_bool(&values[4])?,
-            })
         }
         "holds" => {
             if values.len() < 5 {
@@ -873,6 +892,29 @@ mod tests {
             }
             _ => panic!("expected InsertRule, got {cmd:?}"),
         }
+    }
+
+    #[test]
+    fn parse_multi_row_rules_insert_is_batch() {
+        let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAW";
+        let r = "01CRZ3NDEKTSV4RRFFQ69G5FAX";
+        let multi = format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{id1}', '{r}', 0, 100, false), ('{id2}', '{r}', 200, 300, true)"#
+        );
+        match parse_sql(&multi).unwrap() {
+            Command::BatchInsertRules { rules } => {
+                assert_eq!(rules.len(), 2);
+                assert!(!rules[0].4); // first blocking=false
+                assert!(rules[1].4); // second blocking=true
+            }
+            other => panic!("expected BatchInsertRules, got {other:?}"),
+        }
+        // A single-row INSERT still produces InsertRule, not a batch.
+        let one = format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{id1}', '{r}', 0, 100, false)"#
+        );
+        assert!(matches!(parse_sql(&one).unwrap(), Command::InsertRule { .. }));
     }
 
     #[test]

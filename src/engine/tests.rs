@@ -797,6 +797,24 @@ async fn engine_availability_multi_tags_each_resource_and_dedups() {
     assert_eq!((b_rows[0].1.start, b_rows[0].1.end), (0, 5 * H));
 }
 
+#[tokio::test]
+async fn engine_batch_add_rules_adds_all() {
+    let path = test_wal_path("batch_add_rules.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    let rules = vec![
+        (Ulid::new(), rid, Span::new(0, H), false),
+        (Ulid::new(), rid, Span::new(2 * H, 3 * H), false),
+        (Ulid::new(), rid, Span::new(4 * H, 5 * H), true),
+    ];
+    engine.batch_add_rules(rules).await.unwrap();
+
+    // All three rules applied in one call (the round-trip collapse the SDK relies on).
+    assert_eq!(engine.get_rules(rid).await.unwrap().len(), 3);
+}
+
 // ══════════════════════════════════════════════════════════════
 // Pure function edge cases
 // ══════════════════════════════════════════════════════════════
