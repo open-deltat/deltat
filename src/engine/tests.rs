@@ -815,6 +815,31 @@ async fn engine_batch_add_rules_adds_all() {
     assert_eq!(engine.get_rules(rid).await.unwrap().len(), 3);
 }
 
+#[tokio::test]
+async fn engine_batch_create_resources_creates_all_with_intra_batch_parent() {
+    let path = test_wal_path("batch_create_resources.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let parent = Ulid::new();
+    let child1 = Ulid::new();
+    let child2 = Ulid::new();
+    // The child rows reference `parent`, which is created earlier in the same batch (applied in
+    // list order), so intra-batch parent references resolve.
+    let resources = vec![
+        (parent, None, Some("section".to_string()), 1u32, None),
+        (child1, Some(parent), None, 1u32, None),
+        (child2, Some(parent), None, 1u32, None),
+    ];
+    engine.batch_create_resources(resources).await.unwrap();
+
+    assert!(engine.get_resource(&parent).is_some());
+    let children = engine
+        .list_resources()
+        .into_iter()
+        .filter(|r| r.parent_id == Some(parent))
+        .count();
+    assert_eq!(children, 2);
+}
+
 // ══════════════════════════════════════════════════════════════
 // Pure function edge cases
 // ══════════════════════════════════════════════════════════════

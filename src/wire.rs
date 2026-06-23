@@ -136,6 +136,11 @@ impl DeltaTHandler {
                     .map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
             }
+            Command::BatchInsertResources { resources } => {
+                let count = resources.len();
+                engine.batch_create_resources(resources).await.map_err(engine_err)?;
+                Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
+            }
             Command::DeleteResource { id } => {
                 engine.delete_resource(id).await.map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
