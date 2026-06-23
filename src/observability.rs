@@ -50,6 +50,7 @@ pub fn command_label(cmd: &Command) -> &'static str {
         Command::InsertResource { .. } => "insert_resource",
         Command::UpdateResource { .. } => "update_resource",
         Command::DeleteResource { .. } => "delete_resource",
+        Command::BatchInsertResources { .. } => "batch_insert_resources",
         Command::InsertRule { .. } => "insert_rule",
         Command::BatchInsertRules { .. } => "batch_insert_rules",
         Command::UpdateRule { .. } => "update_rule",
