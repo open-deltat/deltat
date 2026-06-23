@@ -4873,6 +4873,40 @@ async fn concurrent_bookings_on_capacity_one_admit_exactly_one() {
     assert_eq!(conflicted, 7);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_bookings_on_capacity_n_admit_exactly_n() {
+    // INV-01 under contention on a capacity pool: racing many bookings for one span on a capacity-N
+    // resource admits exactly N (the capacity sweep, not just the capacity-1 fast path, holds under
+    // the serializing write lock); the rest are rejected as over capacity.
+    let path = test_wal_path("concurrent_capacity_n.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+    let id = Ulid::new();
+    let capacity = 2u32;
+    engine.create_resource(id, None, None, capacity, None).await.unwrap();
+
+    let span = Span::new(1_000, 2_000);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let engine = engine.clone();
+        tasks.push(tokio::spawn(async move {
+            engine.confirm_booking(Ulid::new(), id, span, None).await
+        }));
+    }
+
+    let mut admitted = 0u32;
+    let mut over_capacity = 0u32;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(()) => admitted += 1,
+            Err(EngineError::CapacityExceeded(_)) => over_capacity += 1,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert_eq!(admitted, capacity);
+    assert_eq!(over_capacity, 8 - capacity);
+}
+
 #[test]
 fn availability_never_panics_on_arbitrary_query_bounds() {
     // PRIN-08: the read path must never panic on untrusted bounds, however extreme. Drive both
