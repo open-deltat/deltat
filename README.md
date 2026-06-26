@@ -1,6 +1,5 @@
 <p align="center">
-  <h1 align="center">deltat</h1>
-  <p align="center">A time-first scheduling database.</p>
+  <img src=".github/social-preview.png" alt="deltat: a time-first scheduling database" width="860">
 </p>
 
 <p align="center">
