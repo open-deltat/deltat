@@ -3,6 +3,13 @@
   <p align="center">A time-first scheduling database.</p>
 </p>
 
+<p align="center">
+  <a href="https://crates.io/crates/deltat"><img src="https://img.shields.io/crates/v/deltat.svg?logo=rust" alt="crates.io"></a>
+  <a href="https://crates.io/crates/deltat"><img src="https://img.shields.io/crates/d/deltat.svg" alt="downloads"></a>
+  <a href="https://github.com/open-tap/deltat/actions/workflows/ci.yml"><img src="https://github.com/open-tap/deltat/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
+</p>
+
 ---
 
 ## The idea
@@ -50,10 +57,12 @@ A single Rust binary that speaks PostgreSQL. No Postgres underneath — it's a p
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/open-tap/deltat.git
+cargo install deltat
 
 DELTAT_PASSWORD=secret deltat
 ```
+
+Or build from source: `cargo install --git https://github.com/open-tap/deltat.git`
 
 Connect on port 5433:
 
