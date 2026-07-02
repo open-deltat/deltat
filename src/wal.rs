@@ -125,7 +125,6 @@ impl Wal {
         let mut events = Vec::new();
 
         loop {
-            // Read length prefix
             let mut len_buf = [0u8; 4];
             match reader.read_exact(&mut len_buf) {
                 Ok(()) => {}
@@ -139,7 +138,6 @@ impl Wal {
                 break;
             }
 
-            // Read payload
             let mut payload = vec![0u8; len];
             match reader.read_exact(&mut payload) {
                 Ok(()) => {}
@@ -147,7 +145,6 @@ impl Wal {
                 Err(e) => return Err(e),
             }
 
-            // Read CRC
             let mut crc_buf = [0u8; 4];
             match reader.read_exact(&mut crc_buf) {
                 Ok(()) => {}
