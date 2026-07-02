@@ -15,20 +15,24 @@ impl Engine {
     /// Blocking: ACCUMULATE — all ancestors' blocking rules are collected.
     ///
     /// Returns `(inherited_non_blocking, inherited_blocking)` clamped to query.
+    ///
+    /// The ancestor id chain is snapshotted lock-free from the parent index FIRST, then each
+    /// ancestor is read under its own lock one at a time. The caller must NOT hold the queried
+    /// resource's guard across this call: holding a descendant guard while awaiting an ancestor
+    /// guard is the ABBA half of a deadlock with `batch_confirm_bookings` (which locks in sorted,
+    /// roughly top-down order).
     pub(super) async fn collect_inherited_rules(
         &self,
-        resource: &ResourceState,
+        resource_id: Ulid,
+        parent_id: Option<Ulid>,
         query: &Span,
     ) -> Result<(Vec<Span>, Vec<Span>), EngineError> {
-        let mut inherited_non_blocking: Vec<Span> = Vec::new();
-        let mut inherited_blocking: Vec<Span> = Vec::new();
-        let mut found_non_blocking = false;
-
-        let mut current_parent_id = resource.parent_id;
+        // Phase 1: snapshot the ancestor id chain without touching any resource lock.
+        let mut chain: Vec<Ulid> = Vec::new();
         let mut visited = HashSet::new();
-        visited.insert(resource.id);
+        visited.insert(resource_id);
+        let mut current_parent_id = parent_id;
         let mut depth = 0usize;
-
         while let Some(pid) = current_parent_id {
             depth += 1;
             if depth > MAX_HIERARCHY_DEPTH {
@@ -37,6 +41,16 @@ impl Engine {
             if !visited.insert(pid) {
                 return Err(EngineError::CycleDetected(pid));
             }
+            chain.push(pid);
+            current_parent_id = self.store.get_parent(&pid);
+        }
+
+        // Phase 2: read each ancestor's rules, locking one at a time (never two at once, never with
+        // a descendant guard held).
+        let mut inherited_non_blocking: Vec<Span> = Vec::new();
+        let mut inherited_blocking: Vec<Span> = Vec::new();
+        let mut found_non_blocking = false;
+        for pid in chain {
             let parent_rs = self
                 .get_resource(&pid)
                 .ok_or(EngineError::NotFound(pid))?;
@@ -63,8 +77,6 @@ impl Engine {
             if !found_non_blocking && !inherited_non_blocking.is_empty() {
                 found_non_blocking = true;
             }
-
-            current_parent_id = parent_guard.parent_id;
         }
 
         inherited_non_blocking.sort_by_key(|s| s.start);
@@ -80,10 +92,14 @@ impl Engine {
         query_end: Ms,
         min_duration_ms: Option<Ms>,
     ) -> Result<Vec<Span>, EngineError> {
-        // Untrusted query bounds: reject inverted/empty windows before Span::new (which
-        // asserts start < end), and take the width with saturating_sub so an enormous
-        // start..end span cannot overflow i64 and panic the task. It is rejected as too
-        // wide instead.
+        // Untrusted query bounds. Clamp both into the valid timestamp range first: a negative
+        // query_end would otherwise survive the inverted-window guard (e.g. [-100, -50)) and then
+        // panic inside availability() at `Span::new(start.saturating_sub(buffer).max(0), end)` with
+        // a clamped start of 0 and a negative end. After clamping, reject inverted/empty windows
+        // before Span::new (which asserts start < end), and take the width with saturating_sub so an
+        // enormous start..end span cannot overflow i64 and panic the task (rejected as too wide).
+        let query_start = query_start.clamp(MIN_VALID_TIMESTAMP_MS, MAX_VALID_TIMESTAMP_MS);
+        let query_end = query_end.clamp(MIN_VALID_TIMESTAMP_MS, MAX_VALID_TIMESTAMP_MS);
         if query_end <= query_start {
             return Ok(vec![]);
         }
@@ -94,12 +110,16 @@ impl Engine {
             Some(rs) => rs,
             None => return Ok(vec![]),
         };
-        let guard = rs.read().await;
 
         let query = Span::new(query_start, query_end);
+        // Snapshot the parent lock-free and collect inherited rules BEFORE taking the child guard.
+        // Holding the child guard while awaiting ancestor guards is the ABBA half of a deadlock with
+        // batch_confirm_bookings; the parent index makes the walk lock-free (C1).
+        let parent_id = self.store.get_parent(&resource_id);
         let (inherited_non_blocking, inherited_blocking) =
-            self.collect_inherited_rules(&guard, &query).await?;
+            self.collect_inherited_rules(resource_id, parent_id, &query).await?;
 
+        let guard = rs.read().await;
         let now = self.now_ms();
         let mut free = availability(
             &guard,

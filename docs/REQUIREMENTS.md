@@ -90,7 +90,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 ## AVAIL — Availability & booking math (the calculations)
 
 - **AVAIL-01** ✅ Availability = **open windows − blocking rules − active allocations (bookings + live holds)**, each allocation extended by `buffer_after`. The read path scans a **buffer-expanded window** (`[query.start − buffer, query.end)`) so an allocation whose buffer tail reaches into the window still subtracts — matching `check_no_conflict`'s search window (GAP-12). Verified by the property test (TEST-01) and by `buffer_straddling_query_start_blocks_availability` (`engine/availability.rs`).
-- **AVAIL-02** ✅ A booking is **1-D interval collision** on the resource timeline; conflict iff buffered spans overlap (`engine/conflict.rs:17-52`).
+- **AVAIL-02** ✅ A booking is **1-D interval collision** on the resource timeline; conflict iff the two allocations' **buffered footprints overlap**. Buffer is **symmetric** (B1, resolved): every allocation, existing *and* candidate, occupies `[start, end + buffer)`, so the candidate's own turnaround is weighed against existing allocations, not only theirs against it. This makes admission **order-independent**: booking A then B and B then A reach the same decision, and neither ordering can reach `count > capacity` (INV-01). The single-booking check (`check_no_conflict`), the batch capacity check, and the availability read view all use this same footprint. Previously `check_no_conflict` extended only the existing allocation's end (candidate raw), which let an out-of-order pair (e.g. book the *later* slot first, then the earlier one whose buffer tail runs into it) silently overbook a capacity-1 resource. Regression-locked by `buffer_conflict_is_order_independent` (all three paths) and the symmetric `verify.rs` properties (`engine/conflict.rs`).
 - **AVAIL-03** ✅ **"2-D" = N coupled 1-D timelines keyed by resource id, bound by atomicity** — not a metric 2-D index.
 - **AVAIL-04** ✅ Multi-resource availability = per-resource availability fed to a +1/−1 sweep with a `min_available` threshold (`engine/queries.rs:113-166`). Verified: Alice ∩ Bob.
 - **AVAIL-05** ✅ Capacity > 1: occupancy via +1/−1 sweep-line; free = where occupancy < capacity (`engine/availability.rs:64-75,126-163`). Verified: hotel cap 5 vs cap 1.
@@ -170,7 +170,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 - **PROTO-11** 🟡 Tenant = pgwire connection **database name** (default `default`); SQL username ignored; auth = single shared cleartext password `DELTAT_PASSWORD` (`wire.rs:71-84`, `auth.rs:18-44`).
 - **PROTO-12** ✅ (current) LISTEN/NOTIFY channels are `resource_{ULID}`; events pushed as pgwire `NotificationResponse` with a JSON `Event` payload; a listener lagging > 256 events (broadcast capacity) is silently dropped (`wire.rs:86-101,724-776`).
 - **PROTO-13** ✅ (current) Error→SQLSTATE map: parse→42601, engine→P0001, tenant→08006, invalid LISTEN/bad ULID→42000, **invalid time range (start≥end)→22007**, query too long→54000 (`wire.rs`).
-- **PROTO-14** 🟡 Multi-row INSERT is honored **only for bookings** (`BatchInsertBookings`); multi-row resources/rules/holds silently keep the first row (`sql.rs:543-557`) — the engine-side root of GAP-03.
+- **PROTO-14** 🟡 Multi-row INSERT is honored for **bookings, resources, and rules** (`BatchInsertBookings/Resources/Rules`); **holds** have no batch variant and silently keep the first row (`extract_insert_values` returns `rows[0]`), the one remaining engine-side case of GAP-03. All four tables now map VALUES by the declared **column list** (a reordered or partial list binds by column name, not position), and a column/value count mismatch is a `WrongArity` error rather than a silent mis-map.
 - **PROTO-15** 🟡 The demo hold→confirm→release lifecycle is a per-connection **WebSocket** protocol in `tap/demo/server.ts` (`{hold|subscribe|confirm}` → `{confirmed|error|Event}`); non-atomic here (the kernel now has atomic `commit_hold`, AVAIL-07, but this WS path is not yet wired to it) and hold expiry is client-supplied (`Date.now()+300000`).
 
 ---
@@ -340,7 +340,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 
 - **GAP-01** 📋 No durable link between multi-resource bookings → add `booking_group: Ulid` (MODEL-10) before the format freezes.
 - **GAP-02** 📋 `label: String` is a second free-text/PII field → replace with `external_ref: Ulid`.
-- **GAP-03** 📋 Engine silently truncates multi-row `INSERT` (PROTO-14) → must error, not truncate; resolved by the framed protocol. (SDK works around it.)
+- **GAP-03** 🟡 Engine silently truncates a multi-row `INSERT` (PROTO-14), now narrowed to **holds only** (bookings/resources/rules honor every row via BatchInsert*); holds should error rather than keep the first row, resolved fully by the framed protocol. (SDK works around it.)
 - **GAP-04** ❓ Open-ended / variable-duration bookings vs the frozen `start < end` invariant.
 - **GAP-05** 🟡 Availability demo owner-edit save uses dead kernel-Schedule → point at `addRecurringRules`; then delete the dead demo `schedules` action.
 - **GAP-06** ❓ Whether a kernel "reserve k-of-N specific" / adjacency verb is wanted.

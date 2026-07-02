@@ -442,6 +442,18 @@ impl DeltaTHandler {
             }
             Command::Listen { channel } => {
                 let resource_id = Self::parse_channel_resource_id(&channel)?;
+                // Reject a LISTEN on a resource that does not exist. Subscribing would create a
+                // NotifyHub broadcast channel (a 256-slot ring) that is reclaimed only on
+                // delete_resource, so reconnect-and-LISTEN cycles on bogus ids would grow tenant
+                // memory without bound. This is the sole origin of Subscribe commands, so gating
+                // here keeps the forwarder path free of phantom subscriptions.
+                if engine.get_resource(&resource_id).is_none() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42704".into(),
+                        format!("resource does not exist: {resource_id}"),
+                    ))));
+                }
                 if let Some(ref tx) = self.subscribe_tx {
                     let _ = tx.send(SubscriptionCommand::Subscribe(resource_id));
                 }
@@ -537,17 +549,25 @@ impl SimpleQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
-        if query.len() > MAX_QUERY_LEN {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "54000".into(),
-                "query too long".into(),
-            ))));
-        }
+        enforce_query_len(query.len())?;
         let engine = self.resolve_engine(client)?;
         let cmd = sql::parse_sql(query).map_err(sql_err)?;
         self.execute_command(&engine, cmd).await
     }
+}
+
+/// Reject SQL longer than MAX_QUERY_LEN. Enforced at Parse time (QueryParser::parse_sql) so an
+/// oversized statement is rejected before count_params materializes its chars and sqlparser runs a
+/// full parse, and again on each Execute path. SQLSTATE 54000 = program_limit_exceeded.
+fn enforce_query_len(len: usize) -> PgWireResult<()> {
+    if len > MAX_QUERY_LEN {
+        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "54000".into(),
+            "query too long".into(),
+        ))));
+    }
+    Ok(())
 }
 
 // ── Extended Query Protocol ──────────────────────────────────────
@@ -568,6 +588,7 @@ impl QueryParser for DeltaTQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        enforce_query_len(sql.len())?;
         Ok(sql.to_string())
     }
 
@@ -607,13 +628,7 @@ impl ExtendedQueryHandler for DeltaTHandler {
     {
         let engine = self.resolve_engine(client)?;
         let sql = substitute_params(portal);
-        if sql.len() > MAX_QUERY_LEN {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "54000".into(),
-                "query too long".into(),
-            ))));
-        }
+        enforce_query_len(sql.len())?;
         let cmd = sql::parse_sql(&sql).map_err(sql_err)?;
         let mut responses = self.execute_command(&engine, cmd).await?;
         Ok(responses.remove(0))
@@ -840,17 +855,14 @@ pub async fn process_connection(
                     .await
                     {
                         tracing::debug!("startup error: {e}");
+                        // AUTH_FAILURES_TOTAL counts any startup failure, not only bad passwords: a
+                        // generic PgWireError is not trivially separable into auth-vs-other here, so
+                        // the metric stays broad (its doc comment already says "startup/auth").
                         metrics::counter!(crate::observability::AUTH_FAILURES_TOTAL).increment(1);
-                        if pgwire::tokio::server::process_error(
-                            &mut socket,
-                            e,
-                            false,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
-                        }
+                        // Send the error, then drop the connection. Looping back would let a client
+                        // retry passwords on one TCP connection for the whole startup deadline.
+                        let _ = pgwire::tokio::server::process_error(&mut socket, e, false).await;
+                        break;
                     }
                 }
                 _ => break,
@@ -909,6 +921,11 @@ pub async fn process_connection(
                 Action::Subscribe(Some(cmd)) => {
                     match cmd {
                         SubscriptionCommand::Subscribe(rid) => {
+                            // Prune forwarders whose task already exited (e.g. the resource was
+                            // deleted, closing the broadcast). Without this a dead entry keeps
+                            // contains_key true (a re-LISTEN silently no-ops) and counts against
+                            // MAX_SUBSCRIPTIONS_PER_CONNECTION forever.
+                            forwarders.retain(|_, h| !h.is_finished());
                             if forwarders.contains_key(&rid) {
                                 continue; // already subscribed
                             }
@@ -920,6 +937,13 @@ pub async fn process_connection(
                                 Ok(e) => e,
                                 Err(_) => continue,
                             };
+                            // Defense in depth against a delete racing between the LISTEN's
+                            // existence check and this Subscribe: never recreate a broadcast channel
+                            // for a resource that no longer exists (it would leak, since only delete
+                            // reclaims it).
+                            if engine.get_resource(&rid).is_none() {
+                                continue;
+                            }
                             let rx = engine.notify.subscribe(rid);
                             let tx = notify_tx.clone();
                             let channel = format!("resource_{rid}");
@@ -1065,6 +1089,16 @@ mod tests {
         // Some(_) only if the forwarder survived the Lagged; the old behavior dropped the sender
         // and recv() would return None.
         assert!(got.is_some(), "forwarder must survive a broadcast Lagged and keep forwarding");
+    }
+
+    // ── enforce_query_len ────────────────────────────────────────
+
+    #[test]
+    fn enforce_query_len_bounds_at_limit() {
+        // At the limit is accepted; one byte over is rejected. This guard runs at Parse time so an
+        // oversized statement never reaches count_params or a full sqlparser parse.
+        assert!(enforce_query_len(MAX_QUERY_LEN).is_ok());
+        assert!(enforce_query_len(MAX_QUERY_LEN + 1).is_err());
     }
 
     // ── count_params ─────────────────────────────────────────────
@@ -1419,6 +1453,7 @@ mod tests {
     async fn execute_listen_sends_subscribe() {
         let (handler, mut rx, engine) = setup_handler_with_subs();
         let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
         let channel = format!("resource_{rid}");
         let cmd = Command::Listen { channel };
         let responses = handler.execute_command(&engine, cmd).await.unwrap();
@@ -1429,6 +1464,20 @@ mod tests {
             SubscriptionCommand::Subscribe(id) => assert_eq!(id, rid),
             _ => panic!("expected Subscribe"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_listen_nonexistent_resource_errors() {
+        // A LISTEN on a resource that does not exist must be rejected, not silently subscribed:
+        // subscribing would create a NotifyHub ring buffer that is reclaimed only on delete, so
+        // bogus-id LISTENs would leak tenant memory without bound.
+        let (handler, mut rx, engine) = setup_handler_with_subs();
+        let rid = Ulid::new(); // never created
+        let cmd = Command::Listen { channel: format!("resource_{rid}") };
+        let result = handler.execute_command(&engine, cmd).await;
+        assert!(result.is_err());
+        // And no Subscribe command was queued for the forwarder loop.
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1455,6 +1504,7 @@ mod tests {
         let engine = Arc::new(Engine::new(path, notify).unwrap());
 
         let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
         let channel = format!("resource_{rid}");
         let cmd = Command::Listen { channel };
         let responses = handler.execute_command(&engine, cmd).await.unwrap();

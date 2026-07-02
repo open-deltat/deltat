@@ -141,7 +141,10 @@ pub fn subtract_intervals(base: &[Span], to_remove: &[Span]) -> Vec<Span> {
 }
 
 /// Sweep-line algorithm: find time ranges where allocation count >= capacity.
-/// Returns sorted, merged spans representing fully-saturated time ranges.
+/// Returns saturated ranges in ascending start order. For `capacity > 1` two adjacent ranges may be
+/// emitted unmerged (occupancy dips below capacity for an instant and climbs back), which the only
+/// caller, subtraction from free windows, tolerates. The `capacity == 1` path returns merged
+/// spans (it delegates to `merge_overlapping`).
 pub fn compute_saturated_spans(allocs: &[Span], capacity: u32) -> Vec<Span> {
     if allocs.is_empty() || capacity == 0 {
         return Vec::new();

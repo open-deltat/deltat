@@ -24,11 +24,14 @@ pub enum Command {
     BatchInsertResources {
         resources: Vec<ResourceRow>,
     },
+    /// Partial update: a field is `None` when the UPDATE omitted that column (leave unchanged). The
+    /// inner `Option` on the nullable fields carries the value to set, so `name: Some(None)` sets
+    /// NULL whereas `name: None` leaves the current name untouched.
     UpdateResource {
         id: Ulid,
-        name: Option<String>,
-        capacity: u32,
-        buffer_after: Option<Ms>,
+        name: Option<Option<String>>,
+        capacity: Option<u32>,
+        buffer_after: Option<Option<Ms>>,
     },
     DeleteResource {
         id: Ulid,

@@ -97,6 +97,11 @@ proptest! {
     /// must compute identically. (The blocking-rule read/write disagreement is
     /// the separate, still-open T-03, deliberately excluded by generating no
     /// blocking rules here.)
+    ///
+    /// Buffer is SYMMETRIC (B1): a booking occupies its span PLUS its own turnaround
+    /// `[t, t + 1 + buffer)`, so it is bookable iff that whole footprint is free in the
+    /// read view, not just its raw span. Only probes whose footprint stays inside the
+    /// computed window are asserted, so availability (computed over `[0, RANGE)`) covers it.
     #[test]
     fn read_path_agrees_with_write_path(
         allocs in prop::collection::vec(alloc_strategy(), 0..10),
@@ -107,20 +112,23 @@ proptest! {
         let rs = build(&allocs, capacity, buffer, Some(query));
 
         let free = availability(&rs, &query, &[], &[], NOW);
-        for t in query.start..query.end {
-            let read_free = free.iter().any(|s| s.contains_instant(t));
+        let last = (RANGE - buffer).max(0);
+        for t in 0..last {
             let write_ok = check_no_conflict(&rs, &Span::new(t, t + 1), NOW).is_ok();
+            let footprint_free = (t..t + 1 + buffer).all(|u| free.iter().any(|s| s.contains_instant(u)));
             prop_assert_eq!(
-                read_free, write_ok,
-                "read/write disagree at t={}: availability says free={}, conflict-check says bookable={}",
-                t, read_free, write_ok
+                write_ok, footprint_free,
+                "read/write disagree at t={}: buffered footprint free={}, conflict-check says bookable={}",
+                t, footprint_free, write_ok
             );
         }
     }
 
     /// The write path matches an independent brute-force reference: a candidate
-    /// booking is rejected iff, at some instant it covers, the count of live
-    /// buffered allocations already meets capacity.
+    /// booking is rejected iff, at some instant its buffered footprint covers, the
+    /// count of live buffered allocations already meets capacity. The footprint is
+    /// `[candidate.start, candidate.end + buffer)`, the candidate carries its own
+    /// turnaround too (symmetric buffer, B1).
     #[test]
     fn check_no_conflict_matches_brute_force(
         allocs in prop::collection::vec(alloc_strategy(), 0..10),
@@ -132,7 +140,7 @@ proptest! {
         let accepted = check_no_conflict(&rs, &candidate, NOW).is_ok();
 
         let mut should_reject = false;
-        for t in candidate.start..candidate.end {
+        for t in candidate.start..(candidate.end + buffer) {
             let count = allocs
                 .iter()
                 .filter(|a| a.live(NOW) && a.start <= t && t < a.end + buffer)
