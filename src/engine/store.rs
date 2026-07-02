@@ -9,6 +9,10 @@ pub struct InMemoryStore {
     resources: DashMap<Ulid, SharedResourceState>,
     entity_to_resource: DashMap<Ulid, Ulid>,
     children: DashMap<Ulid, Vec<Ulid>>,
+    /// child -> parent. `parent_id` is immutable after creation (no re-parent op), so this lock-free
+    /// index lets any ancestor walk read the parent chain WITHOUT holding or awaiting resource locks
+    /// removing the ABBA cycle between upward walks and batch lock acquisition.
+    parents: DashMap<Ulid, Ulid>,
 }
 
 impl Default for InMemoryStore {
@@ -23,6 +27,7 @@ impl InMemoryStore {
             resources: DashMap::new(),
             entity_to_resource: DashMap::new(),
             children: DashMap::new(),
+            parents: DashMap::new(),
         }
     }
 
@@ -41,11 +46,26 @@ impl InMemoryStore {
     }
 
     pub fn insert_resource(&self, id: Ulid, state: SharedResourceState) {
+        // Record the immutable parent link into the lock-free index. At insert time the Arc is
+        // freshly created and uncontended, so try_read always succeeds. Reading it here (rather than
+        // in add_child) keeps the index correct for every insertion path, including WAL replay and
+        // tests that build a store directly without going through add_child.
+        if let Ok(guard) = state.try_read()
+            && let Some(pid) = guard.parent_id
+        {
+            self.parents.insert(id, pid);
+        }
         self.resources.insert(id, state);
     }
 
     pub fn remove_resource(&self, id: &Ulid) -> Option<(Ulid, SharedResourceState)> {
+        self.parents.remove(id);
         self.resources.remove(id)
+    }
+
+    /// The parent of `child`, read lock-free. `None` for a root (or unknown) resource.
+    pub fn get_parent(&self, child: &Ulid) -> Option<Ulid> {
+        self.parents.get(child).map(|e| *e.value())
     }
 
     pub fn resource_ids(&self) -> Vec<Ulid> {

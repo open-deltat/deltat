@@ -5402,3 +5402,295 @@ async fn availability_bounds_a_corrupt_over_deep_hierarchy() {
         Err(EngineError::LimitExceeded("hierarchy too deep"))
     ));
 }
+
+// ══════════════════════════════════════════════════════════════
+// Review batch A, correctness fixes
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn availability_negative_window_returns_empty_not_panic() {
+    // A negative query_end (reachable from SQL unary-minus, passed raw to the engine) once slipped
+    // past the inverted-window guard and panicked inside availability() at Span::new(0, negative).
+    // Clamping the bounds must yield an empty result instead.
+    let path = test_wal_path("neg_window.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine
+        .add_rule(Ulid::new(), rid, Span::new(0, 100_000), false)
+        .await
+        .unwrap();
+
+    let free = engine.compute_availability(rid, -1000, -500, None).await.unwrap();
+    assert!(free.is_empty());
+    let free2 = engine.compute_availability(rid, i64::MIN, -1, None).await.unwrap();
+    assert!(free2.is_empty());
+}
+
+#[tokio::test]
+async fn delete_resource_unmaps_owned_entities() {
+    let path = test_wal_path("delete_unmaps.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    let rule_id = Ulid::new();
+    engine
+        .add_rule(rule_id, rid, Span::new(0, 100_000), false)
+        .await
+        .unwrap();
+
+    // Before delete the rule resolves to its resource.
+    assert_eq!(engine.get_resource_for_entity(&rule_id), Some(rid));
+
+    engine.delete_resource(rid).await.unwrap();
+
+    // After delete the entity->resource mapping is gone (no leak), and any write op on it is NotFound.
+    assert!(engine.get_resource_for_entity(&rule_id).is_none());
+    let err = engine.remove_rule(rule_id).await.unwrap_err();
+    assert!(matches!(err, EngineError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn entity_write_ops_reject_kind_mismatch() {
+    let path = test_wal_path("kind_mismatch.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine
+        .add_rule(Ulid::new(), rid, Span::new(0, 1_000_000), false)
+        .await
+        .unwrap();
+
+    let rule_id = Ulid::new();
+    engine
+        .add_rule(rule_id, rid, Span::new(0, 10_000), true)
+        .await
+        .unwrap();
+    let booking_id = Ulid::new();
+    engine
+        .confirm_booking(booking_id, rid, Span::new(20_000, 30_000), None)
+        .await
+        .unwrap();
+    let hold_id = Ulid::new();
+    engine
+        .place_hold(hold_id, rid, Span::new(40_000, 50_000), now_ms() + H)
+        .await
+        .unwrap();
+
+    // cancel_booking only cancels bookings.
+    assert!(matches!(engine.cancel_booking(rule_id).await, Err(EngineError::NotFound(_))));
+    assert!(matches!(engine.cancel_booking(hold_id).await, Err(EngineError::NotFound(_))));
+    // release_hold only releases holds.
+    assert!(matches!(engine.release_hold(booking_id).await, Err(EngineError::NotFound(_))));
+    assert!(matches!(engine.release_hold(rule_id).await, Err(EngineError::NotFound(_))));
+    // remove_rule / update_rule only touch rules.
+    assert!(matches!(engine.remove_rule(booking_id).await, Err(EngineError::NotFound(_))));
+    assert!(matches!(
+        engine.update_rule(booking_id, Span::new(20_000, 30_000), false).await,
+        Err(EngineError::NotFound(_))
+    ));
+
+    // The real entities are all still there (nothing was clobbered).
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_holds(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_rules(rid).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn update_rule_enforces_parent_coverage() {
+    let path = test_wal_path("update_rule_coverage.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let parent = Ulid::new();
+    engine.create_resource(parent, None, None, 1, None).await.unwrap();
+    // Parent open only 9:00-17:00.
+    engine
+        .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
+        .await
+        .unwrap();
+
+    let child = Ulid::new();
+    engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
+    let child_rule = Ulid::new();
+    engine
+        .add_rule(child_rule, child, Span::new(10 * H, 12 * H), false)
+        .await
+        .unwrap();
+
+    // Updating the child rule to a span the parent has NOT opened must be rejected.
+    let err = engine
+        .update_rule(child_rule, Span::new(6 * H, 8 * H), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NotCoveredByParent { .. }));
+
+    // A within-parent update is fine.
+    engine
+        .update_rule(child_rule, Span::new(13 * H, 15 * H), false)
+        .await
+        .unwrap();
+    let rules = engine.get_rules(child).await.unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].start, 13 * H);
+}
+
+// ══════════════════════════════════════════════════════════════
+// Review batch B, buffer semantics (symmetric, order-independent)
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn buffer_conflict_is_order_independent() {
+    // A[10:00,11:00) and B[11:15,11:45) with a 30-min buffer cannot coexist on a capacity-1
+    // resource: A's turnaround [11:00,11:30) runs into B. The admission decision must be the same
+    // whether A is booked first, B is booked first, or the pair is submitted as one batch.
+    let a = Span::new(10 * H, 11 * H);
+    let b = Span::new(11 * H + 15 * M, 11 * H + 45 * M);
+    let buffer = Some(30 * M);
+
+    // Single, A then B.
+    {
+        let engine = Engine::new(test_wal_path("buf_order_ab.wal"), Arc::new(NotifyHub::new())).unwrap();
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, buffer).await.unwrap();
+        engine.add_rule(Ulid::new(), rid, Span::new(0, 24 * H), false).await.unwrap();
+        engine.confirm_booking(Ulid::new(), rid, a, None).await.unwrap();
+        let second = engine.confirm_booking(Ulid::new(), rid, b, None).await;
+        assert!(second.is_err(), "A-then-B: B must be rejected");
+        assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    }
+
+    // Single, B then A, the previously-inconsistent order that admitted an overbooking.
+    {
+        let engine = Engine::new(test_wal_path("buf_order_ba.wal"), Arc::new(NotifyHub::new())).unwrap();
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, buffer).await.unwrap();
+        engine.add_rule(Ulid::new(), rid, Span::new(0, 24 * H), false).await.unwrap();
+        engine.confirm_booking(Ulid::new(), rid, b, None).await.unwrap();
+        let second = engine.confirm_booking(Ulid::new(), rid, a, None).await;
+        assert!(second.is_err(), "B-then-A: A must be rejected too (symmetric buffer)");
+        assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    }
+
+    // Batch, the pair submitted atomically must be rejected as a whole.
+    {
+        let engine = Engine::new(test_wal_path("buf_order_batch.wal"), Arc::new(NotifyHub::new())).unwrap();
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, buffer).await.unwrap();
+        engine.add_rule(Ulid::new(), rid, Span::new(0, 24 * H), false).await.unwrap();
+        let batch = engine
+            .batch_confirm_bookings(vec![
+                (Ulid::new(), rid, a, None),
+                (Ulid::new(), rid, b, None),
+            ])
+            .await;
+        assert!(batch.is_err(), "batch: the conflicting pair must be rejected");
+        assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 0);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Review batch D, reaper watermark race + batch WAL atomicity
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn place_hold_bumps_generation_and_lowers_watermark() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // D1 mechanism: place_hold lowers the reaper's earliest-expiry watermark (fetch_min) AND bumps
+    // the placement generation. collect_expired_holds snapshots the generation before scanning and
+    // declines to raise the watermark if it changed, so a placement that races a scan cannot be
+    // hidden by the scan storing a higher recomputed bound.
+    let engine = Engine::new(test_wal_path("hold_gen.wal"), Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    engine.place_hold(Ulid::new(), rid, Span::new(0, 100), 1_000_000).await.unwrap();
+    engine.collect_expired_holds(1);
+    assert_eq!(engine.earliest_hold_expiry.load(Relaxed), 1_000_000);
+    let gen0 = engine.hold_generation.load(Relaxed);
+
+    // A later placement with an earlier expiry: watermark tracks it down, generation advances.
+    engine.place_hold(Ulid::new(), rid, Span::new(200, 300), 500).await.unwrap();
+    assert_eq!(engine.earliest_hold_expiry.load(Relaxed), 500);
+    assert!(engine.hold_generation.load(Relaxed) > gen0);
+}
+
+#[tokio::test]
+async fn batch_bookings_atomic_append_survives_replay() {
+    // D2: the whole batch is persisted under one WAL append. A multi-resource batch must apply all
+    // its bookings and, crucially, all of them must be durable (replay reconstructs every one).
+    let path = test_wal_path("batch_atomic_replay.wal");
+    let r1 = Ulid::new();
+    let r2 = Ulid::new();
+    let b1 = Ulid::new();
+    let b2 = Ulid::new();
+    let b3 = Ulid::new();
+    {
+        let engine = Engine::new(path.clone(), Arc::new(NotifyHub::new())).unwrap();
+        engine.create_resource(r1, None, None, 2, None).await.unwrap();
+        engine.create_resource(r2, None, None, 1, None).await.unwrap();
+        engine
+            .batch_confirm_bookings(vec![
+                (b1, r1, Span::new(0, 100), Some("a".into())),
+                (b2, r1, Span::new(0, 100), None),
+                (b3, r2, Span::new(50, 150), None),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(engine.get_bookings(r1).await.unwrap().len(), 2);
+        assert_eq!(engine.get_bookings(r2).await.unwrap().len(), 1);
+    }
+    // Reopen: every booking from the single atomic append is durable.
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let r1_books = engine.get_bookings(r1).await.unwrap();
+    assert_eq!(r1_books.len(), 2);
+    assert_eq!(engine.get_bookings(r2).await.unwrap().len(), 1);
+    assert_eq!(engine.get_resource_for_entity(&b3), Some(r2));
+}
+
+// ══════════════════════════════════════════════════════════════
+// Review batch C, ABBA deadlock removed via lock-free parent index
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_ancestor_walk_and_batch_do_not_deadlock() {
+    use tokio::time::{timeout, Duration};
+    // Upward walks (availability / add_rule coverage) used to hold the descendant's guard while
+    // awaiting each ancestor's guard, while batch_confirm_bookings locks in sorted (roughly
+    // top-down) order, an ABBA cycle when a batch spans an ancestor+descendant concurrent with a
+    // walk on the descendant. The parent index makes the walks lock-free, so this must complete.
+    let engine = Arc::new(Engine::new(test_wal_path("abba.wal"), Arc::new(NotifyHub::new())).unwrap());
+    let a = Ulid::new();
+    let d = Ulid::new();
+    engine.create_resource(a, None, None, 1, None).await.unwrap();
+    engine.create_resource(d, Some(a), None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), a, Span::new(0, 10_000_000), false).await.unwrap();
+    engine.add_rule(Ulid::new(), d, Span::new(0, 10_000_000), false).await.unwrap();
+
+    let work = async {
+        for i in 0..100i64 {
+            let e1 = engine.clone();
+            let e2 = engine.clone();
+            let base = i * 1000;
+            // Batch touches BOTH ancestor and descendant (locks A then D in sorted order).
+            let t1 = tokio::spawn(async move {
+                let _ = e1
+                    .batch_confirm_bookings(vec![
+                        (Ulid::new(), a, Span::new(base, base + 10), None),
+                        (Ulid::new(), d, Span::new(base, base + 10), None),
+                    ])
+                    .await;
+            });
+            // Concurrent upward walk on the descendant: availability and a covered rule add.
+            let t2 = tokio::spawn(async move {
+                let _ = e2.compute_availability(d, 0, 1_000_000, None).await;
+                let _ = e2.add_rule(Ulid::new(), d, Span::new(base + 500, base + 600), false).await;
+            });
+            let _ = t1.await;
+            let _ = t2.await;
+        }
+    };
+
+    assert!(
+        timeout(Duration::from_secs(30), work).await.is_ok(),
+        "ancestor walk and batch deadlocked"
+    );
+}

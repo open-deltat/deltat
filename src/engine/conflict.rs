@@ -51,9 +51,15 @@ pub(crate) fn check_no_conflict_excluding(
     exclude: Option<Ulid>,
 ) -> Result<(), EngineError> {
     let buffer = rs.buffer_after.unwrap_or(0);
-    // Expand the search window to catch:
-    // - Existing allocations whose end + buffer > span.start (search backwards by buffer)
-    // - Our allocation's end + buffer reaching into existing allocations
+    // Buffer semantics are SYMMETRIC (INV-02 / AVAIL-02): every allocation, existing OR candidate,
+    // occupies `[start, end + buffer)`, its span plus its turnaround. Two allocations conflict iff
+    // those footprints overlap, so the candidate's own buffer tail is weighed against existing
+    // allocations, not just theirs against it. This makes admission order-independent (booking A
+    // then B and B then A reach the same decision) and matches the batch capacity check; an
+    // asymmetric check (candidate raw vs existing buffered) let an out-of-order pair overbook.
+    let candidate = Span::new(span.start, span.end.saturating_add(buffer));
+    // Expand the search window to catch existing allocations whose buffered footprint reaches into
+    // the candidate's, from either side.
     let search_start = span.start.saturating_sub(buffer).max(0);
     let search_end = span.end.saturating_add(buffer);
     let search_span = Span::new(search_start, search_end);
@@ -69,7 +75,7 @@ pub(crate) fn check_no_conflict_excluding(
                 IntervalKind::Hold { .. } | IntervalKind::Booking { .. } => {
                     let effective_end = interval.span.end.saturating_add(buffer);
                     let effective = Span::new(interval.span.start, effective_end);
-                    if effective.overlaps(span) {
+                    if effective.overlaps(&candidate) {
                         return Err(EngineError::Conflict(interval.id));
                     }
                 }
@@ -81,7 +87,7 @@ pub(crate) fn check_no_conflict_excluding(
         let allocs = collect_active_allocs_with_buffer(rs, &search_span, now, buffer, exclude);
         let saturated = compute_saturated_spans(&allocs, rs.capacity);
         for sat in &saturated {
-            if sat.overlaps(span) {
+            if sat.overlaps(&candidate) {
                 return Err(EngineError::CapacityExceeded(rs.capacity));
             }
         }

@@ -74,13 +74,7 @@ async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
                         }
                         Ok(other) => {
                             // Flush current batch first, then handle the non-append command
-                            metrics::histogram!(crate::observability::WAL_FLUSH_BATCH_SIZE)
-                                .record(batch.len() as f64);
-                            let flush_start = std::time::Instant::now();
-                            let result = flush_batch(&mut wal, &mut batch);
-                            metrics::histogram!(crate::observability::WAL_FLUSH_DURATION_SECONDS)
-                                .record(flush_start.elapsed().as_secs_f64());
-                            respond_batch(&mut batch, &result);
+                            flush_and_respond(&mut wal, &mut batch);
                             handle_non_append(&mut wal, other);
                             break;
                         }
@@ -89,18 +83,23 @@ async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
                 }
 
                 if !batch.is_empty() {
-                    metrics::histogram!(crate::observability::WAL_FLUSH_BATCH_SIZE)
-                        .record(batch.len() as f64);
-                    let flush_start = std::time::Instant::now();
-                    let result = flush_batch(&mut wal, &mut batch);
-                    metrics::histogram!(crate::observability::WAL_FLUSH_DURATION_SECONDS)
-                        .record(flush_start.elapsed().as_secs_f64());
-                    respond_batch(&mut batch, &result);
+                    flush_and_respond(&mut wal, &mut batch);
                 }
             }
             other => handle_non_append(&mut wal, other),
         }
     }
+}
+
+/// Record the batch-size and flush-duration metrics, flush the buffered batch under one fsync, and
+/// respond to every sender. Shared by the two flush sites in `wal_writer_loop`.
+fn flush_and_respond(wal: &mut Wal, batch: &mut Vec<(Event, oneshot::Sender<io::Result<()>>)>) {
+    metrics::histogram!(crate::observability::WAL_FLUSH_BATCH_SIZE).record(batch.len() as f64);
+    let flush_start = std::time::Instant::now();
+    let result = flush_batch(wal, batch);
+    metrics::histogram!(crate::observability::WAL_FLUSH_DURATION_SECONDS)
+        .record(flush_start.elapsed().as_secs_f64());
+    respond_batch(batch, &result);
 }
 
 fn flush_batch(wal: &mut Wal, batch: &mut [(Event, oneshot::Sender<io::Result<()>>)]) -> io::Result<()> {
@@ -174,6 +173,10 @@ pub struct Engine {
     /// exactly. `i64::MIN` means "unknown — scan" (the initial value, so the first reaper cycle and
     /// the cycle after any replay scan normally).
     pub(super) earliest_hold_expiry: std::sync::atomic::AtomicI64,
+    /// Bumped by every `place_hold`. `collect_expired_holds` snapshots it before scanning and only
+    /// publishes its recomputed (higher) watermark if it is unchanged afterwards, otherwise a
+    /// concurrent placement lowered the watermark and must not be clobbered.
+    pub(super) hold_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -200,6 +203,7 @@ impl Engine {
             notify,
             clock,
             earliest_hold_expiry: std::sync::atomic::AtomicI64::new(i64::MIN),
+            hold_generation: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Replay events — we're the sole owner of these Arcs, so try_read/try_write
@@ -297,14 +301,20 @@ impl Engine {
         Ok(())
     }
 
-    /// Walk up the parent chain, sending the event to each ancestor's channel.
+    /// Walk up the parent chain, sending the event to each ancestor's channel. The walk reads the
+    /// lock-free parent index, so it never truncates under contention (the old try_read walk dropped
+    /// the rest of the chain whenever an ancestor was locked) and cannot deadlock (C1). The depth
+    /// bound guards against a corrupt/cyclic index rather than looping forever.
     fn notify_ancestors(&self, parent_id: Option<Ulid>, event: &Event) {
         let mut current = parent_id;
+        let mut depth = 0usize;
         while let Some(pid) = current {
             self.notify.send(pid, event);
-            current = self.store.get_resource(&pid).and_then(|rs| {
-                rs.try_read().ok().and_then(|guard| guard.parent_id)
-            });
+            depth += 1;
+            if depth > crate::limits::MAX_HIERARCHY_DEPTH {
+                break;
+            }
+            current = self.store.get_parent(&pid);
         }
     }
 
