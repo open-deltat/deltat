@@ -31,7 +31,17 @@ impl Engine {
             && n.len() > MAX_NAME_LEN {
                 return Err(EngineError::LimitExceeded("resource name too long"));
             }
+        if self.store.contains_resource(&id) {
+            return Err(EngineError::AlreadyExists(id));
+        }
         if let Some(pid) = parent_id {
+            // Cheap checks before the O(depth) walk: self-cycle and parent existence.
+            if pid == id {
+                return Err(EngineError::CycleDetected(id));
+            }
+            if !self.store.contains_resource(&pid) {
+                return Err(EngineError::NotFound(pid));
+            }
             let mut depth = 0usize;
             let mut cur = Some(pid);
             while let Some(cid) = cur {
@@ -39,20 +49,9 @@ impl Engine {
                 if depth > MAX_HIERARCHY_DEPTH {
                     return Err(EngineError::LimitExceeded("hierarchy too deep"));
                 }
-                cur = self.get_resource(&cid).and_then(|rs| {
-                    rs.try_read().ok().and_then(|g| g.parent_id)
-                });
-            }
-        }
-        if self.store.contains_resource(&id) {
-            return Err(EngineError::AlreadyExists(id));
-        }
-        if let Some(pid) = parent_id {
-            if pid == id {
-                return Err(EngineError::CycleDetected(id));
-            }
-            if !self.store.contains_resource(&pid) {
-                return Err(EngineError::NotFound(pid));
+                // Lock-free walk via the parent index: exact (no try_read truncation under
+                // contention) and cannot deadlock against a concurrent batch (C1).
+                cur = self.store.get_parent(&cid);
             }
         }
 
@@ -101,6 +100,12 @@ impl Engine {
         };
         let guard = rs.read().await;
         let parent_id = guard.parent_id;
+        // Unmap every entity (rule/hold/booking) this resource owned. Without this the
+        // entity->resource index keeps dangling rows that resolve to a resource that no longer
+        // exists, so a stale id would resolve past the delete instead of returning NotFound.
+        for interval in &guard.intervals {
+            self.store.unmap_entity(&interval.id);
+        }
         if let Some(pid) = parent_id {
             self.store.remove_child(&pid, &id);
         }
@@ -128,28 +133,37 @@ impl Engine {
         let rs = self
             .get_resource(&resource_id)
             .ok_or(EngineError::NotFound(resource_id))?;
+        // Coverage check BEFORE taking the child write guard: check_parent_coverage locks the parent
+        // (and its ancestors), and holding the child guard across that is the ABBA half of a deadlock
+        // with batch_confirm_bookings (C1). parent_id is immutable, read lock-free.
+        if !blocking
+            && let Some(parent_id) = self.store.get_parent(&resource_id) {
+                self.check_parent_coverage(parent_id, span).await?;
+            }
+
         let mut guard = rs.write().await;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
 
-        if !blocking
-            && let Some(parent_id) = guard.parent_id {
-                let parent_free = self
-                    .compute_availability(parent_id, span.start, span.end, None)
-                    .await?;
-                let rule_as_slice = [span];
-                let uncovered = subtract_intervals(&rule_as_slice, &parent_free);
-                if !uncovered.is_empty() {
-                    return Err(EngineError::NotCoveredByParent {
-                        rule_span: span,
-                        uncovered,
-                    });
-                }
-            }
-
         let event = Event::RuleAdded { id, resource_id, span, blocking };
         self.persist_and_apply(resource_id, &mut guard, &event).await
+    }
+
+    /// AVAIL-09: a non-blocking rule must lie within the parent's availability, else it would open
+    /// time the parent has closed. Blocking rules may close time anywhere and are exempt.
+    async fn check_parent_coverage(&self, parent_id: Ulid, span: Span) -> Result<(), EngineError> {
+        let parent_free = self
+            .compute_availability(parent_id, span.start, span.end, None)
+            .await?;
+        let uncovered = subtract_intervals(&[span], &parent_free);
+        if !uncovered.is_empty() {
+            return Err(EngineError::NotCoveredByParent {
+                rule_span: span,
+                uncovered,
+            });
+        }
+        Ok(())
     }
 
     /// Add several rules in one request. Rules are independent — they carry no capacity/conflict
@@ -172,6 +186,9 @@ impl Engine {
 
     pub async fn remove_rule(&self, id: Ulid) -> Result<Ulid, EngineError> {
         let (resource_id, mut guard) = self.resolve_entity_write(&id).await?;
+        // resolve_entity_write matches any entity kind, so without this a booking/hold id would be
+        // removed as if it were a rule. The id must resolve to a rule.
+        find_interval_of_kind(&guard, &id, is_rule)?;
         let event = Event::RuleRemoved { id, resource_id };
         self.persist_and_apply(resource_id, &mut guard, &event).await?;
         Ok(resource_id)
@@ -198,9 +215,12 @@ impl Engine {
 
         // Lower the reaper's earliest-expiry watermark so it will scan once this hold can expire.
         // A removal (release/commit) may leave the bound stale-low, which only costs a redundant
-        // scan — never a missed expiry.
+        // scan, never a missed expiry. Bump the generation so a reaper scan that overlaps this
+        // placement declines to raise the watermark back over this hold (see collect_expired_holds).
         self.earliest_hold_expiry
             .fetch_min(expires_at, std::sync::atomic::Ordering::Relaxed);
+        self.hold_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let event = Event::HoldPlaced { id, resource_id, span, expires_at };
         self.persist_and_apply(resource_id, &mut guard, &event).await
@@ -208,6 +228,7 @@ impl Engine {
 
     pub async fn release_hold(&self, id: Ulid) -> Result<Ulid, EngineError> {
         let (resource_id, mut guard) = self.resolve_entity_write(&id).await?;
+        find_interval_of_kind(&guard, &id, is_hold)?;
         let event = Event::HoldReleased { id, resource_id };
         self.persist_and_apply(resource_id, &mut guard, &event).await?;
         Ok(resource_id)
@@ -231,10 +252,7 @@ impl Engine {
 
         // The entity must be a hold; a booking/rule id (or one already reaped) means there is no
         // hold to commit. The booking takes exactly the held span.
-        let span = match guard.intervals.iter().find(|i| i.id == hold_id) {
-            Some(i) if matches!(i.kind, IntervalKind::Hold { .. }) => i.span,
-            _ => return Err(EngineError::NotFound(hold_id)),
-        };
+        let span = find_interval_of_kind(&guard, &hold_id, is_hold)?.span;
 
         check_no_conflict_excluding(&guard, &span, self.now_ms(), Some(hold_id))?;
 
@@ -364,15 +382,29 @@ impl Engine {
             }
         }
 
-        // Phase 2: All validated — commit all bookings.
-        for (id, resource_id, span, label) in bookings {
-            let event = Event::BookingConfirmed { id, resource_id, span, label };
-            self.wal_append(&event).await?;
-            let guard_idx = rs_map[&resource_id];
-            let parent_id = guards[guard_idx].parent_id;
-            self.store.apply_event(&mut guards[guard_idx], &event);
-            self.notify.send(resource_id, &event);
-            self.notify_ancestors(parent_id, &event);
+        // Phase 2: All validated, persist the whole batch under ONE fsync, then apply + notify.
+        // A single append is the all-or-nothing durability boundary (AVAIL-06): the previous
+        // per-booking loop did N awaited appends, so a mid-batch WAL error left earlier bookings
+        // durable while later ones failed, and each append was a serialized fsync held under every
+        // batch resource's write lock.
+        let events: Vec<Event> = bookings
+            .iter()
+            .map(|(id, resource_id, span, label)| Event::BookingConfirmed {
+                id: *id,
+                resource_id: *resource_id,
+                span: *span,
+                label: label.clone(),
+            })
+            .collect();
+        self.wal_append_atomic(&events).await?;
+        for event in &events {
+            if let Event::BookingConfirmed { resource_id, .. } = event {
+                let guard_idx = rs_map[resource_id];
+                let parent_id = guards[guard_idx].parent_id;
+                self.store.apply_event(&mut guards[guard_idx], event);
+                self.notify.send(*resource_id, event);
+                self.notify_ancestors(parent_id, event);
+            }
         }
 
         Ok(())
@@ -380,6 +412,7 @@ impl Engine {
 
     pub async fn cancel_booking(&self, id: Ulid) -> Result<Ulid, EngineError> {
         let (resource_id, mut guard) = self.resolve_entity_write(&id).await?;
+        find_interval_of_kind(&guard, &id, is_booking)?;
         let event = Event::BookingCancelled { id, resource_id };
         self.persist_and_apply(resource_id, &mut guard, &event).await?;
         Ok(resource_id)
@@ -413,7 +446,22 @@ impl Engine {
         blocking: bool,
     ) -> Result<Ulid, EngineError> {
         validate_span(&span)?;
-        let (resource_id, mut guard) = self.resolve_entity_write(&id).await?;
+        let resource_id = self
+            .get_resource_for_entity(&id)
+            .ok_or(EngineError::NotFound(id))?;
+        // Same parent-coverage invariant add_rule enforces (else an update could open time the
+        // parent has closed), checked BEFORE the child guard to stay ABBA-safe (C1).
+        if !blocking
+            && let Some(parent_id) = self.store.get_parent(&resource_id) {
+                self.check_parent_coverage(parent_id, span).await?;
+            }
+        let rs = self
+            .get_resource(&resource_id)
+            .ok_or(EngineError::NotFound(resource_id))?;
+        let mut guard = rs.write().await;
+        // The id must resolve to a rule; the entity index matches any kind, so without this
+        // update_rule(booking_id) would morph a booking into a rule.
+        find_interval_of_kind(&guard, &id, is_rule)?;
         let event = Event::RuleUpdated { id, resource_id, span, blocking };
         self.persist_and_apply(resource_id, &mut guard, &event).await?;
         Ok(resource_id)
@@ -426,6 +474,13 @@ impl Engine {
         if now < self.earliest_hold_expiry.load(Relaxed) {
             return Vec::new();
         }
+
+        // Snapshot the placement generation before scanning. A place_hold that runs during the scan
+        // lowers the watermark via fetch_min and bumps this; if we see a bump we must NOT overwrite
+        // that lower watermark with our (higher) recomputed bound, or the just-placed hold would sit
+        // above the watermark and never be scanned. A plain value compare is insufficient: fetch_min
+        // at an equal value proves nothing about intervening placements.
+        let gen_before = self.hold_generation.load(Relaxed);
 
         let mut expired = Vec::new();
         // Recompute the exact next earliest expiry from the live (non-expired) holds we see. If any
@@ -452,8 +507,12 @@ impl Engine {
                 Err(_) => had_locked = true,
             }
         }
-        self.earliest_hold_expiry
-            .store(if had_locked { i64::MIN } else { next_earliest }, Relaxed);
+        // Only publish the recomputed bound if no placement raced our scan. If one did, its
+        // fetch_min already lowered the watermark to cover its hold; leave that lower value.
+        if self.hold_generation.load(Relaxed) == gen_before {
+            self.earliest_hold_expiry
+                .store(if had_locked { i64::MIN } else { next_earliest }, Relaxed);
+        }
         expired
     }
 
@@ -564,6 +623,32 @@ impl Engine {
             return 0;
         }
         rx.await.unwrap_or(0)
+    }
+}
+
+fn is_rule(k: &IntervalKind) -> bool {
+    matches!(k, IntervalKind::NonBlocking | IntervalKind::Blocking)
+}
+
+fn is_hold(k: &IntervalKind) -> bool {
+    matches!(k, IntervalKind::Hold { .. })
+}
+
+fn is_booking(k: &IntervalKind) -> bool {
+    matches!(k, IntervalKind::Booking { .. })
+}
+
+/// Find the interval `id` on `guard` and confirm its kind matches the operation. `resolve_entity_write`
+/// maps an id to a resource without checking kind, so a booking id passed to `release_hold` (etc.)
+/// would otherwise delete the wrong entity. Returns `NotFound` when the id is absent or mismatched.
+fn find_interval_of_kind<'a>(
+    guard: &'a ResourceState,
+    id: &Ulid,
+    is_kind: fn(&IntervalKind) -> bool,
+) -> Result<&'a Interval, EngineError> {
+    match guard.intervals.iter().find(|i| i.id == *id) {
+        Some(i) if is_kind(&i.kind) => Ok(i),
+        _ => Err(EngineError::NotFound(*id)),
     }
 }
 
