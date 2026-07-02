@@ -2,9 +2,8 @@
 
 > **Status: v1.0, decided.** Architecture (§4) and roadmap (§7) resolved by a design judge-panel
 > (4 candidate architectures × 4 independent lenses); the Minimum Viable Adapter scope (§9) is
-> distilled from a Cal.com open-source code study + a per-provider MVA pass. Evidence lives in
-> [`ADAPTERS-RESEARCH.md`](ADAPTERS-RESEARCH.md) (provider→deltat mapping) and the OSS review in
-> [`REVIEW-2026-06-22.md`](REVIEW-2026-06-22.md). Authoritative spec: [`REQUIREMENTS.md`](REQUIREMENTS.md).
+> distilled from a Cal.com open-source code study + a per-provider MVA pass.
+> Authoritative spec: [`REQUIREMENTS.md`](REQUIREMENTS.md).
 > **Three decisions are flagged for the user in §8.3; the rest carry sensible defaults.**
 
 ---
@@ -156,8 +155,7 @@ buffer-0, flat mirror; tokens + the UID↔Ulid map in the adapter store only; **
 
 ## 5. Translation model: provider ↔ deltat
 
-Spine below; the full per-provider tables, lossy points, and admission corners are in
-[`ADAPTERS-RESEARCH.md`](ADAPTERS-RESEARCH.md) §1-2.
+Spine below; the per-provider lossy points and admission corners are noted inline in the Edge work column.
 
 | deltat concept | Inbound (import) source | Outbound (export) target | Edge work |
 |---|---|---|---|
