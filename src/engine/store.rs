@@ -10,8 +10,8 @@ pub struct InMemoryStore {
     entity_to_resource: DashMap<Ulid, Ulid>,
     children: DashMap<Ulid, Vec<Ulid>>,
     /// child -> parent. `parent_id` is immutable after creation (no re-parent op), so this lock-free
-    /// index lets any ancestor walk read the parent chain WITHOUT holding or awaiting resource locks
-    /// removing the ABBA cycle between upward walks and batch lock acquisition.
+    /// index lets any ancestor walk read the parent chain WITHOUT holding or awaiting resource locks.
+    /// That breaks the ABBA cycle between upward walks and batch lock acquisition.
     parents: DashMap<Ulid, Ulid>,
 }
 

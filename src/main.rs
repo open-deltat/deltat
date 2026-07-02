@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .filter(|v| *v >= 0) // a negative retention would push the GC cutoff into the future
         .unwrap_or(604_800_000); // 7 days
-    // Post-auth connection lifetime guards (0 = disabled, the default — long-lived LISTEN is a
+    // Post-auth connection lifetime guards (0 = disabled, the default; long-lived LISTEN is a
     // legitimate product use). A public deployment sets these to bound idle/squatting streams.
     let max_conn_age_ms: u64 = std::env::var("DELTAT_MAX_CONN_AGE_MS")
         .ok()

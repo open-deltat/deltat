@@ -11,8 +11,8 @@ use super::{Engine, EngineError};
 impl Engine {
     /// Walk up from a resource collecting inherited rules from ancestors.
     ///
-    /// Non-blocking: OVERRIDE — first ancestor with non-blocking rules wins.
-    /// Blocking: ACCUMULATE — all ancestors' blocking rules are collected.
+    /// Non-blocking: OVERRIDE. First ancestor with non-blocking rules wins.
+    /// Blocking: ACCUMULATE. All ancestors' blocking rules are collected.
     ///
     /// Returns `(inherited_non_blocking, inherited_blocking)` clamped to query.
     ///
@@ -203,7 +203,7 @@ impl Engine {
         // single continuous window [a,b) is handed off at the shared half-open
         // boundary T: the sweep closes a segment at T (count dips) and reopens it,
         // emitting two adjacent segments. Merge adjacent segments BEFORE the
-        // min_duration filter — otherwise a continuous window long enough to
+        // min_duration filter, otherwise a continuous window long enough to
         // qualify is split into sub-threshold fragments and every fragment is
         // dropped, hiding a real slot (GAP-13). The single-resource path already
         // merges (availability.rs); this mirrors it. Segments are emitted in
@@ -347,7 +347,7 @@ impl Engine {
 
     /// Availability for several resources in one request, each free span tagged with its
     /// resource_id so the caller can regroup. Unlike `compute_multi_availability` (which merges
-    /// the set into one combined timeline), this computes each resource independently — the read
+    /// the set into one combined timeline), this computes each resource independently, the read
     /// equivalent of `get_bookings_multi`. Ids are deduped; the count is bounded for transports
     /// that build the Command without the SQL parser.
     pub async fn get_availability_multi(

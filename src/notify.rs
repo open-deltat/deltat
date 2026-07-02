@@ -73,7 +73,7 @@ mod tests {
     async fn send_without_subscribers_is_noop() {
         let hub = NotifyHub::new();
         let rid = Ulid::new();
-        // No subscriber — should not panic
+        // No subscriber, should not panic
         hub.send(
             rid,
             &Event::ResourceDeleted { id: rid },
@@ -110,7 +110,7 @@ mod tests {
 
         hub.remove(&rid);
 
-        // Channel removed — send is a no-op, receiver gets error
+        // Channel removed, send is a no-op, receiver gets error
         hub.send(rid, &Event::ResourceDeleted { id: rid });
 
         // The receiver should get an error (channel closed) or lag
@@ -123,7 +123,7 @@ mod tests {
         let hub = NotifyHub::new();
         let rid = Ulid::new();
 
-        // No channel exists yet — subscribe should create it
+        // No channel exists yet, subscribe should create it
         let mut rx = hub.subscribe(rid);
 
         let event = Event::ResourceDeleted { id: rid };

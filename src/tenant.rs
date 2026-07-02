@@ -238,7 +238,7 @@ mod tests {
         // The length check itself should pass
         assert!(name.len() <= MAX_TENANT_NAME_LEN);
         // But creating the WAL file may fail on OS filename limits, so just verify
-        // the length check doesn't reject it — the actual io::Error would be from
+        // the length check doesn't reject it, the actual io::Error would be from
         // the OS, not our limit.
         let result = tm.get_or_create(&name);
         // Either succeeds or fails with an OS error (not our "tenant name too long" error)

@@ -3,7 +3,7 @@
 //! `Command` is the boundary between an adapter and the kernel. SQL/pgwire is one adapter today
 //! (`sql::parse_sql` produces a `Command`); the framed, HTTP, and MCP transports (PROTO-01/03/04)
 //! will be siblings that build the same `Command` and hand it to `wire::execute_command`. It depends
-//! only on the kernel value types — never on a specific transport (no `sqlparser`) — so adding a
+//! only on the kernel value types, never on a specific transport (no `sqlparser`), so adding a
 //! transport never drags another transport's parser along, and the kernel can be carved into its own
 //! crate without this seam coming with it.
 

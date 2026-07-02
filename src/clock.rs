@@ -2,8 +2,8 @@
 //!
 //! Every ambient wall-clock read in the engine flows through [`Clock`]. Production uses
 //! [`SystemClock`]; tests and simulations inject a deterministic clock so that a run is
-//! reproducible from a seed. This is the ONLY module permitted to call `SystemTime::now()`
-//! — `scripts/check-no-ambient-time.sh` enforces that in CI, and a clippy `disallowed-methods`
+//! reproducible from a seed. This is the ONLY module permitted to call `SystemTime::now()`;
+//! `scripts/check-no-ambient-time.sh` enforces that in CI, and a clippy `disallowed-methods`
 //! rule bans it everywhere else.
 #![allow(clippy::disallowed_methods)]
 

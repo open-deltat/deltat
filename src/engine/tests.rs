@@ -645,7 +645,7 @@ async fn engine_commit_hold_persists_across_replay() {
         engine.commit_hold(hid, bid, None).await.unwrap();
     }
 
-    // Reopen from the WAL after a clean shutdown: the hold is gone and the booking survives — both
+    // Reopen from the WAL after a clean shutdown: the hold is gone and the booking survives. Both
     // halves of the commit are durable.
     let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
     assert!(engine.get_holds(rid).await.unwrap().is_empty());
@@ -660,7 +660,7 @@ async fn engine_commit_hold_torn_write_never_overbooks() {
     // write (power loss / IO error after the first record's bytes reach disk but before the
     // second's) can persist HoldReleased and lose BookingConfirmed. Replay discards the torn tail.
     // Because release is written BEFORE confirm, the worst a crash can leave is a freed (re-bookable)
-    // slot — never a live hold AND a booking on the span (never an overbook, INV-01). This locks
+    // slot, never a live hold AND a booking on the span (never an overbook, INV-01). This locks
     // that safe direction; it is the durability posture AVAIL-07 actually provides.
     let path = test_wal_path("commit_hold_torn.wal");
     let rid = Ulid::new();
@@ -696,7 +696,7 @@ async fn engine_commit_hold_excludes_own_hold_on_capacity_n() {
     // On a capacity-2 resource already holding two overlapping allocations, committing one must
     // succeed: excluding the committed hold from its own conflict check leaves only the other
     // allocation (1 < 2). Without the exclusion the sweep would count both holds (= capacity) and
-    // reject the new booking — so this exercises the capacity>1 exclusion path through
+    // reject the new booking, so this exercises the capacity>1 exclusion path through
     // collect_active_allocs_with_buffer, distinct from the capacity-1 fast path.
     let path = test_wal_path("commit_hold_cap_n.wal");
     let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
@@ -714,7 +714,7 @@ async fn engine_commit_hold_excludes_own_hold_on_capacity_n() {
     assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
     assert_eq!(engine.get_holds(rid).await.unwrap().len(), 1);
 
-    // A third overlapping allocation now exceeds capacity — confirms the resource was genuinely full.
+    // A third overlapping allocation now exceeds capacity. Confirms the resource was genuinely full.
     let err = engine
         .confirm_booking(Ulid::new(), rid, Span::new(10, 20), None)
         .await
@@ -1098,7 +1098,7 @@ async fn engine_grandparent_non_blocking_skips_empty_parent() {
 
 #[tokio::test]
 async fn engine_sibling_independence() {
-    // Two children of same parent — booking on one doesn't affect the other
+    // Two children of same parent, booking on one doesn't affect the other
     let path = test_wal_path("sibling_independence.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -1270,7 +1270,7 @@ async fn engine_children_index_rebuilt_on_replay() {
         engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
     }
 
-    // Replay from WAL — children index should be rebuilt
+    // Replay from WAL, children index should be rebuilt
     let engine2 = Engine::new(path, notify).unwrap();
     // Verify by trying to delete parent (should fail because child exists)
     assert!(matches!(
@@ -1336,7 +1336,7 @@ async fn engine_multiple_blocking_from_different_ancestors() {
 
 #[tokio::test]
 async fn engine_adjacent_allocations_no_conflict() {
-    // [100,200) and [200,300) are adjacent, NOT overlapping — should succeed
+    // [100,200) and [200,300) are adjacent, NOT overlapping, should succeed
     let path = test_wal_path("adjacent_no_conflict.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -1349,7 +1349,7 @@ async fn engine_adjacent_allocations_no_conflict() {
         .place_hold(Ulid::new(), rid, Span::new(100, 200), far_future)
         .await
         .unwrap();
-    // Adjacent — should NOT conflict
+    // Adjacent, should NOT conflict
     engine
         .place_hold(Ulid::new(), rid, Span::new(200, 300), far_future)
         .await
@@ -1415,7 +1415,7 @@ async fn engine_hold_expires_at_exact_now() {
         .await
         .unwrap();
 
-    // Should succeed — hold at exact `now` is expired
+    // Should succeed: hold at exact `now` is expired
     engine
         .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
         .await
@@ -1428,7 +1428,7 @@ async fn engine_hold_expires_at_exact_now() {
 
 #[tokio::test]
 async fn engine_projection_exact_boundary() {
-    // Rule at exact parent boundary edges — should pass
+    // Rule at exact parent boundary edges, should pass
     let path = test_wal_path("projection_exact.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -1443,7 +1443,7 @@ async fn engine_projection_exact_boundary() {
     let child = Ulid::new();
     engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
-    // Exactly at parent boundaries — should succeed
+    // Exactly at parent boundaries, should succeed
     engine
         .add_rule(Ulid::new(), child, Span::new(9 * H, 17 * H), false)
         .await
@@ -1452,7 +1452,7 @@ async fn engine_projection_exact_boundary() {
 
 #[tokio::test]
 async fn engine_projection_one_ms_outside() {
-    // Rule extends 1ms beyond parent availability — should be rejected
+    // Rule extends 1ms beyond parent availability, should be rejected
     let path = test_wal_path("projection_1ms_outside.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -1508,7 +1508,7 @@ async fn engine_projection_validated_against_parent_not_grandparent() {
         .await
         .unwrap();
 
-    // Child tries [8,10) — grandparent allows it but parent doesn't
+    // Child tries [8,10), grandparent allows it but parent doesn't
     let result = engine
         .add_rule(Ulid::new(), child, Span::new(8 * H, 10 * H), false)
         .await;
@@ -1530,7 +1530,7 @@ async fn engine_projection_validated_against_parent_not_grandparent() {
 
 #[tokio::test]
 async fn engine_resource_with_many_intervals() {
-    // 1000 bookings, query a narrow window — binary search should handle this
+    // 1000 bookings, query a narrow window, binary search should handle this
     let path = test_wal_path("many_intervals.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -1567,7 +1567,7 @@ async fn engine_resource_with_many_intervals() {
 
 #[tokio::test]
 async fn engine_availability_past_query() {
-    // Query entirely in the past — should still return correctly
+    // Query entirely in the past, should still return correctly
     let path = test_wal_path("past_query.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -1754,7 +1754,7 @@ async fn vertical_doctor_office() {
         .compute_availability(dr_smith, 0, 24 * H, Some(30 * M))
         .await
         .unwrap();
-    // [9:30, 12:00)=150min, [13:00, 14:00)=60min, [15:00, 17:00)=120min — all ≥ 30min
+    // [9:30, 12:00)=150min, [13:00, 14:00)=60min, [15:00, 17:00)=120min, all ≥ 30min
     assert_eq!(avail_30.len(), 3);
     assert_eq!(avail_30[0], Span::new(9 * H + 30 * M, 12 * H));
     assert_eq!(avail_30[1], Span::new(13 * H, 14 * H));
@@ -1768,7 +1768,7 @@ async fn vertical_doctor_office() {
     // [9:30, 12:00)=150min ✓, [13:00, 14:00)=60min ✗, [15:00, 17:00)=120min ✓
     assert_eq!(avail_90.len(), 2);
 
-    // Doctor calls in sick — add personal blocking
+    // Doctor calls in sick, add personal blocking
     engine
         .add_rule(Ulid::new(), dr_smith, Span::new(15 * H, 17 * H), true)
         .await
@@ -1781,7 +1781,7 @@ async fn vertical_doctor_office() {
         .compute_availability(dr_smith, 0, 24 * H, None)
         .await
         .unwrap();
-    // [9:30, 12:00) + [13:00, 15:00) — afternoon cut short
+    // [9:30, 12:00) + [13:00, 15:00), afternoon cut short
     assert_eq!(avail_after_sick.len(), 2);
     assert_eq!(avail_after_sick[0], Span::new(9 * H + 30 * M, 12 * H));
     assert_eq!(avail_after_sick[1], Span::new(13 * H, 15 * H));
@@ -2009,7 +2009,7 @@ async fn vertical_hotel_multi_night_with_cleaning() {
     // Actually, conflict check only checks against allocations, not rules.
     // The booking at cleaning time won't conflict with allocations but should not be allowed
     // based on business logic. Currently our conflict check is allocation-only.
-    // This is a valid finding — the engine doesn't prevent booking in blocked time.
+    // This is a valid finding: the engine doesn't prevent booking in blocked time.
     // For now, let's just verify the availability correctly shows it as blocked.
     let cleaning_avail = engine
         .compute_availability(room, checkout_a, checkout_a + 2 * H, None)
@@ -2024,7 +2024,7 @@ async fn vertical_hotel_multi_night_with_cleaning() {
 
 #[tokio::test]
 async fn vertical_multi_tenant_isolation() {
-    // Two completely independent resource trees — no cross-contamination
+    // Two completely independent resource trees, no cross-contamination
     let path = test_wal_path("vertical_multi_tenant.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -2076,7 +2076,7 @@ async fn vertical_multi_tenant_isolation() {
         .create_resource(orphan, Some(gym), None, 1, None)
         .await
         .unwrap();
-    // orphan is under gym — not under restaurant. Totally separate.
+    // orphan is under gym, not under restaurant. Totally separate.
     let orphan_avail = engine
         .compute_availability(orphan, 0, 24 * H, None)
         .await
@@ -2356,7 +2356,7 @@ async fn capacity_two_bookings_same_slot() {
         .await
         .unwrap();
 
-    // Two bookings on the same span — capacity=2, both should succeed
+    // Two bookings on the same span: capacity=2, both should succeed
     engine
         .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
         .await
@@ -2390,7 +2390,7 @@ async fn capacity_third_booking_conflicts() {
         .await
         .unwrap();
 
-    // Third booking should fail — capacity exceeded
+    // Third booking should fail, capacity exceeded
     let result = engine
         .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
         .await;
@@ -2444,7 +2444,7 @@ async fn capacity_one_is_default_behavior() {
         .await
         .unwrap();
 
-    // Second booking should fail — capacity=1
+    // Second booking should fail, capacity=1
     let result = engine
         .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
         .await;
@@ -2454,7 +2454,7 @@ async fn capacity_one_is_default_behavior() {
 #[tokio::test]
 async fn batch_capacity_books_n_units_same_span_atomically() {
     // A capacity-N pool (e.g. a stadium GA section) must accept N simultaneous bookings for
-    // the SAME span in one atomic batch — the "buy N GA tickets at once" path.
+    // the SAME span in one atomic batch, the "buy N GA tickets at once" path.
     let path = test_wal_path("batch_cap_n_ok.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Arc::new(Engine::new(path, notify).unwrap());
@@ -2473,7 +2473,7 @@ async fn batch_capacity_books_n_units_same_span_atomically() {
 
 #[tokio::test]
 async fn batch_capacity_rejects_over_capacity_atomically() {
-    // N+1 simultaneous units on a capacity-N pool must fail as a whole — none committed.
+    // N+1 simultaneous units on a capacity-N pool must fail as a whole, none committed.
     let path = test_wal_path("batch_cap_over.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Arc::new(Engine::new(path, notify).unwrap());
@@ -2526,7 +2526,7 @@ async fn batch_capacity_accounts_for_committed_load() {
 async fn sync_stable_unit_multi_night_availability() {
     // SYNC-01: a capacity-2 pool = 2 interchangeable rooms. Two overlapping multi-night stays
     // saturate the middle night; a longer stay spanning it would require switching rooms, so it
-    // must be rejected — while a stay clear of it fits on a single stable room. The capacity
+    // must be rejected, while a stay clear of it fits on a single stable room. The capacity
     // sweep already guarantees this: a stay is ONE interval, and max-overlap < capacity over its
     // span ⟺ a stable unit exists for the whole span (interval-graph colouring; chromatic
     // number = max clique). No new primitive needed; this test locks the guarantee.
@@ -2538,7 +2538,7 @@ async fn sync_stable_unit_multi_night_availability() {
     let day = 24 * H;
     engine.add_rule(Ulid::new(), rid, Span::new(0, 10 * day), false).await.unwrap();
 
-    // Stay A: nights 1–3, Stay B: nights 2–4 → night [2,3) is fully booked (2 of 2).
+    // Stay A: nights 1-3, Stay B: nights 2-4 → night [2,3) is fully booked (2 of 2).
     engine.confirm_booking(Ulid::new(), rid, Span::new(day, 3 * day), None).await.unwrap();
     engine.confirm_booking(Ulid::new(), rid, Span::new(2 * day, 4 * day), None).await.unwrap();
 
@@ -2659,7 +2659,7 @@ async fn buffer_after_shrinks_availability() {
         .await
         .unwrap();
 
-    // Should be: [0, 10h), [11.5h, 24h) — buffer pushes next available to 11:30
+    // Should be: [0, 10h), [11.5h, 24h). Buffer pushes next available to 11:30
     let h_half = h / 2;
     assert_eq!(
         avail,
@@ -2685,7 +2685,7 @@ async fn buffer_after_between_bookings() {
         .await
         .unwrap();
 
-    // Two bookings — should not be able to book immediately after the first
+    // Two bookings, should not be able to book immediately after the first
     engine
         .confirm_booking(Ulid::new(), rid, Span::new(0, 10_000_000), None)
         .await
@@ -2755,7 +2755,7 @@ async fn capacity_and_buffer_combined() {
         .await
         .unwrap();
 
-    // Two bookings on same slot (capacity=2) — both succeed
+    // Two bookings on same slot (capacity=2), both succeed
     engine
         .confirm_booking(Ulid::new(), rid, Span::new(1000, 5000), None)
         .await
@@ -2870,7 +2870,7 @@ async fn vertical_hotel_room_buffer() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// Multi-resource availability — comprehensive edge case coverage
+// Multi-resource availability: comprehensive edge case coverage
 // ══════════════════════════════════════════════════════════════
 
 // ── Basic operations ──────────────────────────────────────────
@@ -2953,7 +2953,7 @@ async fn multi_avail_merges_adjacent_coverage_before_min_duration() {
     // between resources at a shared half-open boundary (r1 free [8,12), r2 free
     // [12,16)), the sweep emits two adjacent segments. They must be merged before
     // the min_duration filter, or a genuinely continuous 8h window gets split into
-    // two 4h fragments and dropped — hiding a real slot.
+    // two 4h fragments and dropped, hiding a real slot.
     let path = test_wal_path("multi_avail_gap13.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -3085,7 +3085,7 @@ async fn multi_avail_min_available_exceeds_count() {
     engine.create_resource(b, None, None, 1, None).await.unwrap();
     engine.add_rule(Ulid::new(), b, Span::new(0, 10000), false).await.unwrap();
 
-    // Need 3 of 2 — impossible
+    // Need 3 of 2, impossible
     let result = engine
         .compute_multi_availability(&[a, b], 0, 10000, 3, None)
         .await
@@ -3132,7 +3132,7 @@ async fn multi_avail_one_resource_has_no_rules() {
 
     let b = Ulid::new();
     engine.create_resource(b, None, None, 1, None).await.unwrap();
-    // No rules for b — zero availability
+    // No rules for b, zero availability
 
     // Intersection: a has [8,17), b has nothing → empty
     let result = engine
@@ -3280,7 +3280,7 @@ async fn multi_avail_with_capacity_resource() {
     let room = Ulid::new();
     engine.create_resource(room, None, None, 2, None).await.unwrap();
     engine.add_rule(Ulid::new(), room, Span::new(8 * H, 17 * H), false).await.unwrap();
-    // One booking 10-11am — room NOT saturated (1 of 2)
+    // One booking 10-11am, room NOT saturated (1 of 2)
     engine.confirm_booking(Ulid::new(), room, Span::new(10 * H, 11 * H), None).await.unwrap();
 
     // Projector: capacity 1
@@ -3316,7 +3316,7 @@ async fn multi_avail_with_capacity_resource() {
 #[tokio::test]
 async fn multi_avail_exact_boundary_touch() {
     // Two resources whose availability spans share exact boundaries
-    // [8,12) and [12,17) — they touch but don't overlap
+    // [8,12) and [12,17), they touch but don't overlap
     let path = test_wal_path("multi_avail_boundary.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
@@ -3337,7 +3337,7 @@ async fn multi_avail_exact_boundary_touch() {
     assert!(result.is_empty());
 
     // Union: [8,12) ∪ [12,17) = [8,17). The two resources hand off coverage at
-    // the exact boundary 12h, so the result is ONE continuous window — not two
+    // the exact boundary 12h, so the result is ONE continuous window, not two
     // fragments. (Before GAP-13 the sweep emitted two adjacent spans here; that
     // representation silently dropped continuous windows under a min_duration
     // filter, so the result is now merged to match the single-resource path.)
@@ -3363,7 +3363,7 @@ async fn multi_avail_single_ms_overlap() {
     engine.create_resource(b, None, None, 1, None).await.unwrap();
     engine.add_rule(Ulid::new(), b, Span::new(1000, 2000), false).await.unwrap();
 
-    // Intersection: [1000, 1001) — 1ms overlap
+    // Intersection: [1000, 1001), 1ms overlap
     let result = engine
         .compute_multi_availability(&[a, b], 0, 3000, 2, None)
         .await
@@ -3503,7 +3503,7 @@ async fn multi_avail_cascading_no_triple_overlap() {
     engine.create_resource(c, None, None, 1, None).await.unwrap();
     engine.add_rule(Ulid::new(), c, Span::new(14 * H, 20 * H), false).await.unwrap();
 
-    // min=1: [8,20) — continuous chain
+    // min=1: [8,20), continuous chain
     let union = engine
         .compute_multi_availability(&[a, b, c], 0, 24 * H, 1, None)
         .await
@@ -3605,21 +3605,21 @@ async fn multi_avail_large_pool_various_thresholds() {
     }
 
     // At time 9h, all 10 are available. At time 0h, only resource 0 is.
-    // min=1: [0,20h) — at least one is always free from 0-20h
+    // min=1: [0,20h), at least one is always free from 0-20h
     let union = engine
         .compute_multi_availability(&ids, 0, 24 * H, 1, None)
         .await
         .unwrap();
     assert_eq!(union, vec![Span::new(0, 20 * H)]);
 
-    // min=10: [9h,20h) — all 10 are free only from 9h onward
+    // min=10: [9h,20h), all 10 are free only from 9h onward
     let all = engine
         .compute_multi_availability(&ids, 0, 24 * H, 10, None)
         .await
         .unwrap();
     assert_eq!(all, vec![Span::new(9 * H, 20 * H)]);
 
-    // min=5: [4h,20h) — resources 0-4 all available from 4h
+    // min=5: [4h,20h), resources 0-4 all available from 4h
     let five = engine
         .compute_multi_availability(&ids, 0, 24 * H, 5, None)
         .await
@@ -3639,7 +3639,7 @@ async fn multi_avail_nonexistent_resource_ignored() {
     engine.create_resource(real, None, None, 1, None).await.unwrap();
     engine.add_rule(Ulid::new(), real, Span::new(0, 10000), false).await.unwrap();
 
-    let fake = Ulid::new(); // never created — contributes 0 availability
+    let fake = Ulid::new(); // never created, contributes 0 availability
 
     // min_available=1, so the real resource's availability is enough
     let result = engine
@@ -3682,7 +3682,7 @@ async fn multi_avail_vertical_maintenance_scheduling() {
     // mechanic: [7,9) ∪ [11,15)
     // plane: [0,6) ∪ [9,13) ∪ [17,24)
     // hangar: [6,7) ∪ [10,22)
-    // ALL three free: [11,13) — the only maintenance window
+    // ALL three free: [11,13), the only maintenance window
     let window = engine
         .compute_multi_availability(&[mechanic, plane, hangar], 0, 24 * H, 3, None)
         .await
@@ -3773,14 +3773,14 @@ async fn multi_avail_vertical_taxi_dispatch() {
     engine.confirm_booking(Ulid::new(), taxis[0], Span::new(12 * H, 13 * H), None).await.unwrap();
     engine.confirm_booking(Ulid::new(), taxis[1], Span::new(12 * H, 13 * H), None).await.unwrap();
 
-    // min=1 (any taxi free): [0,8) ∪ [9,24) — 8-9am completely blocked
+    // min=1 (any taxi free): [0,8) ∪ [9,24), 8-9am completely blocked
     let any = engine
         .compute_multi_availability(&taxis, 0, 24 * H, 1, None)
         .await
         .unwrap();
     assert_eq!(any, vec![Span::new(0, 8 * H), Span::new(9 * H, 24 * H)]);
 
-    // min=3: [0,8) ∪ [9,12) ∪ [13,24) — at lunch only 2 taxis (0,1 busy)
+    // min=3: [0,8) ∪ [9,12) ∪ [13,24), at lunch only 2 taxis (0,1 busy)
     let three = engine
         .compute_multi_availability(&taxis, 0, 24 * H, 3, None)
         .await
@@ -3792,7 +3792,7 @@ async fn multi_avail_vertical_taxi_dispatch() {
     ]);
 
     // min=4 (all taxis): [0,8) ∪ [9,12) ∪ [13,24)
-    // Wait — taxis 2,3 are free at lunch, so at lunch count=2.
+    // Wait, taxis 2,3 are free at lunch, so at lunch count=2.
     // For min=4 we also lose 12-1pm.
     let all = engine
         .compute_multi_availability(&taxis, 0, 24 * H, 4, None)
@@ -4285,7 +4285,7 @@ async fn group_commit_batches_appends() {
 
     assert_eq!(engine.list_resources().len(), n);
 
-    // Replay WAL from disk — should reconstruct the same N resources
+    // Replay WAL from disk, should reconstruct the same N resources
     let engine2 = Engine::new(path, notify).unwrap();
     assert_eq!(engine2.list_resources().len(), n);
 }
@@ -4436,7 +4436,7 @@ async fn hierarchy_at_limit() {
         prev = next;
     }
 
-    // This is the MAX_HIERARCHY_DEPTH-th child — should succeed
+    // This is the MAX_HIERARCHY_DEPTH-th child, should succeed
     let result = engine.create_resource(Ulid::new(), Some(prev), None, 1, None).await;
     assert!(result.is_ok());
 }
@@ -4947,7 +4947,7 @@ async fn gc_compact_roundtrip() {
     // Compact WAL
     engine.compact_wal().await.unwrap();
 
-    // Replay from WAL — old booking should not reappear
+    // Replay from WAL, old booking should not reappear
     let notify2 = Arc::new(crate::notify::NotifyHub::new());
     let engine2 = Engine::new(path, notify2).unwrap();
 

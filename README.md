@@ -36,15 +36,15 @@ Everything in scheduling is just an extension of this primitive:
 | **Hold** | A segment with a self-destruct timer |
 | **Availability** | The gaps between everything already placed |
 
-deltat is a database built entirely around this primitive. It operates purely on raw `i64` Unix milliseconds — no time zones, no calendars, no date formats. No pricing, no user profiles, no business data. Just segments on a number line.
+deltat is a database built entirely around this primitive. It operates purely on raw `i64` Unix milliseconds. No time zones, no calendars, no date formats. No pricing, no user profiles, no business data. Just segments on a number line.
 
-Scheduling has historically been painful because it was forced into relational databases that weren't designed for it — time intervals, collision detection, and availability queries bolted onto tables built for storing rows. deltat inverts that. Time isn't a column in someone else's schema. It's the entire database.
+Scheduling has historically been painful because it was forced into relational databases that weren't designed for it: time intervals, collision detection, and availability queries bolted onto tables built for storing rows. deltat inverts that. Time isn't a column in someone else's schema. It's the entire database.
 
 Human-readable time is a display concern that belongs in the client. The database just sees numbers on a line, which means it will work unchanged as long as 64-bit integers exist.
 
 ## What it is
 
-A single Rust binary that speaks PostgreSQL. No Postgres underneath — it's a purpose-built in-memory engine backed by an append-only WAL. Connect with any Postgres client.
+A single Rust binary that speaks PostgreSQL. No Postgres underneath: it's a purpose-built in-memory engine backed by an append-only WAL. Connect with any Postgres client.
 
 > The PostgreSQL wire protocol is the current transport; a v2 framed protocol (+ HTTP/MCP) is planned (see `docs/REQUIREMENTS.md`).
 
@@ -76,7 +76,7 @@ psql -h localhost -p 5433 -U deltat
 
 ### Resources
 
-Anything bookable. Resources form a tree — children inherit availability from their parent.
+Anything bookable. Resources form a tree: children inherit availability from their parent.
 
 ```sql
 INSERT INTO resources (id, parent_id, name, capacity, buffer_after)
@@ -96,7 +96,7 @@ SELECT * FROM resources WHERE parent_id = '01J...';    -- children
 When a resource is open or closed.
 
 ```sql
--- Available 9am–5pm
+-- Available 9am-5pm
 INSERT INTO rules (id, resource_id, start, "end", blocking)
 VALUES ('01J...', '01J...', 1706000000000, 1706028800000, false);
 
@@ -177,7 +177,7 @@ UNLISTEN resource_01J...;
 
 ## Reference
 
-All times are **Unix milliseconds**. Intervals are half-open `[start, end)` — adjacent segments don't collide.
+All times are **Unix milliseconds**. Intervals are half-open `[start, end)`, so adjacent segments don't collide.
 
 ### Configuration
 
@@ -217,7 +217,7 @@ src/
 
 ### Client libraries
 
-**TypeScript** — [@open-tap/client](https://github.com/open-tap/tap)
+**TypeScript**: [@open-tap/client](https://github.com/open-tap/tap)
 
 ### Demos
 

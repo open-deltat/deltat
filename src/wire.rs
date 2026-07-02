@@ -751,9 +751,9 @@ fn substitute_params(portal: &Portal<String>) -> String {
 /// `NotificationResponse`s.
 ///
 /// A `Lagged` error means the subscriber briefly fell behind the bounded broadcast ring and lost
-/// some events — it must NOT end the subscription. Ending it would let a transient burst silently
+/// some events. It must NOT end the subscription. Ending it would let a transient burst silently
 /// kill the live stream forever; instead we keep forwarding subsequent events (the listener
-/// re-reads authoritative state on the next one — availability is never derived from the stream).
+/// re-reads authoritative state on the next one; availability is never derived from the stream).
 /// Only `Closed` (all senders dropped, e.g. the resource was deleted) ends the forwarder.
 async fn forward_resource_events(
     mut rx: tokio::sync::broadcast::Receiver<Event>,
@@ -784,7 +784,7 @@ pub async fn process_connection(
     password: String,
     tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
     // Post-auth lifetime guards in ms (0 = disabled). They bound a client that opens a LISTEN and
-    // then squats — the only thing that reclaims a connection slot once the global semaphore is
+    // then squats, the only thing that reclaims a connection slot once the global semaphore is
     // full, so they are the real defense against connection-exhaustion DoS.
     max_conn_age_ms: u64,
     max_idle_ms: u64,
@@ -1509,7 +1509,7 @@ mod tests {
         let cmd = Command::Listen { channel };
         let responses = handler.execute_command(&engine, cmd).await.unwrap();
         assert_eq!(responses.len(), 1);
-        // No subscribe_tx, so no command sent — just returns LISTEN tag
+        // No subscribe_tx, so no command sent, just returns LISTEN tag
     }
 
     #[tokio::test]

@@ -39,7 +39,7 @@ pub(super) enum WalCommand {
     /// guarantee both-or-neither against a torn write between them (a power loss or write error
     /// after one record's bytes reach disk but before the next's): replay discards the torn tail
     /// and keeps the prefix. Callers must therefore order events so that losing the tail is the
-    /// safe outcome — `commit_hold` writes HoldReleased before BookingConfirmed, so a torn pair
+    /// safe outcome: `commit_hold` writes HoldReleased before BookingConfirmed, so a torn pair
     /// loses the booking (a re-bookable slot), never leaves a hold plus a booking.
     AppendAtomic {
         events: Vec<Event>,
@@ -78,7 +78,7 @@ async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
                             handle_non_append(&mut wal, other);
                             break;
                         }
-                        Err(_) => break, // channel empty — flush batch
+                        Err(_) => break, // channel empty, flush batch
                     }
                 }
 
@@ -110,7 +110,7 @@ fn flush_batch(wal: &mut Wal, batch: &mut [(Event, oneshot::Sender<io::Result<()
             break;
         }
     }
-    // Always flush — even on append error — so partially buffered bytes
+    // Always flush, even on append error, so partially buffered bytes
     // don't leak into the next batch (callers were told this batch failed).
     let flush_err = wal.flush_sync().err();
     if let Some(e) = append_err {
@@ -135,7 +135,7 @@ fn respond_batch(batch: &mut Vec<(Event, oneshot::Sender<io::Result<()>>)>, resu
 fn handle_non_append(wal: &mut Wal, cmd: WalCommand) {
     match cmd {
         WalCommand::AppendAtomic { events, response } => {
-            // Buffer every event, then one flush_sync — the same shape as flush_batch but for a
+            // Buffer every event, then one flush_sync, the same shape as flush_batch but for a
             // single response. Always flush so partial bytes don't leak into the next write.
             let mut append_err = None;
             for event in &events {
@@ -170,7 +170,7 @@ pub struct Engine {
     clock: Arc<dyn Clock>,
     /// A conservative lower bound on the earliest live hold's `expires_at`. The reaper skips its
     /// full scan when `now` is below this. `place_hold` lowers it; each full scan recomputes it
-    /// exactly. `i64::MIN` means "unknown — scan" (the initial value, so the first reaper cycle and
+    /// exactly. `i64::MIN` means "unknown, scan" (the initial value, so the first reaper cycle and
     /// the cycle after any replay scan normally).
     pub(super) earliest_hold_expiry: std::sync::atomic::AtomicI64,
     /// Bumped by every `place_hold`. `collect_expired_holds` snapshots it before scanning and only
@@ -206,7 +206,7 @@ impl Engine {
             hold_generation: std::sync::atomic::AtomicU64::new(0),
         };
 
-        // Replay events — we're the sole owner of these Arcs, so try_read/try_write
+        // Replay events: we're the sole owner of these Arcs, so try_read/try_write
         // always succeed instantly (no contention). Never use blocking_read/blocking_write
         // here because this may run inside an async context (e.g. lazy tenant creation).
         for event in &events {
@@ -279,7 +279,7 @@ impl Engine {
         self.store.get_resource_for_entity(entity_id)
     }
 
-    /// Current time in UTC Unix milliseconds, taken from the injected clock — the single
+    /// Current time in UTC Unix milliseconds, taken from the injected clock, the single
     /// point through which the whole engine reads "now".
     pub fn now_ms(&self) -> Ms {
         self.clock.now_ms()

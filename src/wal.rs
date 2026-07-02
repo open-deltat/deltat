@@ -46,8 +46,8 @@ impl Wal {
         })
     }
 
-    /// Append a single event to the WAL and fsync. Used by tests only —
-    /// production code uses `append_buffered` + `flush_sync` for group commit.
+    /// Append a single event to the WAL and fsync. Used by tests only.
+    /// Production code uses `append_buffered` + `flush_sync` for group commit.
     #[cfg(test)]
     pub fn append(&mut self, event: &Event) -> io::Result<()> {
         self.append_buffered(event)?;
@@ -74,7 +74,7 @@ impl Wal {
     }
 
     /// Write compacted events to a temp file and fsync.
-    /// This is the slow I/O phase — call OUTSIDE the WAL lock.
+    /// This is the slow I/O phase. Call OUTSIDE the WAL lock.
     pub fn write_compact_file(path: &Path, events: &[Event]) -> io::Result<()> {
         let tmp_path = path.with_extension("wal.tmp");
         let file = File::create(&tmp_path)?;
@@ -88,7 +88,7 @@ impl Wal {
     }
 
     /// Atomic swap: rename temp file over the WAL and reopen.
-    /// This is fast — call while holding the WAL lock.
+    /// This is fast. Call while holding the WAL lock.
     pub fn swap_compact_file(&mut self) -> io::Result<()> {
         let tmp_path = self.path.with_extension("wal.tmp");
         fs::rename(&tmp_path, &self.path)?;
@@ -158,7 +158,7 @@ impl Wal {
             let computed_crc = crc32fast::hash(&payload);
 
             if stored_crc != computed_crc {
-                // Corrupt entry — stop replaying
+                // Corrupt entry, stop replaying
                 break;
             }
 

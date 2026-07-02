@@ -93,7 +93,7 @@ proptest! {
 
     /// The read path and the write path agree on the allocation/capacity/buffer
     /// dimension. The whole window is open (one non-blocking rule), so the only
-    /// thing that can close an instant is allocation pressure — which both paths
+    /// thing that can close an instant is allocation pressure, which both paths
     /// must compute identically. (The blocking-rule read/write disagreement is
     /// the separate, still-open T-03, deliberately excluded by generating no
     /// blocking rules here.)

@@ -307,14 +307,14 @@ fn extract_availability_filters(
 /// execution router (`parse_select`) and the Describe schema (`wire::schema_for_sql`) branch on
 /// this single function so the announced column set always matches the rows that get produced.
 /// It must agree at Describe time (when `$N` placeholders are still unbound and values cannot be
-/// read) and at execution time, so it inspects only structure — never literal values.
+/// read) and at execution time, so it inspects only structure, never literal values.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AvailabilityShape {
-    /// `resource_id = X` — per-resource rows tagged with `resource_id`.
+    /// `resource_id = X`: per-resource rows tagged with `resource_id`.
     Single,
-    /// `resource_id IN (...)` without `min_available` — per-resource rows, each tagged.
+    /// `resource_id IN (...)` without `min_available`: per-resource rows, each tagged.
     PerResourceMulti,
-    /// `resource_id IN (...) AND min_available = N` — merged across the set, no `resource_id`.
+    /// `resource_id IN (...) AND min_available = N`: merged across the set, no `resource_id`.
     Merged,
 }
 
@@ -343,7 +343,7 @@ fn selection_has_resource_id_in_list(expr: &Expr) -> bool {
 }
 
 /// Mirror `extract_availability_filters`' merged-marker matching exactly: `min_available = ...`
-/// with the column on the left (`Eq` only — not `>`, `>=`, or a reversed `N = min_available`),
+/// with the column on the left (`Eq` only, not `>`, `>=`, or a reversed `N = min_available`),
 /// reachable only through `AND`.
 fn selection_has_min_available_eq(expr: &Expr) -> bool {
     match expr {
@@ -435,7 +435,7 @@ fn extract_resource_id_filter(selection: &Option<Expr>) -> Result<Ulid, SqlError
                 Err(SqlError::MissingFilter("resource_id"))
             }
         }
-        // Handle AND expressions — find resource_id = X within ANDs
+        // Handle AND expressions: find resource_id = X within ANDs
         Expr::BinaryOp {
             left,
             op: ast::BinaryOperator::And,
@@ -581,7 +581,7 @@ fn extract_insert_values(insert: &ast::Insert) -> Result<Vec<Expr>, SqlError> {
 /// (BatchInsertResources) paths.
 /// Resolve a declared-column value index against the actual row, returning None when the column was
 /// declared but the row supplied fewer values. sqlparser accepts that column/value arity mismatch,
-/// so indexing it unchecked panics on untrusted SQL — and the SQL boundary must never panic
+/// so indexing it unchecked panics on untrusted SQL, and the SQL boundary must never panic
 /// (PRIN-08 / SEC-09). Optional columns become absent; a missing required column is a WrongArity.
 fn cell(values: &[Expr], idx: Option<usize>) -> Option<&Expr> {
     idx.filter(|&i| i < values.len()).map(|i| &values[i])
@@ -593,7 +593,7 @@ fn parse_resource_row(values: &[Expr], columns: &[String]) -> Result<ResourceRow
     }
     // A declared column list must match the value count; sqlparser accepts a mismatch, so reject it
     // cleanly here rather than indexing a column position past the row (the `cell` accesses below
-    // are then bounded either way — defense in depth).
+    // are then bounded either way, defense in depth).
     if !columns.is_empty() && values.len() != columns.len() {
         return Err(SqlError::WrongArity("resources", columns.len(), values.len()));
     }
@@ -955,7 +955,7 @@ mod tests {
         // The merged form is selected ONLY by `min_available = N` (Eq, column on the left). Any
         // other form (`>`, `>=`, reversed `N = min_available`) routes per-resource. The Describe
         // schema (wire::schema_for_sql) classifies with the same `availability_shape`, so the
-        // announced column set matches the produced rows — see the wire cross-check test.
+        // announced column set matches the produced rows. See the wire cross-check test.
         let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let b = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
         let prefix = format!("SELECT * FROM availability WHERE resource_id IN ('{a}', '{b}')");
@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn parse_resource_insert_column_arity_mismatch_does_not_panic() {
         // Declared 5 columns, supplied 1 value: sqlparser accepts it; the parser must return a
-        // clean error, never index out of bounds (the SQL boundary is untrusted — PRIN-08/SEC-09).
+        // clean error, never index out of bounds (the SQL boundary is untrusted, PRIN-08/SEC-09).
         let sql = "INSERT INTO resources (id, parent_id, name, capacity, buffer_after) VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV')";
         assert!(parse_sql(sql).is_err());
     }
@@ -1089,7 +1089,7 @@ mod tests {
     fn parse_resource_insert_arity_fuzz_never_panics() {
         use proptest::prelude::*;
         let cols = ["id", "parent_id", "name", "capacity", "buffer_after"];
-        // Any declared-column count vs value count must yield Ok or Err — never a panic.
+        // Any declared-column count vs value count must yield Ok or Err, never a panic.
         proptest!(ProptestConfig::with_cases(400), |(ncols in 1usize..=5, nvals in 0usize..=5)| {
             let collist = cols[..ncols].join(", ");
             let vallist = (0..nvals)
@@ -1763,7 +1763,7 @@ mod tests {
 
     #[test]
     fn parse_insert_booking_without_label() {
-        // No label column at all — should default to None
+        // No label column at all, should default to None
         let sql = r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAV', 1000, 2000)"#;
         let cmd = parse_sql(sql).unwrap();
         match cmd {

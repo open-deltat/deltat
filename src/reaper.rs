@@ -16,7 +16,7 @@ pub async fn run_reaper(engine: Arc<Engine>) {
             match engine.release_hold(hold_id).await {
                 Ok(_) => info!("reaped expired hold {hold_id}"),
                 Err(e) => {
-                    // May already have been released — that's fine
+                    // May already have been released, that's fine
                     tracing::debug!("reaper skip {hold_id}: {e}");
                 }
             }

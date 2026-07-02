@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-/// Unix milliseconds — the only time type.
+/// Unix milliseconds, the only time type.
 pub type Ms = i64;
 
 /// One resource as carried by a (batch) create: `(id, parent_id, name, capacity, buffer_after)`.
@@ -64,7 +64,7 @@ pub enum IntervalKind {
     Booking { label: Option<String> },
 }
 
-/// A single interval on a resource — rules, holds, and bookings are all just intervals.
+/// A single interval on a resource: rules, holds, and bookings are all just intervals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interval {
     pub id: Ulid,
@@ -140,7 +140,7 @@ impl ResourceState {
     }
 }
 
-/// The event types — flat, no nesting. This is the WAL record format.
+/// The event types: flat, no nesting. This is the WAL record format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     ResourceCreated {

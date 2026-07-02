@@ -5,9 +5,9 @@ use crate::model::*;
 /// Compute raw free intervals for a resource using its unified interval list
 /// plus inherited rules from ancestors.
 ///
-/// Non-blocking: OVERRIDE — if resource has own non-blocking rules, use those;
+/// Non-blocking: OVERRIDE. If resource has own non-blocking rules, use those;
 /// otherwise fall back to inherited_non_blocking.
-/// Blocking: ACCUMULATE — own blocking + inherited_blocking are all subtracted.
+/// Blocking: ACCUMULATE. Own blocking + inherited_blocking are all subtracted.
 pub fn availability(
     resource: &ResourceState,
     query: &Span,
@@ -34,7 +34,7 @@ pub fn availability(
         match &interval.kind {
             IntervalKind::NonBlocking | IntervalKind::Blocking => {
                 if interval.span.end <= query.start {
-                    continue; // entirely before the window — rules have no buffer
+                    continue; // entirely before the window, rules have no buffer
                 }
                 let clamped = Span::new(
                     interval.span.start.max(query.start),
@@ -401,7 +401,7 @@ mod tests {
         // Defense-in-depth: a resource carrying an absurd buffer (as could arrive by replaying a WAL
         // written before buffer validation existed) must compute availability via saturating
         // arithmetic. Without it, `span.end + buffer` overflows i64 and panics (debug overflow checks
-        // / release overflow-checks) — the DoS the boundary validation closes on the write path.
+        // / release overflow-checks), the DoS the boundary validation closes on the write path.
         let ten = 10 * H;
         let eleven = 11 * H;
         let rs = make_resource_with_capacity(
@@ -481,7 +481,7 @@ mod tests {
 /// millisecond in the query window and decides freeness from first principles
 /// (open ∧ ¬blocked ∧ active < capacity), then reassembles maximal free runs.
 /// Because all coordinates are integers and spans are half-open `[start, end)`,
-/// point-sampling at integers reconstructs the exact span set — so any
+/// point-sampling at integers reconstructs the exact span set, so any
 /// disagreement is a real bug in the production algorithm, not sampling error.
 ///
 /// This makes INV-01 (availability is derived, never stored) and INV-02
@@ -518,7 +518,7 @@ mod spec {
 
     fn kind_strategy() -> impl Strategy<Value = GenKind> {
         // Concentrate expires_at ON and AROUND `now`: the `expires_at > now`
-        // boundary (AVAIL-11 — a hold at exactly `now` is expired) is a one-point
+        // boundary (AVAIL-11, a hold at exactly `now` is expired) is a one-point
         // edge that uniform sampling almost never hits. Without this weighting the
         // test cannot distinguish `>` from `>=` (a mutation that proved exactly
         // this slipped through before the weighting was added).
@@ -595,7 +595,7 @@ mod spec {
 
             // ACCUMULATE rule: count live allocations (bookings + unexpired holds),
             // each extended by the buffer. Capacity is the max concurrent count.
-            // No query gate — an allocation occupies `[start, end + buffer)` wherever
+            // No query gate: an allocation occupies `[start, end + buffer)` wherever
             // that lands, including a buffer tail that reaches past `query.start`.
             let active = intervals
                 .iter()

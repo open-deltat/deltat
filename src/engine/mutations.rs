@@ -166,7 +166,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Add several rules in one request. Rules are independent — they carry no capacity/conflict
+    /// Add several rules in one request. Rules are independent: they carry no capacity/conflict
     /// interaction with each other (unlike batch bookings), so each is applied via the single-rule
     /// path with its full validation (span, parent coverage, interval limit). The win is collapsing
     /// N client round-trips into one Command; semantics match the SDK's prior per-row inserts,
@@ -236,7 +236,7 @@ impl Engine {
 
     /// Atomically convert a live hold into a booking on the same span (AVAIL-07). The whole
     /// operation runs under one resource write lock, and the hold being committed is excluded
-    /// from the conflict check — it is the caller's own reservation — so there is no
+    /// from the conflict check (it is the caller's own reservation), so there is no
     /// release-then-rebook gap where a competing booker could win the span in between.
     pub async fn commit_hold(
         &self,
@@ -258,11 +258,11 @@ impl Engine {
 
         // Release + confirm share one fsync (WalCommand::AppendAtomic): an fsync error or a crash
         // before the flush leaves neither durable. They are still two WAL records, so a torn write
-        // between them can lose the booking — but release is written before confirm, so the worst
+        // between them can lose the booking, but release is written before confirm, so the worst
         // case a crash can leave is a freed (re-bookable) slot, never a live hold AND booking, i.e.
         // never an overbook (INV-01 holds). Apply only after the append is durable, like
         // persist_and_apply. (This closes the in-memory release-then-book TOCTOU; it is not a
-        // claim of torn-write crash atomicity — see WalCommand::AppendAtomic.)
+        // claim of torn-write crash atomicity. See WalCommand::AppendAtomic.)
         let release = Event::HoldReleased { id: hold_id, resource_id };
         let book = Event::BookingConfirmed { id: booking_id, resource_id, span, label };
         self.wal_append_atomic(&[release.clone(), book.clone()]).await?;
@@ -489,7 +489,7 @@ impl Engine {
 
         let mut expired = Vec::new();
         // Recompute the exact next earliest expiry from the live (non-expired) holds we see. If any
-        // resource is locked we can't see its holds, so we cannot raise the bound past it — fall
+        // resource is locked we can't see its holds, so we cannot raise the bound past it. Fall
         // back to i64::MIN to force a scan next cycle rather than risk skipping a due hold.
         let mut next_earliest = i64::MAX;
         let mut had_locked = false;
