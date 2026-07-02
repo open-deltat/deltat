@@ -346,105 +346,63 @@ impl DeltaTHandler {
                     Some(Some(pid)) => all.into_iter().filter(|r| r.parent_id == Some(pid)).collect(),
                 };
 
-                let schema = Arc::new(resources_schema());
-                let rows: Vec<PgWireResult<_>> = filtered
-                    .into_iter()
-                    .map(|r| {
-                        let mut encoder = DataRowEncoder::new(schema.clone());
-                        encoder.encode_field(&r.id.to_string())?;
-                        encoder.encode_field(&r.parent_id.map(|p| p.to_string()))?;
-                        encoder.encode_field(&r.name)?;
-                        encoder.encode_field(&(r.capacity as i64))?;
-                        encoder.encode_field(&r.buffer_after)?;
-                        Ok(encoder.take_row())
-                    })
-                    .collect();
-                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+                Ok(encode_rows(Arc::new(resources_schema()), filtered, |e, r| {
+                    e.encode_field(&r.id.to_string())?;
+                    e.encode_field(&r.parent_id.map(|p| p.to_string()))?;
+                    e.encode_field(&r.name)?;
+                    e.encode_field(&(r.capacity as i64))?;
+                    e.encode_field(&r.buffer_after)
+                }))
             }
             Command::SelectRules { resource_id } => {
                 let rules = engine.get_rules(resource_id).await.map_err(engine_err)?;
-                let schema = Arc::new(rules_schema());
-                let rows: Vec<PgWireResult<_>> = rules
-                    .into_iter()
-                    .map(|r| {
-                        let mut encoder = DataRowEncoder::new(schema.clone());
-                        encoder.encode_field(&r.id.to_string())?;
-                        encoder.encode_field(&r.resource_id.to_string())?;
-                        encoder.encode_field(&r.start)?;
-                        encoder.encode_field(&r.end)?;
-                        encoder.encode_field(&r.blocking)?;
-                        Ok(encoder.take_row())
-                    })
-                    .collect();
-                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+                Ok(encode_rows(Arc::new(rules_schema()), rules, |e, r| {
+                    e.encode_field(&r.id.to_string())?;
+                    e.encode_field(&r.resource_id.to_string())?;
+                    e.encode_field(&r.start)?;
+                    e.encode_field(&r.end)?;
+                    e.encode_field(&r.blocking)
+                }))
             }
             Command::SelectBookings { resource_id } => {
                 let bookings = engine.get_bookings(resource_id).await.map_err(engine_err)?;
-                let schema = Arc::new(bookings_schema());
-                let rows: Vec<PgWireResult<_>> = bookings
-                    .into_iter()
-                    .map(|b| {
-                        let mut encoder = DataRowEncoder::new(schema.clone());
-                        encoder.encode_field(&b.id.to_string())?;
-                        encoder.encode_field(&b.resource_id.to_string())?;
-                        encoder.encode_field(&b.start)?;
-                        encoder.encode_field(&b.end)?;
-                        encoder.encode_field(&b.label)?;
-                        Ok(encoder.take_row())
-                    })
-                    .collect();
-                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+                Ok(encode_rows(Arc::new(bookings_schema()), bookings, |e, b| {
+                    e.encode_field(&b.id.to_string())?;
+                    e.encode_field(&b.resource_id.to_string())?;
+                    e.encode_field(&b.start)?;
+                    e.encode_field(&b.end)?;
+                    e.encode_field(&b.label)
+                }))
             }
             Command::SelectHolds { resource_id } => {
                 let holds = engine.get_holds(resource_id).await.map_err(engine_err)?;
-                let schema = Arc::new(holds_schema());
-                let rows: Vec<PgWireResult<_>> = holds
-                    .into_iter()
-                    .map(|h| {
-                        let mut encoder = DataRowEncoder::new(schema.clone());
-                        encoder.encode_field(&h.id.to_string())?;
-                        encoder.encode_field(&h.resource_id.to_string())?;
-                        encoder.encode_field(&h.start)?;
-                        encoder.encode_field(&h.end)?;
-                        encoder.encode_field(&h.expires_at)?;
-                        Ok(encoder.take_row())
-                    })
-                    .collect();
-                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+                Ok(encode_rows(Arc::new(holds_schema()), holds, |e, h| {
+                    e.encode_field(&h.id.to_string())?;
+                    e.encode_field(&h.resource_id.to_string())?;
+                    e.encode_field(&h.start)?;
+                    e.encode_field(&h.end)?;
+                    e.encode_field(&h.expires_at)
+                }))
             }
             Command::SelectBookingsMulti { resource_ids } => {
                 let bookings = engine.get_bookings_multi(&resource_ids).await.map_err(engine_err)?;
-                let schema = Arc::new(bookings_schema());
-                let rows: Vec<PgWireResult<_>> = bookings
-                    .into_iter()
-                    .map(|b| {
-                        let mut encoder = DataRowEncoder::new(schema.clone());
-                        encoder.encode_field(&b.id.to_string())?;
-                        encoder.encode_field(&b.resource_id.to_string())?;
-                        encoder.encode_field(&b.start)?;
-                        encoder.encode_field(&b.end)?;
-                        encoder.encode_field(&b.label)?;
-                        Ok(encoder.take_row())
-                    })
-                    .collect();
-                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+                Ok(encode_rows(Arc::new(bookings_schema()), bookings, |e, b| {
+                    e.encode_field(&b.id.to_string())?;
+                    e.encode_field(&b.resource_id.to_string())?;
+                    e.encode_field(&b.start)?;
+                    e.encode_field(&b.end)?;
+                    e.encode_field(&b.label)
+                }))
             }
             Command::SelectHoldsMulti { resource_ids } => {
                 let holds = engine.get_holds_multi(&resource_ids).await.map_err(engine_err)?;
-                let schema = Arc::new(holds_schema());
-                let rows: Vec<PgWireResult<_>> = holds
-                    .into_iter()
-                    .map(|h| {
-                        let mut encoder = DataRowEncoder::new(schema.clone());
-                        encoder.encode_field(&h.id.to_string())?;
-                        encoder.encode_field(&h.resource_id.to_string())?;
-                        encoder.encode_field(&h.start)?;
-                        encoder.encode_field(&h.end)?;
-                        encoder.encode_field(&h.expires_at)?;
-                        Ok(encoder.take_row())
-                    })
-                    .collect();
-                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+                Ok(encode_rows(Arc::new(holds_schema()), holds, |e, h| {
+                    e.encode_field(&h.id.to_string())?;
+                    e.encode_field(&h.resource_id.to_string())?;
+                    e.encode_field(&h.start)?;
+                    e.encode_field(&h.end)?;
+                    e.encode_field(&h.expires_at)
+                }))
             }
             Command::Listen { channel } => {
                 let resource_id = Self::parse_channel_resource_id(&channel)?;
@@ -480,6 +438,24 @@ impl DeltaTHandler {
             }
         }
     }
+}
+
+/// Encode a homogeneous row set into one `QueryResponse`, applying `encode` per item.
+/// The Select* read commands differ only in schema and per-row fields, so they share this.
+fn encode_rows<T>(
+    schema: Arc<Vec<FieldInfo>>,
+    items: Vec<T>,
+    encode: impl Fn(&mut DataRowEncoder, &T) -> PgWireResult<()>,
+) -> Vec<Response> {
+    let rows: Vec<PgWireResult<_>> = items
+        .into_iter()
+        .map(|item| {
+            let mut encoder = DataRowEncoder::new(schema.clone());
+            encode(&mut encoder, &item)?;
+            Ok(encoder.take_row())
+        })
+        .collect();
+    vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))]
 }
 
 fn availability_schema() -> Vec<FieldInfo> {
