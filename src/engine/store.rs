@@ -198,9 +198,18 @@ impl InMemoryStore {
                 buffer_after,
                 ..
             } => {
-                rs.name = name.clone();
-                rs.capacity = *capacity;
-                rs.buffer_after = *buffer_after;
+                // Overwrite ONLY the fields the update actually carried (Some(_)); a `None` field
+                // was absent from the SET list and must be left as is, so a partial
+                // `SET buffer_after = ...` cannot wipe name or capacity.
+                if let Some(name) = name {
+                    rs.name = name.clone();
+                }
+                if let Some(capacity) = capacity {
+                    rs.capacity = *capacity;
+                }
+                if let Some(buffer_after) = buffer_after {
+                    rs.buffer_after = *buffer_after;
+                }
             }
             Event::ResourceCreated { .. } | Event::ResourceDeleted { .. } => {}
         }

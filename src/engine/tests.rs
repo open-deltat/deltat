@@ -3949,7 +3949,7 @@ async fn update_resource_changes_fields() {
     let rid = Ulid::new();
     engine.create_resource(rid, None, Some("Old Name".into()), 1, None).await.unwrap();
 
-    engine.update_resource(rid, Some("New Name".into()), 3, Some(15 * M)).await.unwrap();
+    engine.update_resource(rid, Some(Some("New Name".into())), Some(3), Some(Some(15 * M))).await.unwrap();
 
     let resources = engine.list_resources();
     let r = resources.iter().find(|r| r.id == rid).unwrap();
@@ -3959,12 +3959,41 @@ async fn update_resource_changes_fields() {
 }
 
 #[tokio::test]
+async fn update_resource_partial_leaves_other_fields_intact() {
+    // A partial update that mentions only buffer_after must not wipe name or capacity. The parser
+    // sends None for the omitted columns and the apply arm skips them.
+    let path = test_wal_path("update_resource_partial.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, Some("Room A".into()), 4, Some(5 * M)).await.unwrap();
+
+    // Only buffer_after is present; name and capacity are absent (None).
+    engine.update_resource(rid, None, None, Some(Some(30 * M))).await.unwrap();
+
+    let resources = engine.list_resources();
+    let r = resources.iter().find(|r| r.id == rid).unwrap();
+    assert_eq!(r.name, Some("Room A".into()), "name must be unchanged");
+    assert_eq!(r.capacity, 4, "capacity must be unchanged");
+    assert_eq!(r.buffer_after, Some(30 * M), "buffer_after must be updated");
+
+    // Setting name to NULL explicitly (Some(None)) clears it, distinct from leaving it absent.
+    engine.update_resource(rid, Some(None), None, None).await.unwrap();
+    let resources = engine.list_resources();
+    let r = resources.iter().find(|r| r.id == rid).unwrap();
+    assert_eq!(r.name, None, "explicit SET name = NULL clears the name");
+    assert_eq!(r.capacity, 4, "capacity still unchanged");
+    assert_eq!(r.buffer_after, Some(30 * M), "buffer_after still unchanged");
+}
+
+#[tokio::test]
 async fn update_resource_not_found() {
     let path = test_wal_path("update_resource_notfound.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
     assert!(matches!(
-        engine.update_resource(Ulid::new(), None, 1, None).await,
+        engine.update_resource(Ulid::new(), None, None, None).await,
         Err(EngineError::NotFound(_))
     ));
 }
@@ -3978,7 +4007,7 @@ async fn update_resource_persists_via_wal() {
     {
         let engine = Engine::new(path.clone(), notify.clone()).unwrap();
         engine.create_resource(rid, None, Some("Before".into()), 1, None).await.unwrap();
-        engine.update_resource(rid, Some("After".into()), 5, Some(H)).await.unwrap();
+        engine.update_resource(rid, Some(Some("After".into())), Some(5), Some(Some(H))).await.unwrap();
     }
 
     // Replay from WAL
@@ -4662,7 +4691,7 @@ async fn update_resource_name_too_long() {
     engine.create_resource(rid, None, Some("short".into()), 1, None).await.unwrap();
 
     let long_name = "x".repeat(MAX_NAME_LEN + 1);
-    let result = engine.update_resource(rid, Some(long_name), 1, None).await;
+    let result = engine.update_resource(rid, Some(Some(long_name)), Some(1), None).await;
     assert!(matches!(result, Err(EngineError::LimitExceeded("resource name too long"))));
 }
 
@@ -4675,7 +4704,7 @@ async fn update_resource_name_at_limit() {
     engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
     let name = "x".repeat(MAX_NAME_LEN);
-    let result = engine.update_resource(rid, Some(name), 1, None).await;
+    let result = engine.update_resource(rid, Some(Some(name)), Some(1), None).await;
     assert!(result.is_ok());
 }
 
