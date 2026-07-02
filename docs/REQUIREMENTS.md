@@ -14,7 +14,7 @@
 
 Companion docs: [`../V2-DESIGN.md`](../V2-DESIGN.md) (rationale), [`FORMAT.md`](FORMAT.md) (target wire/storage
 format), [`PHASE-0-1-PLAN.md`](PHASE-0-1-PLAN.md) (build plan). **Note:** FORMAT.md, V2-DESIGN.md, the
-README and both CLAUDE.md still describe the removed kernel `Schedule` and pgwire-as-destination — they
+README and the contributor docs still describe the removed kernel `Schedule` and pgwire-as-destination — they
 are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflict.
 
 ---
@@ -49,7 +49,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 - **PRIN-08** No panics in hot paths (Rust): errors are values. *(The untrusted-input panic via `Span::new` is now closed — SEC-09; internal asserts remain as guaranteed invariants, full fallibility tracked by TIME-05.)*
 - **PRIN-09** Accidental complexity gets deleted; essential complexity gets relocated to the right layer — never into the kernel.
 - **PRIN-10** A requirement is "met" only when running code verifies it; planning/docs are not progress.
-- **PRIN-11** TDD: tests pass at every step; never leave tests broken between changes (deltat CLAUDE.md).
+- **PRIN-11** TDD: tests pass at every step; never leave tests broken between changes.
 - **PRIN-12** **Test-first (red→green).** For a bug fix, write the failing test that reproduces it *before* the fix and confirm it goes red, then green; for a feature, extend the executable spec (TEST-01/02) alongside the code. A fix without a test that would have caught it is incomplete. Verify the test isn't hollow — a property/regression test must fail when the code is mutated (this session, mutation-testing the availability spec caught a real boundary blind spot). Practiced this session: GAP-12, GAP-13, and the seat hold→book race each had a red test before the green fix.
 
 ---
@@ -345,7 +345,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 - **GAP-05** 🟡 Availability demo owner-edit save uses dead kernel-Schedule → point at `addRecurringRules`; then delete the dead demo `schedules` action.
 - **GAP-06** ❓ Whether a kernel "reserve k-of-N specific" / adjacency verb is wanted.
 - **GAP-07** 📋 The **demo** availability owner-panel is the only remaining caller of `dt.schedules.set` (`tap/demo/app/actions/schedules.ts`). The `tap/calendar` app does **not** use it (EX-14). Remove the dead path once the owner-panel points at `addRecurringRules`.
-- **GAP-08** 🟡 **Docs reconciled to HEAD (mostly):** FORMAT.md Schedule commands/events removed; V2-DESIGN admission-rule `schedule` arg dropped; README + deltat/CLAUDE.md now note pgwire is *transitional* and Schedule is removed. **Remaining:** the TS SDK still exports a dead `Schedules` class + Schedule `DeltaTEvent` variants (= GAP-07 / #9); a few historical `schedule` mentions in V2-DESIGN §1/§4 (the v1 audit) are intentionally kept as history.
+- **GAP-08** 🟡 **Docs reconciled to HEAD (mostly):** FORMAT.md Schedule commands/events removed; V2-DESIGN admission-rule `schedule` arg dropped; README and the project docs now note pgwire is *transitional* and Schedule is removed. **Remaining:** the TS SDK still exports a dead `Schedules` class + Schedule `DeltaTEvent` variants (= GAP-07 / #9); a few historical `schedule` mentions in V2-DESIGN §1/§4 (the v1 audit) are intentionally kept as history.
 - **GAP-09** 🟡 Meet-booking cancel has no `booking_group` (MODEL-10) → the demo re-finds the mirror booking by matching `(start,end)` and cancels it separately — fragile if two bookings share a span (`tap/demo/app/actions/bookings.ts:34-46`).
 - **GAP-10** 🟡 Orphaned `VERSION` file (`0.1.0`) duplicates the Cargo.toml version and is referenced by nothing — wire it up or delete (DRY).
 - **GAP-11** 📋 **Hold-expiry/conflict math reads steppable `CLOCK_REALTIME`** — split the `Clock` into `now_wall`/`now_mono` and compare a monotonic elapsed-delta vs TTL (HW-01…HW-04); add adversarial backward/stalled-clock tests (HW-20). A real backward-jump correctness hazard, not cosmetic.
@@ -367,7 +367,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 - **T-02** `MODEL-09`/`NOT-02` (no business data in kernel) ⟷ `MODEL-08` (`name` **and** `label` are descriptive Strings in the kernel). `name` is grandfathered; `label` is the unresolved one → `GAP-02` (`label → external_ref`).
 - **T-03** `AVAIL-01` (availability **subtracts blocking rules** → a blocked window reads as *unavailable*) ⟷ `AVAIL-16` (the booking conflict-check **ignores blocking rules**, so a direct `ConfirmBooking`/`PlaceHold` into a blocked window **succeeds**). **The availability view and the write guard disagree** — a client is told a slot is unavailable yet can still book it. Not an `INV-01` (capacity) violation, but a real semantic inconsistency. → decide: should the conflict check also reject blocked windows?
 - **T-04** `ENG-16` (enforced hard caps = 1e5 resources/intervals) ⟷ `SCALE-01`/`SCALE-02` (target: tens-to-hundreds of millions / billions). The code *actively forbids* the vision's scale today. → raise caps + build the spill tier (`ENG-07`) when warranted.
-- **T-05** ✅ **mostly resolved** — docs reconciled to HEAD (FORMAT.md, V2-DESIGN.md, README, deltat/CLAUDE.md; GAP-08): kernel `Schedule` marked removed, pgwire marked transitional. Only the dead SDK `Schedules` class remains (GAP-07 / #9).
+- **T-05** ✅ **mostly resolved** — docs reconciled to HEAD (FORMAT.md, V2-DESIGN.md, README; GAP-08): kernel `Schedule` marked removed, pgwire marked transitional. Only the dead SDK `Schedules` class remains (GAP-07 / #9).
 - **T-06** `MODEL-12` (caller-supplied Ulids — enables `INV-06` idempotent commit) ⟷ `SEC-03` (a guessable/leaked `hold_id` = slot-hijack once `CommitHold` exists). The same property that buys idempotency creates a capability-security question. → the `commit_hold` kernel verb (`AVAIL-07`) is built, but decide the hold-capability model before **exposing** it over the transport/SDK.
 
 ### RESOLVED — coexist by design (don't relitigate)
