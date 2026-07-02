@@ -549,17 +549,25 @@ impl SimpleQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
-        if query.len() > MAX_QUERY_LEN {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "54000".into(),
-                "query too long".into(),
-            ))));
-        }
+        enforce_query_len(query.len())?;
         let engine = self.resolve_engine(client)?;
         let cmd = sql::parse_sql(query).map_err(sql_err)?;
         self.execute_command(&engine, cmd).await
     }
+}
+
+/// Reject SQL longer than MAX_QUERY_LEN. Enforced at Parse time (QueryParser::parse_sql) so an
+/// oversized statement is rejected before count_params materializes its chars and sqlparser runs a
+/// full parse, and again on each Execute path. SQLSTATE 54000 = program_limit_exceeded.
+fn enforce_query_len(len: usize) -> PgWireResult<()> {
+    if len > MAX_QUERY_LEN {
+        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "54000".into(),
+            "query too long".into(),
+        ))));
+    }
+    Ok(())
 }
 
 // ── Extended Query Protocol ──────────────────────────────────────
@@ -580,6 +588,7 @@ impl QueryParser for DeltaTQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        enforce_query_len(sql.len())?;
         Ok(sql.to_string())
     }
 
@@ -619,13 +628,7 @@ impl ExtendedQueryHandler for DeltaTHandler {
     {
         let engine = self.resolve_engine(client)?;
         let sql = substitute_params(portal);
-        if sql.len() > MAX_QUERY_LEN {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "54000".into(),
-                "query too long".into(),
-            ))));
-        }
+        enforce_query_len(sql.len())?;
         let cmd = sql::parse_sql(&sql).map_err(sql_err)?;
         let mut responses = self.execute_command(&engine, cmd).await?;
         Ok(responses.remove(0))
@@ -1089,6 +1092,16 @@ mod tests {
         // Some(_) only if the forwarder survived the Lagged; the old behavior dropped the sender
         // and recv() would return None.
         assert!(got.is_some(), "forwarder must survive a broadcast Lagged and keep forwarding");
+    }
+
+    // ── enforce_query_len ────────────────────────────────────────
+
+    #[test]
+    fn enforce_query_len_bounds_at_limit() {
+        // At the limit is accepted; one byte over is rejected. This guard runs at Parse time so an
+        // oversized statement never reaches count_params or a full sqlparser parse.
+        assert!(enforce_query_len(MAX_QUERY_LEN).is_ok());
+        assert!(enforce_query_len(MAX_QUERY_LEN + 1).is_err());
     }
 
     // ── count_params ─────────────────────────────────────────────

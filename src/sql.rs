@@ -26,6 +26,11 @@ pub fn parse_sql(sql: &str) -> Result<Command, SqlError> {
     if stmts.is_empty() {
         return Err(SqlError::Empty);
     }
+    // A multi-statement simple query ("INSERT ...; INSERT ...;") must not run only its first
+    // statement and report success; reject it rather than silently dropping the rest.
+    if stmts.len() > 1 {
+        return Err(SqlError::Unsupported("multiple statements in one query".into()));
+    }
 
     match &stmts[0] {
         Statement::Insert(insert) => parse_insert(insert),
@@ -62,45 +67,23 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
         "rules" => {
             let all_rows = extract_all_insert_rows(insert)?;
             if all_rows.len() == 1 {
-                let values = &all_rows[0];
-                if values.len() < 5 {
-                    return Err(SqlError::WrongArity("rules", 5, values.len()));
-                }
-                Ok(Command::InsertRule {
-                    id: parse_ulid(&values[0])?,
-                    resource_id: parse_ulid(&values[1])?,
-                    start: parse_i64(&values[2])?,
-                    end: parse_i64(&values[3])?,
-                    blocking: parse_bool(&values[4])?,
-                })
+                let (id, resource_id, start, end, blocking) =
+                    parse_rule_row(&all_rows[0], &columns)?;
+                Ok(Command::InsertRule { id, resource_id, start, end, blocking })
             } else {
                 let mut rules = Vec::with_capacity(all_rows.len());
                 for (i, row) in all_rows.iter().enumerate() {
-                    if row.len() < 5 {
-                        return Err(SqlError::WrongArity("rules row", 5, row.len()));
-                    }
-                    rules.push((
-                        parse_ulid(&row[0]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                        parse_ulid(&row[1]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                        parse_i64(&row[2]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                        parse_i64(&row[3]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                        parse_bool(&row[4]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                    ));
+                    rules.push(
+                        parse_rule_row(row, &columns)
+                            .map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
+                    );
                 }
                 Ok(Command::BatchInsertRules { rules })
             }
         }
         "holds" => {
-            if values.len() < 5 {
-                return Err(SqlError::WrongArity("holds", 5, values.len()));
-            }
-            Ok(Command::InsertHold {
-                id: parse_ulid(&values[0])?,
-                resource_id: parse_ulid(&values[1])?,
-                start: parse_i64(&values[2])?,
-                end: parse_i64(&values[3])?,
-                expires_at: parse_i64(&values[4])?,
-            })
+            let (id, resource_id, start, end, expires_at) = parse_hold_row(&values, &columns)?;
+            Ok(Command::InsertHold { id, resource_id, start, end, expires_at })
         }
         "bookings" => {
             let all_rows = extract_all_insert_rows(insert)?;
@@ -646,6 +629,61 @@ fn parse_resource_row(values: &[Expr], columns: &[String]) -> Result<ResourceRow
     Ok((id, parent_id, name, capacity, buffer_after))
 }
 
+/// Resolve one declared column's value in a VALUES row. With a column list present the value is
+/// found by column name (so a reordered list lands on the right field); without one it falls back
+/// to the canonical positional index. Returns None when the column/value is absent, so callers turn
+/// a missing required column into a clean WrongArity rather than indexing out of bounds.
+fn col_value<'a>(columns: &[String], values: &'a [Expr], name: &str, positional: usize) -> Option<&'a Expr> {
+    let idx = if columns.is_empty() {
+        Some(positional)
+    } else {
+        columns.iter().position(|c| c == name)
+    };
+    cell(values, idx)
+}
+
+/// A declared column list must match the value count. sqlparser accepts a mismatch, so reject it
+/// cleanly here (shared by the rule/hold row parsers) rather than indexing a column position past
+/// the row.
+fn check_column_arity(table: &'static str, columns: &[String], values: &[Expr]) -> Result<(), SqlError> {
+    if !columns.is_empty() && values.len() != columns.len() {
+        return Err(SqlError::WrongArity(table, columns.len(), values.len()));
+    }
+    Ok(())
+}
+
+/// Parse one `rules` VALUES row into (id, resource_id, start, end, blocking), honoring a declared
+/// column list. Positional order (the fallback) is (id, resource_id, start, end, blocking).
+fn parse_rule_row(values: &[Expr], columns: &[String]) -> Result<(Ulid, Ulid, Ms, Ms, bool), SqlError> {
+    check_column_arity("rules", columns, values)?;
+    let get = |name: &str, pos: usize| {
+        col_value(columns, values, name, pos).ok_or(SqlError::WrongArity("rules", 5, values.len()))
+    };
+    Ok((
+        parse_ulid(get("id", 0)?)?,
+        parse_ulid(get("resource_id", 1)?)?,
+        parse_i64(get("start", 2)?)?,
+        parse_i64(get("end", 3)?)?,
+        parse_bool(get("blocking", 4)?)?,
+    ))
+}
+
+/// Parse one `holds` VALUES row into (id, resource_id, start, end, expires_at), honoring a declared
+/// column list. Positional order (the fallback) is (id, resource_id, start, end, expires_at).
+fn parse_hold_row(values: &[Expr], columns: &[String]) -> Result<(Ulid, Ulid, Ms, Ms, Ms), SqlError> {
+    check_column_arity("holds", columns, values)?;
+    let get = |name: &str, pos: usize| {
+        col_value(columns, values, name, pos).ok_or(SqlError::WrongArity("holds", 5, values.len()))
+    };
+    Ok((
+        parse_ulid(get("id", 0)?)?,
+        parse_ulid(get("resource_id", 1)?)?,
+        parse_i64(get("start", 2)?)?,
+        parse_i64(get("end", 3)?)?,
+        parse_i64(get("expires_at", 4)?)?,
+    ))
+}
+
 fn extract_all_insert_rows(insert: &ast::Insert) -> Result<Vec<Vec<Expr>>, SqlError> {
     let body = insert
         .source
@@ -1132,6 +1170,73 @@ mod tests {
     }
 
     #[test]
+    fn parse_insert_rule_honors_reordered_columns() {
+        // resource_id declared before id. Both are ULIDs, so a positional parse would silently swap
+        // them; the column-aware parse must land each value on its named field.
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let res = "01BRZ3NDEKTSV4RRFFQ69G5FAW";
+        let sql = format!(
+            r#"INSERT INTO rules (resource_id, id, start, "end", blocking) VALUES ('{res}', '{id}', 0, 100, true)"#
+        );
+        match parse_sql(&sql).unwrap() {
+            Command::InsertRule { id: pid, resource_id, start, end, blocking } => {
+                assert_eq!(pid.to_string(), id);
+                assert_eq!(resource_id.to_string(), res);
+                assert_eq!(start, 0);
+                assert_eq!(end, 100);
+                assert!(blocking);
+            }
+            cmd => panic!("expected InsertRule, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_batch_insert_rules_honors_reordered_columns() {
+        let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAW";
+        let res = "01CRZ3NDEKTSV4RRFFQ69G5FAX";
+        let sql = format!(
+            r#"INSERT INTO rules (resource_id, id, start, "end", blocking) VALUES ('{res}', '{id1}', 0, 100, false), ('{res}', '{id2}', 200, 300, true)"#
+        );
+        match parse_sql(&sql).unwrap() {
+            Command::BatchInsertRules { rules } => {
+                assert_eq!(rules.len(), 2);
+                assert_eq!(rules[0].0.to_string(), id1); // id
+                assert_eq!(rules[0].1.to_string(), res); // resource_id
+                assert_eq!(rules[1].0.to_string(), id2);
+            }
+            cmd => panic!("expected BatchInsertRules, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_hold_honors_reordered_columns() {
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let res = "01BRZ3NDEKTSV4RRFFQ69G5FAW";
+        let sql = format!(
+            r#"INSERT INTO holds (resource_id, id, start, "end", expires_at) VALUES ('{res}', '{id}', 1000, 2000, 3000)"#
+        );
+        match parse_sql(&sql).unwrap() {
+            Command::InsertHold { id: hid, resource_id, start, end, expires_at } => {
+                assert_eq!(hid.to_string(), id);
+                assert_eq!(resource_id.to_string(), res);
+                assert_eq!(start, 1000);
+                assert_eq!(end, 2000);
+                assert_eq!(expires_at, 3000);
+            }
+            cmd => panic!("expected InsertHold, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_rule_column_arity_mismatch_does_not_panic() {
+        // Declared 5 columns, supplied 4 values: sqlparser accepts it; the parser must return a
+        // clean WrongArity, never index out of bounds.
+        let sql = r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW', 0, 100)"#;
+        assert!(parse_sql(sql).is_err());
+    }
+
+    #[test]
     fn parse_delete_hold() {
         let sql = "DELETE FROM holds WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
         let cmd = parse_sql(sql).unwrap();
@@ -1335,6 +1440,17 @@ mod tests {
     #[test]
     fn parse_empty_errors() {
         assert!(matches!(parse_sql(""), Err(SqlError::Empty)));
+    }
+
+    #[test]
+    fn parse_multi_statement_is_rejected() {
+        // Two statements in one query must be rejected, not silently reduced to the first with a
+        // success reply.
+        let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!(
+            "INSERT INTO resources (id) VALUES ('{a}'); INSERT INTO resources (id) VALUES ('{a}')"
+        );
+        assert!(matches!(parse_sql(&sql), Err(SqlError::Unsupported(_))));
     }
 
     // ── SELECT resources ─────────────────────────────────────────
