@@ -5,6 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "A time-first scheduling database: availability, conflicts, capacity, holds, and buffers as collision detection on the Unix-time number line. Speaks the PostgreSQL wire protocol."
 repository = "https://github.com/open-tap/deltat"
+homepage = "https://delt.at"
 readme = "README.md"
 keywords = ["scheduling", "availability", "booking", "calendar", "database"]
 categories = ["database-implementations", "date-and-time"]
