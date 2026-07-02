@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 use crate::engine::Engine;
@@ -29,20 +30,68 @@ impl TenantManager {
 
     /// Get or lazily create an engine for the given tenant.
     pub fn get_or_create(&self, tenant: &str) -> std::io::Result<Arc<Engine>> {
-        if let Some(engine) = self.engines.get(tenant) {
-            return Ok(engine.value().clone());
-        }
         if tenant.len() > MAX_TENANT_NAME_LEN {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "tenant name too long",
             ));
         }
+
+        // Sanitize FIRST, then key the map by the sanitized name. The WAL path is derived from
+        // safe_name, so raw names that differ only in stripped punctuation ("prod", "prod!",
+        // "pr.od") must resolve to ONE engine on ONE WAL file. Keying by the raw name instead let
+        // distinct names collide onto one WAL: separate Engines replaying+appending the same file
+        // (cross-tenant exposure) and the compactor's tmp-rename unlinking each other's inode.
+        let safe_name = Self::sanitize(tenant)?;
+
+        // Hot path: an already-created tenant needs only a shard read lock.
+        if let Some(engine) = self.engines.get(&safe_name) {
+            return Ok(engine.value().clone());
+        }
+
+        // Bound the tenant count before taking the entry's shard write lock below: DashMap::len
+        // walks every shard, so calling it while holding an entry guard would deadlock.
         if self.engines.len() >= MAX_TENANTS {
             return Err(std::io::Error::other("too many tenants"));
         }
 
-        // Sanitize tenant name to prevent path traversal
+        // entry() serializes creation per key so Engine construction + background-task spawn happen
+        // exactly once. Two racing first-connections would otherwise each build an Engine on the
+        // same WAL path and each spawn a reaper/compactor/GC set, and the loser's tasks would leak
+        // forever. Engine::new is synchronous, so it runs inside the entry guard directly.
+        match self.engines.entry(safe_name.clone()) {
+            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Vacant(e) => {
+                let wal_path = self.data_dir.join(format!("{safe_name}.wal"));
+                let notify = Arc::new(NotifyHub::new());
+                let engine = Arc::new(Engine::new(wal_path, notify)?);
+
+                // Spawn reaper + compactor + GC for this tenant
+                let reaper_engine = engine.clone();
+                tokio::spawn(async move {
+                    reaper::run_reaper(reaper_engine).await;
+                });
+                let compactor_engine = engine.clone();
+                let threshold = self.compact_threshold;
+                tokio::spawn(async move {
+                    reaper::run_compactor(compactor_engine, threshold).await;
+                });
+                let gc_engine = engine.clone();
+                let retention = self.gc_retention_ms;
+                tokio::spawn(async move {
+                    reaper::run_gc(gc_engine, retention).await;
+                });
+
+                e.insert(engine.clone());
+                metrics::gauge!(crate::observability::TENANTS_ACTIVE).set(self.engines.len() as f64);
+                Ok(engine)
+            }
+        }
+    }
+
+    /// Strip path-traversal characters, keeping only alphanumerics, `_`, and `-`. A name that is
+    /// empty after stripping is rejected so it can never map to a bare `.wal` file.
+    fn sanitize(tenant: &str) -> std::io::Result<String> {
         let safe_name: String = tenant
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
@@ -53,30 +102,7 @@ impl TenantManager {
                 "empty tenant name",
             ));
         }
-
-        let wal_path = self.data_dir.join(format!("{safe_name}.wal"));
-        let notify = Arc::new(NotifyHub::new());
-        let engine = Arc::new(Engine::new(wal_path, notify)?);
-
-        // Spawn reaper + compactor + GC for this tenant
-        let reaper_engine = engine.clone();
-        tokio::spawn(async move {
-            reaper::run_reaper(reaper_engine).await;
-        });
-        let compactor_engine = engine.clone();
-        let threshold = self.compact_threshold;
-        tokio::spawn(async move {
-            reaper::run_compactor(compactor_engine, threshold).await;
-        });
-        let gc_engine = engine.clone();
-        let retention = self.gc_retention_ms;
-        tokio::spawn(async move {
-            reaper::run_gc(gc_engine, retention).await;
-        });
-
-        self.engines.insert(tenant.to_string(), engine.clone());
-        metrics::gauge!(crate::observability::TENANTS_ACTIVE).set(self.engines.len() as f64);
-        Ok(engine)
+        Ok(safe_name)
     }
 }
 
@@ -149,6 +175,27 @@ mod tests {
 
         // Should be the same Arc
         assert!(Arc::ptr_eq(&eng1, &eng2));
+    }
+
+    #[tokio::test]
+    async fn tenant_names_colliding_after_sanitize_share_one_engine() {
+        let dir = test_data_dir("collide");
+        let tm = TenantManager::new(dir, 1000, 604_800_000);
+
+        // "prod", "prod!" and "pr.od" all sanitize to "prod". They must resolve to ONE engine on
+        // ONE WAL, not distinct engines behind a shared WAL file. Keyed by the raw name (the old
+        // behavior) these were three separate Arcs on one "prod.wal".
+        let e1 = tm.get_or_create("prod").unwrap();
+        let e2 = tm.get_or_create("prod!").unwrap();
+        let e3 = tm.get_or_create("pr.od").unwrap();
+        assert!(Arc::ptr_eq(&e1, &e2));
+        assert!(Arc::ptr_eq(&e1, &e3));
+
+        // Same engine instance => same data: a resource created via one raw name is visible via
+        // another that sanitizes to the same key.
+        let rid = Ulid::new();
+        e1.create_resource(rid, None, None, 1, None).await.unwrap();
+        assert!(e2.get_resource(&rid).is_some());
     }
 
     #[tokio::test]
