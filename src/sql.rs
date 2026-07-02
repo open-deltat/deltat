@@ -9,11 +9,19 @@ use crate::model::*;
 
 pub fn parse_sql(sql: &str) -> Result<Command, SqlError> {
     let trimmed = sql.trim();
-    if trimmed.to_uppercase().starts_with("LISTEN ") {
+    // Match the keyword ASCII-case-insensitively via get(..n): a byte-offset slice after an
+    // uppercased starts_with can land mid-char (Unicode case-folding changes byte length) and
+    // panic. get returns None off a char boundary, and an ASCII-insensitive match guarantees the
+    // matched prefix is single-byte ASCII, so the trailing slice is on a boundary.
+    if let Some(prefix) = trimmed.get(..7)
+        && prefix.eq_ignore_ascii_case("LISTEN ")
+    {
         let channel = trimmed[7..].trim().trim_matches(';').trim_matches('"').to_string();
         return Ok(Command::Listen { channel });
     }
-    if trimmed.to_uppercase().starts_with("UNLISTEN ") {
+    if let Some(prefix) = trimmed.get(..9)
+        && prefix.eq_ignore_ascii_case("UNLISTEN ")
+    {
         let rest = trimmed[9..].trim().trim_matches(';').trim_matches('"');
         if rest == "*" {
             return Ok(Command::UnlistenAll);
@@ -845,7 +853,12 @@ fn parse_bool(expr: &Expr) -> Result<bool, SqlError> {
                 "false" | "f" | "0" => Ok(false),
                 _ => Err(SqlError::Parse(format!("bad bool: {s}"))),
             },
-            Value::Number(n, _) => Ok(n != "0"),
+            // A numeric bool is true iff its value is nonzero. Parsing catches "0.0", "-0", "00" as
+            // false (a raw `n != "0"` string compare treated all three as true).
+            Value::Number(n, _) => match n.parse::<f64>() {
+                Ok(v) => Ok(v != 0.0),
+                Err(_) => Ok(n != "0"),
+            },
             _ => Err(SqlError::Parse(format!("expected bool, got {value:?}"))),
         }
     } else {
@@ -1802,6 +1815,31 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("IN clause too large"));
+    }
+
+    #[test]
+    fn listen_fast_path_non_ascii_prefix_does_not_panic() {
+        // A multibyte char around the keyword boundary must not byte-slice-panic the fast path.
+        for s in ["LISTEN Ωchan", "listen Ω", "Ωlisten x", "listenΩ x", "UNLISTEN Ω", "ßunlisten"] {
+            let _ = parse_sql(s);
+        }
+    }
+
+    #[test]
+    fn parse_rule_numeric_blocking_zero_forms_are_false() {
+        // The number arm of parse_bool is true only for a nonzero value; "0", "0.0" and "00" are
+        // all false (a raw string compare treated "0.0"/"00" as true).
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let r = "01BRZ3NDEKTSV4RRFFQ69G5FAW";
+        for (lit, expected) in [("0", false), ("0.0", false), ("00", false), ("1", true), ("2", true)] {
+            let sql = format!(
+                r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{id}', '{r}', 0, 100, {lit})"#
+            );
+            match parse_sql(&sql).unwrap() {
+                Command::InsertRule { blocking, .. } => assert_eq!(blocking, expected, "lit={lit}"),
+                cmd => panic!("expected InsertRule, got {cmd:?}"),
+            }
+        }
     }
 
     #[test]
