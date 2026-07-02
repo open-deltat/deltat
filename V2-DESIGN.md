@@ -228,7 +228,7 @@ body   = Command            (request)   // postcard or NDJSON, see below
   at the security layer, a fraction of the hot-path cost, and *no* per-op signing (per-op ed25519 is
   a federation-edge concern, forbidden in the single-node kernel).
 
-### The SDK, `@open-tap/protocol`
+### The SDK, `@open-deltat/protocol`
 
 `tap` is lightly refactored, not rebuilt. Reusable verbatim:
 
@@ -236,7 +236,7 @@ body   = Command            (request)   // postcard or NDJSON, see below
 - Schedule bitmask + time helpers + their 20-case test suite (`schedules.ts`), the only tested SDK unit.
 - The **hold→confirm→release connection-lifecycle concept** (`server.ts:21-66`): socket-open = place
   hold, confirm = **`CommitHold` (atomic)**, socket-close = auto-release, expiry as backstop. Promote
-  into a typed, validated `@open-tap/protocol` schema (kills the `msg: any` at `server.ts:21,43`).
+  into a typed, validated `@open-deltat/protocol` schema (kills the `msg: any` at `server.ts:21,43`).
 - The sub-client facade shape (`client.ts:28-50`): generalize the `Options | Sql` DI seam to
   `Options | Transport`; swap raw-SQL bodies for framed `Command` calls.
 - Client types (`types.ts`), widen ms→µs; **codegen from the deltat structs** rather than hand-maintain.
@@ -359,7 +359,7 @@ costume" (delete pgwire/SQL) is folded across Phases 0–3 since it's mostly del
 | **1, Fix correctness, prove it with a *seed*** | Atomic reservation; regression is a seed, not a hand-written ordering | Atomic `CommitHold(hold_id)` (one lock, one event, excludes the named hold from the conflict check); authority-assigned opaque expiry; idempotent commit on `Ulid` retry; **decide the hold-capability/security model** (Open Q); a 2-actor `madsim`/`turmoil` sim whose scheduler reorders *across* the release→confirm boundary, proving the TOCTOU window is closed; WAL-replay determinism property. |
 | **1.5, Payment-backed commitment** *(PROMOTED, the wedge)* | Make a single node useful to a paying operator by killing no-shows | `hold→confirm→capture` state machine: Stripe `capture_method=manual` (short-horizon auth hold) + `setup_future_usage=off_session` mandate (long-horizon charge-on-event, modeled as a *fallible* async step); deposit/prepay/card-hold instruments; cancellation-window *policy* layer; **Stripe Connect direct-charge custody** (resource's PSP = merchant of record; protocol never custodies funds); fault-injection on lost-ack re-commit. |
 | **2, Fix efficiency** | Sub-ms at the 100k-interval ceiling | Max-end-augmented interval tree + `id→node` map behind `ResourceState`; `Span::new → Result`; the proptest model-vs-tree comparison guards the swap (any divergence = tree bug); benchmarks proving `O(log n)` overlap/remove and non-`O(N²)` replay. |
-| **3, µs time + SDK; SHIP single-node v2** | Sub-ms granularity, one protocol, **first paying operator live** | `ms→µs` widening *gated on* the metamorphic refinement + WAL-replay properties being green (it's a flag day); `@open-tap/protocol` package; demos ported to the framed transport; cross-language wire round-trip test gating CI. Freeze `name` as the single grandfathered business field with a no-second-field rule. Confirm a per-resource monotonic sequence is derivable in the WAL so federation stays a *seam*. |
+| **3, µs time + SDK; SHIP single-node v2** | Sub-ms granularity, one protocol, **first paying operator live** | `ms→µs` widening *gated on* the metamorphic refinement + WAL-replay properties being green (it's a flag day); `@open-deltat/protocol` package; demos ported to the framed transport; cross-language wire round-trip test gating CI. Freeze `name` as the single grandfathered business field with a no-second-field rule. Confirm a per-resource monotonic sequence is derivable in the WAL so federation stays a *seam*. |
 | **4, Identity + AI-native discovery seam** | Make supply agent-discoverable; draw the moat's first edge | Portable `Ulid`/`did:web` ids + `.well-known` resolution stubbed; a signed `/.well-known/bookable.json` manifest (schema.org graph as a **W3C Verifiable Credential**, JWS/Ed25519) for ONE node; an **MCP tool surface** (`search_bookable`/`get_availability`/`book`) + OpenAPI query endpoint over the single node, agent-readable supply with *zero* federation; a **Cal.com adapter** as the supply wedge. Key-management design written, not wired. |
 | **5, Federation** | *Only on a real 2nd operator sharing supply with #1* | Relay firehose of signed availability **summaries**; synchronous signed commit to the home node; monotonic ownership epoch / fencing token; per-resource seq + per-op nonce vs replay; **ACP/AP2 handoff at the book step**; registry-of-pointers (ANS-style) so no party is the gatekeeper; index = stale hint. |
 | **6, Geo discovery** | *Only on a real near-me query* | Indexer/AppView over the firehose; **one** spatial index (S2); cell-covering fan-out to home shards; commit still synchronous to home; geo lives entirely in the AppView edge, never the kernel. |

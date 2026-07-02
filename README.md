@@ -217,7 +217,7 @@ src/
 
 ### Client libraries
 
-**TypeScript**: [@open-tap/client](https://github.com/open-deltat/tap)
+**TypeScript**: [@open-deltat/client](https://github.com/open-deltat/tap)
 
 ### Demos
 
