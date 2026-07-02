@@ -170,7 +170,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 - **PROTO-11** 🟡 Tenant = pgwire connection **database name** (default `default`); SQL username ignored; auth = single shared cleartext password `DELTAT_PASSWORD` (`wire.rs:71-84`, `auth.rs:18-44`).
 - **PROTO-12** ✅ (current) LISTEN/NOTIFY channels are `resource_{ULID}`; events pushed as pgwire `NotificationResponse` with a JSON `Event` payload; a listener lagging > 256 events (broadcast capacity) is silently dropped (`wire.rs:86-101,724-776`).
 - **PROTO-13** ✅ (current) Error→SQLSTATE map: parse→42601, engine→P0001, tenant→08006, invalid LISTEN/bad ULID→42000, **invalid time range (start≥end)→22007**, query too long→54000 (`wire.rs`).
-- **PROTO-14** 🟡 Multi-row INSERT is honored **only for bookings** (`BatchInsertBookings`); multi-row resources/rules/holds silently keep the first row (`sql.rs:543-557`) — the engine-side root of GAP-03.
+- **PROTO-14** 🟡 Multi-row INSERT is honored for **bookings, resources, and rules** (`BatchInsertBookings/Resources/Rules`); **holds** have no batch variant and silently keep the first row (`extract_insert_values` returns `rows[0]`), the one remaining engine-side case of GAP-03. All four tables now map VALUES by the declared **column list** (a reordered or partial list binds by column name, not position), and a column/value count mismatch is a `WrongArity` error rather than a silent mis-map.
 - **PROTO-15** 🟡 The demo hold→confirm→release lifecycle is a per-connection **WebSocket** protocol in `tap/demo/server.ts` (`{hold|subscribe|confirm}` → `{confirmed|error|Event}`); non-atomic here (the kernel now has atomic `commit_hold`, AVAIL-07, but this WS path is not yet wired to it) and hold expiry is client-supplied (`Date.now()+300000`).
 
 ---
@@ -340,7 +340,7 @@ are stale w.r.t. HEAD (see GAP-08). This doc is authoritative where they conflic
 
 - **GAP-01** 📋 No durable link between multi-resource bookings → add `booking_group: Ulid` (MODEL-10) before the format freezes.
 - **GAP-02** 📋 `label: String` is a second free-text/PII field → replace with `external_ref: Ulid`.
-- **GAP-03** 📋 Engine silently truncates multi-row `INSERT` (PROTO-14) → must error, not truncate; resolved by the framed protocol. (SDK works around it.)
+- **GAP-03** 🟡 Engine silently truncates a multi-row `INSERT` (PROTO-14), now narrowed to **holds only** (bookings/resources/rules honor every row via BatchInsert*); holds should error rather than keep the first row, resolved fully by the framed protocol. (SDK works around it.)
 - **GAP-04** ❓ Open-ended / variable-duration bookings vs the frozen `start < end` invariant.
 - **GAP-05** 🟡 Availability demo owner-edit save uses dead kernel-Schedule → point at `addRecurringRules`; then delete the dead demo `schedules` action.
 - **GAP-06** ❓ Whether a kernel "reserve k-of-N specific" / adjacency verb is wanted.
