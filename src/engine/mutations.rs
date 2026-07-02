@@ -1,3 +1,9 @@
+//! The write path: create, delete, add and remove rules, place holds, and book.
+//!
+//! Every mutation validates against limits and parent coverage, persists to the WAL, and only
+//! then applies to memory, so an fsync failure cannot leave a durable-versus-visible split.
+//! Batch bookings and hold commits run under one lock so they are all-or-nothing.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

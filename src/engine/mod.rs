@@ -1,3 +1,10 @@
+//! The state machine: availability, conflict detection, mutations, and queries.
+//!
+//! This is the kernel. It owns resource state in memory, serializes every write through a WAL
+//! group-commit loop, and rebuilds itself by replay on startup. The submodules split the work:
+//! reads compute availability, writes mutate under per-resource locks, and a verification path
+//! cross-checks the two.
+
 mod availability;
 mod conflict;
 mod error;

@@ -1,3 +1,8 @@
+//! The read path: availability, rule inheritance, and listing bookings, holds, and rules.
+//!
+//! Reads walk a resource's ancestors to gather inherited rules, then hand the assembled
+//! timeline to the availability algorithm. Nothing here mutates state.
+
 use std::collections::HashSet;
 
 use ulid::Ulid;

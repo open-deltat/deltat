@@ -1,3 +1,9 @@
+//! Per-resource broadcast channels behind LISTEN/NOTIFY.
+//!
+//! Each resource gets a bounded broadcast ring that fans committed events out to subscribed
+//! connections. The bound is deliberate: a slow listener drops old events rather than stalling
+//! writers, then re-reads authoritative state instead of trusting the stream.
+
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 use ulid::Ulid;

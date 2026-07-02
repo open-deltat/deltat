@@ -1,3 +1,5 @@
+//! The error type returned by the engine's read and write paths.
+
 use ulid::Ulid;
 
 use crate::model::Span;

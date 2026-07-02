@@ -1,3 +1,9 @@
+//! The SQL adapter: parse a statement into a transport-neutral [`crate::command::Command`].
+//!
+//! pgwire speaks SQL today, so this is where SQL text becomes a `Command` for the engine. It
+//! inspects only structure and never literal values, so the same classification holds at
+//! Describe time when `$N` placeholders are still unbound.
+
 use sqlparser::ast::{self, Expr, FromTable, ObjectNamePart, SetExpr, Statement, TableFactor, TableObject, Value, ValueWithSpan};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;

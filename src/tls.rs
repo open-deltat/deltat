@@ -1,3 +1,8 @@
+//! Optional TLS for pgwire connections.
+//!
+//! Loads a cert/key pair into a rustls acceptor when both `DELTAT_TLS_CERT` and
+//! `DELTAT_TLS_KEY` are set, and refuses a half-configured pair.
+
 use std::fs::File;
 use std::io::{self, BufReader, ErrorKind};
 use std::sync::Arc;

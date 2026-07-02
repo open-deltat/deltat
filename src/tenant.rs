@@ -1,3 +1,8 @@
+//! Per-database isolation: each tenant owns its own engine, WAL, and background loops.
+//!
+//! The pgwire database name selects the tenant, and engines are created lazily on first use.
+//! Names are sanitized so a tenant can never escape its own data directory.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

@@ -1,3 +1,9 @@
+//! The core value types: `Span`, `Interval`, `Event`, and `ResourceState`.
+//!
+//! Everything deltat stores is an interval on a line of `i64` Unix milliseconds. These types
+//! are the shared vocabulary of the engine, the WAL, and every adapter, and they carry no
+//! behavior beyond the invariants that keep spans well-formed.
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

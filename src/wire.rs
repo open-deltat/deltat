@@ -1,3 +1,9 @@
+//! The pgwire server: the transport that runs commands and streams results back.
+//!
+//! It drives the startup handshake, the simple and extended query protocols, and LISTEN/NOTIFY
+//! forwarding. A parsed [`crate::command::Command`] becomes engine calls whose rows it encodes,
+//! and this is where a connection's lifetime and subscription limits are enforced.
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;

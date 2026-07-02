@@ -1,3 +1,8 @@
+//! Span validation and conflict detection shared by the mutation paths.
+//!
+//! Bounds a span and its buffer so later arithmetic cannot overflow, and decides whether a new
+//! allocation would push any instant past capacity.
+
 use ulid::Ulid;
 
 use crate::model::*;

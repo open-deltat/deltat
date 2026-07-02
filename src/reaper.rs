@@ -1,3 +1,9 @@
+//! Background maintenance loops: hold expiry, WAL compaction, and past-interval GC.
+//!
+//! Holds carry an `expires_at`, and the reaper releases them once due so a crashed booker
+//! never parks a slot forever. It also compacts the WAL and collects long-past intervals so
+//! state and log stay bounded over time.
+
 use std::sync::Arc;
 use std::time::Duration;
 

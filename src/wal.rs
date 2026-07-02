@@ -1,3 +1,9 @@
+//! The append-only write-ahead log: one `[len][bincode payload][crc32]` record per event.
+//!
+//! Every mutation is durable here before it touches memory, and the engine rebuilds its state
+//! by replaying the log. Replay stops at the first torn or corrupt record, so a partial
+//! trailing write loses only that record and never corrupts the prefix.
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};

@@ -1,3 +1,10 @@
+//! Hard bounds on everything the transport boundary accepts.
+//!
+//! Untrusted input (SQL length, batch sizes, hierarchy depth, name lengths) is validated
+//! against these constants before it reaches the engine, so one request cannot exhaust memory
+//! or drive an unbounded allocation. Test builds shrink several bounds to keep the limit paths
+//! cheap to exercise.
+
 pub const MAX_QUERY_WINDOW_MS: i64 = 90 * 86_400_000; // 90 days
 pub const MAX_SPAN_DURATION_MS: i64 = 3650 * 86_400_000; // ~10 years
 pub const MIN_VALID_TIMESTAMP_MS: i64 = 0; // epoch

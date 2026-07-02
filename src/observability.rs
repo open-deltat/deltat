@@ -1,3 +1,8 @@
+//! Prometheus metrics: the metric-name constants plus the exporter setup.
+//!
+//! RED counters and latencies for requests, USE gauges for connections and tenants, and WAL
+//! flush timings. `init` starts the exporter endpoint when a port is configured.
+
 use std::net::SocketAddr;
 
 use crate::command::Command;

@@ -1,3 +1,6 @@
+//! Cleartext-password auth for the pgwire startup handshake: one shared server password
+//! (`DELTAT_PASSWORD`) verified against every connection.
+
 use async_trait::async_trait;
 use pgwire::api::auth::{AuthSource, LoginInfo, Password};
 use pgwire::error::PgWireResult;

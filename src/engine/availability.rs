@@ -1,3 +1,9 @@
+//! The availability algorithm: a sweep line over intervals.
+//!
+//! Blocking rules and live allocations subtract from a resource's open windows, and a sweep
+//! over interval endpoints reassembles the maximal free runs while honoring per-resource
+//! capacity and turnaround buffers. This is the hot path the whole database exists to serve.
+
 use crate::model::*;
 
 // ── Availability Algorithm ────────────────────────────────────────

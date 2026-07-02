@@ -1,3 +1,9 @@
+//! In-memory resource state: the `DashMap`s the engine reads and writes.
+//!
+//! Owns the resource table plus the entity-to-resource and child/parent indexes, and applies
+//! each `Event` to them. Keeping the maps here lets the rest of the engine treat state access
+//! as method calls rather than reaching into shared containers.
+
 use dashmap::DashMap;
 use ulid::Ulid;
 
