@@ -855,17 +855,14 @@ pub async fn process_connection(
                     .await
                     {
                         tracing::debug!("startup error: {e}");
+                        // AUTH_FAILURES_TOTAL counts any startup failure, not only bad passwords: a
+                        // generic PgWireError is not trivially separable into auth-vs-other here, so
+                        // the metric stays broad (its doc comment already says "startup/auth").
                         metrics::counter!(crate::observability::AUTH_FAILURES_TOTAL).increment(1);
-                        if pgwire::tokio::server::process_error(
-                            &mut socket,
-                            e,
-                            false,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
-                        }
+                        // Send the error, then drop the connection. Looping back would let a client
+                        // retry passwords on one TCP connection for the whole startup deadline.
+                        let _ = pgwire::tokio::server::process_error(&mut socket, e, false).await;
+                        break;
                     }
                 }
                 _ => break,
