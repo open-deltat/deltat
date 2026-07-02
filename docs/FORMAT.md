@@ -1,4 +1,4 @@
-# open-tap wire & storage format: v0 (DRAFT)
+# open-deltat wire & storage format: v0 (DRAFT)
 
 > The thing designed to outlive every implementation. Per [`../V2-DESIGN.md`](../V2-DESIGN.md) §13,
 > "never change for 100 years" applies to **this format**, *not* to the Rust binary, the index, or the
@@ -12,7 +12,7 @@
 
 ## 1. What this format is (and is not)
 
-It is the complete contract between a client and an open-tap node, and between a node and its own
+It is the complete contract between a client and an open-deltat node, and between a node and its own
 write-ahead log. It has exactly four conceptual objects: an **instant**, an **interval**, a **command**,
 and an **event**. Everything else (calendars, recurrence, geography, identity, money, business data) is
 **out of scope by construction**: it lives in higher layers that reference resources by id (V2-DESIGN

@@ -1,4 +1,4 @@
-# deltat / open-tap, v2 design
+# deltat / open-deltat, v2 design
 
 > A first-principles rethink of the time-allocation database and the protocol around it.
 > Researched and stress-tested by a 19-agent review of both repos + 6 prior-art domains

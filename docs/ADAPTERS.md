@@ -87,7 +87,7 @@ trigger (T-10: "boundaries now, layers on a trigger"), not an arbitrary one.
 
 **The decision, in one line:** a **pure translation core built first and shared**; **thin in-SDK
 adapters reach the kernel over the existing pgwire transport** for the cheap read/import directions
-(ships value today, zero new infrastructure, no kernel change); a standalone **`open-tap-bridge` +
+(ships value today, zero new infrastructure, no kernel change); a standalone **`open-deltat-bridge` +
 PROTO-03 is introduced only at the two-way trigger**, where it doubles as the FED-01 federation unit
 (VIS-02), so the end-state arrives without a retrofit.
 
@@ -208,7 +208,7 @@ pgwire transport.
 | **1b** | Bookings appear in the silo | Google EXPORT (`createEvent` on confirm) + echo-suppression | No | ✅ pgwire |
 | **2** | Broadest single open adapter | CalDAV import+export (MVP scope): iCloud/Fastmail/Nextcloud | No | ✅ pgwire |
 | **3** | The business duo | MS Graph import+export (+ EWS on-prem deferred) | No | ✅ pgwire |
-| **4** | Two-way trigger | `open-tap-bridge` + PROTO-03 + per-conn auth; `external_ref` (GAP-02); deltat-as-CalDAV-server + RFC 6638 iTIP; delta/webhooks; Holds gated on GAP-11 | `external_ref` | builds PROTO-03 |
+| **4** | Two-way trigger | `open-deltat-bridge` + PROTO-03 + per-conn auth; `external_ref` (GAP-02); deltat-as-CalDAV-server + RFC 6638 iTIP; delta/webhooks; Holds gated on GAP-11 | `external_ref` | builds PROTO-03 |
 | **5** | Highest-quality open two-way | JMAP/JSCalendar: validates the JSCalendar-shaped PROTO-03 envelope (reference for PROTO-01) | No | via bridge |
 
 **Phase 0, the first PR (red→green, PRIN-12):** `expandRecurrence` (`recurrence.ts:36-66`) uses

@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://crates.io/crates/deltat"><img src="https://img.shields.io/crates/v/deltat.svg?logo=rust" alt="crates.io"></a>
   <a href="https://crates.io/crates/deltat"><img src="https://img.shields.io/crates/d/deltat.svg" alt="downloads"></a>
-  <a href="https://github.com/open-tap/deltat/actions/workflows/ci.yml"><img src="https://github.com/open-tap/deltat/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/open-deltat/deltat/actions/workflows/ci.yml"><img src="https://github.com/open-deltat/deltat/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
   <a href="https://delt.at"><img src="https://img.shields.io/badge/site-delt.at-4fe3a3.svg" alt="delt.at"></a>
 </p>
@@ -62,7 +62,7 @@ cargo install deltat
 DELTAT_PASSWORD=secret deltat
 ```
 
-Or build from source: `cargo install --git https://github.com/open-tap/deltat.git`
+Or build from source: `cargo install --git https://github.com/open-deltat/deltat.git`
 
 Connect on port 5433:
 
@@ -217,11 +217,11 @@ src/
 
 ### Client libraries
 
-**TypeScript**: [@open-tap/client](https://github.com/open-tap/tap)
+**TypeScript**: [@open-tap/client](https://github.com/open-deltat/tap)
 
 ### Demos
 
-The [tap](https://github.com/open-tap/tap) repo includes a Next.js demo app with interactive examples spanning seat maps (airline, theater, stadium), multi-resource availability, recurring schedules, capacity pools, and hold-to-book flows.
+The [tap](https://github.com/open-deltat/tap) repo includes a Next.js demo app with interactive examples spanning seat maps (airline, theater, stadium), multi-resource availability, recurring schedules, capacity pools, and hold-to-book flows.
 
 ## License
 

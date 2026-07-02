@@ -1,4 +1,4 @@
-# open-tap / deltat: Requirements (the forever spec)
+# open-deltat / deltat: Requirements (the forever spec)
 
 > The single source of truth for **what this project is supposed to be and do.** Each line is a
 > factual, checkable requirement with a stable ID. Add to it, edit it, never delete an ID (mark it
