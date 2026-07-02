@@ -359,26 +359,24 @@ fn parse_update(
 
     match table_name.as_str() {
         "resources" => {
-            let mut name: Option<String> = None;
+            // Only fields actually present in the SET list are emitted; an absent field stays
+            // `None` so the engine leaves it unchanged. The inner Option distinguishes "set to NULL"
+            // (Some(None)) from "not mentioned" (None) for the nullable columns.
+            let mut name: Option<Option<String>> = None;
             let mut capacity: Option<u32> = None;
             let mut buffer_after: Option<Option<Ms>> = None;
 
             for a in assignments {
                 let col = assignment_column_name(a)?;
                 match col.as_str() {
-                    "name" => name = parse_string_or_null(&a.value)?,
+                    "name" => name = Some(parse_string_or_null(&a.value)?),
                     "capacity" => capacity = Some(parse_u32(&a.value)?),
                     "buffer_after" => buffer_after = Some(parse_i64_or_null(&a.value)?),
                     _ => {}
                 }
             }
 
-            Ok(Command::UpdateResource {
-                id,
-                name,
-                capacity: capacity.unwrap_or(1),
-                buffer_after: buffer_after.unwrap_or(None),
-            })
+            Ok(Command::UpdateResource { id, name, capacity, buffer_after })
         }
         "rules" => {
             let mut start: Option<Ms> = None;
@@ -1598,8 +1596,9 @@ mod tests {
         match cmd {
             Command::UpdateResource { id, name, capacity, buffer_after } => {
                 assert_eq!(id.to_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
-                assert_eq!(name, Some("Meeting Room A".to_string()));
-                assert_eq!(capacity, 5);
+                assert_eq!(name, Some(Some("Meeting Room A".to_string())));
+                assert_eq!(capacity, Some(5));
+                // buffer_after absent from the SET list => None (leave unchanged), NOT Some(None).
                 assert_eq!(buffer_after, None);
             }
             _ => panic!("expected UpdateResource, got {cmd:?}"),
@@ -1611,11 +1610,27 @@ mod tests {
         let sql = "UPDATE resources SET capacity = 10, buffer_after = 900000 WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
         let cmd = parse_sql(sql).unwrap();
         match cmd {
-            Command::UpdateResource { capacity, buffer_after, .. } => {
-                assert_eq!(capacity, 10);
-                assert_eq!(buffer_after, Some(900000));
+            Command::UpdateResource { name, capacity, buffer_after, .. } => {
+                assert_eq!(name, None); // name absent => unchanged
+                assert_eq!(capacity, Some(10));
+                assert_eq!(buffer_after, Some(Some(900000)));
             }
             _ => panic!("expected UpdateResource, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_resource_only_buffer_leaves_others_absent() {
+        // The regression at the parser boundary: a partial update must emit None for the columns it
+        // does not mention, so the engine leaves name and capacity intact.
+        let sql = "UPDATE resources SET buffer_after = 600000 WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        match parse_sql(sql).unwrap() {
+            Command::UpdateResource { name, capacity, buffer_after, .. } => {
+                assert_eq!(name, None);
+                assert_eq!(capacity, None);
+                assert_eq!(buffer_after, Some(Some(600000)));
+            }
+            cmd => panic!("expected UpdateResource, got {cmd:?}"),
         }
     }
 
@@ -1625,7 +1640,8 @@ mod tests {
         let cmd = parse_sql(sql).unwrap();
         match cmd {
             Command::UpdateResource { buffer_after, .. } => {
-                assert_eq!(buffer_after, None);
+                // Explicit NULL => Some(None) (set to NULL), distinct from absent (None).
+                assert_eq!(buffer_after, Some(None));
             }
             _ => panic!("expected UpdateResource, got {cmd:?}"),
         }

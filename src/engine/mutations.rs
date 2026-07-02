@@ -418,15 +418,20 @@ impl Engine {
         Ok(resource_id)
     }
 
+    /// Partial update: each argument is `None` when the caller left that column out (unchanged). The
+    /// inner Option on the nullable fields is the value to set, so `name = Some(None)` clears the
+    /// name while `name = None` leaves it as is. Only mentioned fields are validated and written.
     pub async fn update_resource(
         &self,
         id: Ulid,
-        name: Option<String>,
-        capacity: u32,
-        buffer_after: Option<Ms>,
+        name: Option<Option<String>>,
+        capacity: Option<u32>,
+        buffer_after: Option<Option<Ms>>,
     ) -> Result<(), EngineError> {
-        validate_buffer(buffer_after)?;
-        if let Some(ref n) = name
+        if let Some(buffer) = buffer_after {
+            validate_buffer(buffer)?;
+        }
+        if let Some(Some(ref n)) = name
             && n.len() > MAX_NAME_LEN {
                 return Err(EngineError::LimitExceeded("resource name too long"));
             }

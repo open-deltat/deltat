@@ -150,11 +150,15 @@ pub enum Event {
         capacity: u32,
         buffer_after: Option<Ms>,
     },
+    /// A partial resource update. Each field is `None` when the UPDATE did not mention that column
+    /// (leave it unchanged); the inner `Option` on the nullable fields is the value to set, so
+    /// `name: Some(None)` sets NULL while `name: None` leaves the existing name intact. This
+    /// absent-vs-null distinction is why a `SET buffer_after = $1` no longer wipes name and capacity.
     ResourceUpdated {
         id: Ulid,
-        name: Option<String>,
-        capacity: u32,
-        buffer_after: Option<Ms>,
+        name: Option<Option<String>>,
+        capacity: Option<u32>,
+        buffer_after: Option<Option<Ms>>,
     },
     ResourceDeleted {
         id: Ulid,
