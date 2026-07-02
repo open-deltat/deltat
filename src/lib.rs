@@ -17,17 +17,26 @@
 //! - `wal`, `tenant`, `notify`, `reaper`, `clock`, `auth`, `tls`, `observability`, `limits`:
 //!   durability, isolation, and the supporting machinery around the kernel.
 
+#[doc(hidden)]
 pub mod auth;
+#[doc(hidden)]
 pub mod clock;
 pub mod command;
 pub mod engine;
+#[doc(hidden)]
 pub mod limits;
 pub mod model;
+#[doc(hidden)]
 pub mod notify;
+#[doc(hidden)]
 pub mod observability;
+#[doc(hidden)]
 pub mod reaper;
 pub mod sql;
+#[doc(hidden)]
 pub mod tenant;
+#[doc(hidden)]
 pub mod tls;
+#[doc(hidden)]
 pub mod wal;
 pub mod wire;
