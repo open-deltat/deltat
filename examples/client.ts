@@ -1,5 +1,5 @@
 /**
- * deltat — Bun SQL client example
+ * deltat, Bun SQL client example
  *
  * Start the server:
  *   DELTAT_PASSWORD=secret cargo run --release

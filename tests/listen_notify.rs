@@ -119,7 +119,7 @@ async fn inverted_span_errors_without_panicking() {
         .await
         .unwrap();
 
-    // A booking with end < start is invalid input — must return an error, not crash.
+    // A booking with end < start is invalid input, must return an error, not crash.
     let bid = Ulid::new();
     let bad = client
         .batch_execute(&format!(
@@ -218,7 +218,7 @@ async fn listen_receives_notification() {
     // Connection 2: mutator
     let (client2, _rx2) = connect(addr).await;
 
-    // Mutate — add a rule to trigger an event
+    // Mutate, add a rule to trigger an event
     let rule_id = Ulid::new();
     client2
         .batch_execute(&format!(
@@ -301,7 +301,7 @@ async fn notification_only_on_subscribed_resource() {
 
     let (client2, _) = connect(addr).await;
 
-    // Mutate B — should NOT trigger notification
+    // Mutate B, should NOT trigger notification
     let rule_id = Ulid::new();
     client2
         .batch_execute(&format!(
@@ -313,7 +313,7 @@ async fn notification_only_on_subscribed_resource() {
     let notif = recv_notification(&mut rx1, Duration::from_millis(500)).await;
     assert!(notif.is_none(), "should not receive notification for unsubscribed resource");
 
-    // Mutate A — SHOULD trigger notification
+    // Mutate A, SHOULD trigger notification
     let rule_id2 = Ulid::new();
     client2
         .batch_execute(&format!(
@@ -339,7 +339,7 @@ async fn listen_duplicate_is_idempotent() {
         .await
         .unwrap();
 
-    // Listen twice on the same channel — should not error
+    // Listen twice on the same channel, should not error
     client1
         .batch_execute(&format!("LISTEN resource_{rid}"))
         .await
@@ -479,7 +479,7 @@ async fn disconnect_cleans_up() {
         .await
         .unwrap();
 
-    // Drop client — should not panic or leak
+    // Drop client, should not panic or leak
     drop(client1);
     drop(_rx1);
 
@@ -528,7 +528,7 @@ async fn event_bubbles_to_parent() {
         .await
         .unwrap();
 
-    // Listen on PARENT only — after setup so we don't catch the parent rule event
+    // Listen on PARENT only, after setup so we don't catch the parent rule event
     client1
         .batch_execute(&format!("LISTEN resource_{parent_id}"))
         .await
@@ -600,7 +600,7 @@ async fn event_bubbles_to_root() {
         .await
         .unwrap();
 
-    // Listen on ROOT only — after setup so we don't catch parent rule events
+    // Listen on ROOT only, after setup so we don't catch parent rule events
     client1
         .batch_execute(&format!("LISTEN resource_{root_id}"))
         .await
