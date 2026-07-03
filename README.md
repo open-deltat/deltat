@@ -54,7 +54,7 @@ A single Rust binary that speaks PostgreSQL. No Postgres underneath: it's a purp
 - Atomic batch bookings (all-or-nothing)
 - Real-time LISTEN/NOTIFY events
 
-Working in TypeScript? [TAP](https://github.com/open-deltat/tap), the Time Allocation Protocol, is the typed SDK (`@open-deltat/client`) over deltat, so you speak in resources, holds, and availability instead of SQL.
+deltat is the reference implementation of [TAP](https://github.com/open-deltat/tap), the Time Allocation Protocol: the open standard for scheduling, booking, and availability. Working in TypeScript? TAP's SDK, `@open-deltat/client`, lets you write resources, holds, and availability instead of SQL.
 
 ## Quick start
 
