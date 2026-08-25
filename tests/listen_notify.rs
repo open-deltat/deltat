@@ -1102,3 +1102,34 @@ async fn multi_row_holds_insert_is_rejected_not_truncated() {
     let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
     assert!(holds.is_empty(), "no partial hold may land from a rejected statement");
 }
+
+#[tokio::test]
+async fn reordered_booking_insert_round_trips() {
+    // A column list declaring resource_id before id is valid PostgreSQL; the booking must land
+    // on the declared resource with the declared id, not on whatever the positional order says.
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let rid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+
+    // A live span: an ancient one can lose a race with the GC first tick (7-day retention)
+    // and vanish before the SELECT, which is not what this test is about.
+    let start = client_now_ms() + 3_600_000;
+    let end = start + 3_600_000;
+    let bid = Ulid::new();
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO bookings (resource_id, id, start, "end", label) VALUES ('{rid}', '{bid}', {start}, {end}, 'swapped')"#
+        ))
+        .await
+        .expect("reordered column list is valid SQL and must succeed");
+
+    let rows = select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+    assert_eq!(rows.len(), 1, "the booking must land on the declared resource");
+    assert_eq!(rows[0].0, bid.to_string(), "the booking must carry the declared id");
+    assert_eq!(rows[0].1, "swapped");
+}
