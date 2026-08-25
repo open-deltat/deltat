@@ -12,8 +12,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream;
 use futures::{Sink, SinkExt, StreamExt};
-use pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
-use pgwire::api::auth::DefaultServerParameterProvider;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -32,7 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use ulid::Ulid;
 
-use crate::auth::DeltaTAuthSource;
+use crate::auth::{DeltaTAuthSource, DeltaTStartupHandler};
 use crate::engine::Engine;
 use crate::limits::{MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
 use crate::model::*;
@@ -808,10 +806,9 @@ pub async fn process_connection(
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<NotificationResponse>();
 
     // 3. Per-connection handlers
-    let auth_handler = Arc::new(CleartextPasswordAuthStartupHandler::new(
-        DeltaTAuthSource::new(password),
-        DefaultServerParameterProvider::default(),
-    ));
+    let auth_handler = Arc::new(DeltaTStartupHandler::new(Arc::new(DeltaTAuthSource::new(
+        password,
+    ))));
     let handler = Arc::new(DeltaTHandler::with_subscriptions(
         tenant_manager.clone(),
         subscribe_tx,
