@@ -66,6 +66,11 @@ DELTAT_PASSWORD=secret deltat
 
 Or build from source: `cargo install --git https://github.com/open-deltat/deltat.git`
 
+Without `DELTAT_PASSWORD`, deltat generates a random password and prints it once at startup.
+Anyone holding the password has full read/write access to every tenant (see `DELTAT_TENANT_PASSWORDS`
+below to scope credentials per tenant), and auth is cleartext unless TLS is configured, so on
+anything but localhost set a strong password and `DELTAT_TLS_CERT`/`DELTAT_TLS_KEY`.
+
 Connect on port 5433:
 
 ```bash
@@ -195,7 +200,7 @@ All times are **Unix milliseconds**. Intervals are half-open `[start, end)`, so 
 | `DELTAT_PORT` | `5433` | Listen port |
 | `DELTAT_BIND` | `0.0.0.0` | Bind address |
 | `DELTAT_DATA_DIR` | `./data` | WAL storage directory |
-| `DELTAT_PASSWORD` | `deltat` | Connection password |
+| `DELTAT_PASSWORD` | generated | Connection password. Unset means a random one is generated and printed once at startup |
 | `DELTAT_TENANT_PASSWORDS` | unset | Per-tenant credentials as comma-separated `tenant:password` pairs (passwords may contain colons, not commas). A tenant listed here accepts only its own password; unlisted tenants use `DELTAT_PASSWORD` |
 | `DELTAT_MAX_CONNECTIONS` | `256` | Concurrent connection cap |
 | `DELTAT_COMPACT_THRESHOLD` | `1000` | WAL appends before a compaction runs |

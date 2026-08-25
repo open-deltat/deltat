@@ -36,6 +36,27 @@ impl DeltaTAuthSource {
     }
 }
 
+/// How the server password was chosen at startup.
+pub enum ServerPassword {
+    Configured(String),
+    /// `DELTAT_PASSWORD` was unset or empty: a random password the caller must announce once
+    /// (the Grafana/Neo4j pattern), so the out-of-box deployment never ships a known credential.
+    Generated(String),
+}
+
+/// Resolve `DELTAT_PASSWORD`: a set, nonempty value is used as-is; anything else becomes a
+/// generated random password (two ULIDs' 80-bit random components, 160 bits of entropy).
+pub fn resolve_password(configured: Option<String>) -> ServerPassword {
+    match configured.filter(|p| !p.is_empty()) {
+        Some(p) => ServerPassword::Configured(p),
+        None => ServerPassword::Generated(format!(
+            "{:020x}{:020x}",
+            ulid::Ulid::new().random(),
+            ulid::Ulid::new().random()
+        )),
+    }
+}
+
 /// Parse `DELTAT_TENANT_PASSWORDS`: comma-separated `tenant:password` pairs, split on the first
 /// colon so passwords may contain colons (but not commas). Keys are stored sanitized, matching how
 /// the tenant manager keys engines. Malformed or duplicate entries are startup errors: silently
@@ -201,6 +222,32 @@ mod tests {
         );
         let no_db = LoginInfo::new(Some("u"), None, "127.0.0.1".to_string());
         assert_eq!(source.get_password(&no_db).await.unwrap().password(), b"default_pw");
+    }
+
+    #[test]
+    fn resolve_password_unset_generates_random_nonempty() {
+        let ServerPassword::Generated(first) = resolve_password(None) else {
+            panic!("unset DELTAT_PASSWORD must yield a generated password");
+        };
+        assert!(!first.is_empty());
+        assert_ne!(first, "deltat", "the known default credential must be gone");
+        let ServerPassword::Generated(second) = resolve_password(None) else {
+            panic!("unset DELTAT_PASSWORD must yield a generated password");
+        };
+        assert_ne!(first, second, "generated passwords must be random");
+    }
+
+    #[test]
+    fn resolve_password_empty_env_is_treated_as_unset() {
+        assert!(matches!(resolve_password(Some(String::new())), ServerPassword::Generated(_)));
+    }
+
+    #[test]
+    fn resolve_password_configured_passes_through() {
+        assert!(matches!(
+            resolve_password(Some("s3cret".into())),
+            ServerPassword::Configured(p) if p == "s3cret"
+        ));
     }
 
     #[test]
