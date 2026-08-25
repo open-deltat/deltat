@@ -133,6 +133,11 @@ INSERT INTO holds (id, resource_id, start, "end", expires_at)
 VALUES ('01J...', '01J...', 1706000000000, 1706003600000, 1706000900000);
 
 DELETE FROM holds WHERE id = '01J...';
+
+-- Commit the hold: atomically convert it into a booking on the held span.
+-- One lock, one WAL flush; there is no release-then-rebook gap for a
+-- competing booker to steal. label is optional.
+UPDATE holds SET booking_id = '01J...', label = 'seat 14F' WHERE id = '01J...';
 ```
 
 ### Availability

@@ -414,6 +414,28 @@ fn parse_update(
                 blocking: blocking.ok_or(SqlError::MissingFilter("blocking"))?,
             })
         }
+        "holds" => {
+            // The one UPDATE a hold supports: assigning booking_id commits the hold, converting
+            // it into a booking atomically (Command::CommitHold). Span and resource come from the
+            // hold itself, so only booking_id and label are assignable.
+            let mut booking_id: Option<Ulid> = None;
+            let mut label: Option<String> = None;
+
+            for a in assignments {
+                let col = assignment_column_name(a)?;
+                match col.as_str() {
+                    "booking_id" => booking_id = Some(parse_ulid_expr(&a.value)?),
+                    "label" => label = parse_string_or_null(&a.value)?,
+                    _ => {}
+                }
+            }
+
+            Ok(Command::CommitHold {
+                hold_id: id,
+                booking_id: booking_id.ok_or(SqlError::MissingFilter("booking_id"))?,
+                label,
+            })
+        }
         _ => Err(SqlError::Unsupported(format!("UPDATE {table_name}"))),
     }
 }
@@ -1687,6 +1709,52 @@ mod tests {
     fn parse_update_rule_missing_field() {
         // Missing blocking field should error
         let sql = r#"UPDATE rules SET start = 5000, "end" = 10000 WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'"#;
+        assert!(parse_sql(sql).is_err());
+    }
+
+    // ── UPDATE holds (commit hold -> booking) ────────────────────
+
+    #[test]
+    fn parse_update_holds_commits_hold() {
+        let sql = "UPDATE holds SET booking_id = '01BX5ZZKBKACTAV9WEVGEMMVRZ' WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        match parse_sql(sql).unwrap() {
+            Command::CommitHold { hold_id, booking_id, label } => {
+                assert_eq!(hold_id.to_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+                assert_eq!(booking_id.to_string(), "01BX5ZZKBKACTAV9WEVGEMMVRZ");
+                assert_eq!(label, None);
+            }
+            cmd => panic!("expected CommitHold, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_holds_with_label() {
+        let sql = "UPDATE holds SET booking_id = '01BX5ZZKBKACTAV9WEVGEMMVRZ', label = 'seat 14F' WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        match parse_sql(sql).unwrap() {
+            Command::CommitHold { label, .. } => assert_eq!(label, Some("seat 14F".to_string())),
+            cmd => panic!("expected CommitHold, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_holds_null_label_is_no_label() {
+        let sql = "UPDATE holds SET booking_id = '01BX5ZZKBKACTAV9WEVGEMMVRZ', label = NULL WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        match parse_sql(sql).unwrap() {
+            Command::CommitHold { label, .. } => assert_eq!(label, None),
+            cmd => panic!("expected CommitHold, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_holds_missing_booking_id_errors() {
+        // label alone is not a commit; booking_id is the one required assignment.
+        let sql = "UPDATE holds SET label = 'x' WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        assert!(parse_sql(sql).is_err());
+    }
+
+    #[test]
+    fn parse_update_holds_missing_where_id_errors() {
+        let sql = "UPDATE holds SET booking_id = '01BX5ZZKBKACTAV9WEVGEMMVRZ'";
         assert!(parse_sql(sql).is_err());
     }
 

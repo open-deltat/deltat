@@ -921,3 +921,121 @@ async fn multiple_events_on_same_channel() {
     }
     assert_eq!(count, 3, "should receive all 3 notifications");
 }
+
+// ── Commit hold (atomic hold -> booking) over the wire ───────────
+
+/// Real client wall-clock for hold-expiry fixtures. The Clock seam bans ambient time in the
+/// engine, not in external test clients simulating a booker.
+#[allow(clippy::disallowed_methods)]
+fn client_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+async fn setup_held_span(client: &tokio_postgres::Client) -> (Ulid, Ulid) {
+    let rid = Ulid::new();
+    let hid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+    let expires = client_now_ms() + 60_000;
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {expires})"#
+        ))
+        .await
+        .unwrap();
+    (rid, hid)
+}
+
+/// Rows of a simple-query SELECT, as (first-column, last-column) text pairs.
+async fn select_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<(String, String)> {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap_or_default().to_string(),
+                row.get(row.len() - 1).unwrap_or_default().to_string(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn commit_hold_via_simple_query() {
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let (rid, hid) = setup_held_span(&client).await;
+
+    let bid = Ulid::new();
+    let messages = client
+        .simple_query(&format!(
+            "UPDATE holds SET booking_id = '{bid}', label = 'picnic' WHERE id = '{hid}'"
+        ))
+        .await
+        .unwrap();
+    let affected = messages.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::CommandComplete(n) => Some(*n),
+        _ => None,
+    });
+    assert_eq!(affected, Some(1), "CommandComplete must report UPDATE 1");
+
+    let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+    assert!(holds.is_empty(), "the committed hold must be gone");
+    let bookings =
+        select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+    assert_eq!(bookings.len(), 1);
+    assert_eq!(bookings[0].0, bid.to_string());
+    assert_eq!(bookings[0].1, "picnic");
+}
+
+#[tokio::test]
+async fn commit_hold_via_extended_query() {
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let (rid, hid) = setup_held_span(&client).await;
+
+    let bid = Ulid::new();
+    let affected = client
+        .execute(
+            "UPDATE holds SET booking_id = $1 WHERE id = $2",
+            &[&bid.to_string(), &hid.to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "CommandComplete must report UPDATE 1");
+
+    let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+    assert!(holds.is_empty(), "the committed hold must be gone");
+    let bookings =
+        select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+    assert_eq!(bookings.len(), 1);
+    assert_eq!(bookings[0].0, bid.to_string());
+}
+
+#[tokio::test]
+async fn commit_hold_on_released_hold_errors_via_simple_query() {
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let (_rid, hid) = setup_held_span(&client).await;
+
+    client
+        .batch_execute(&format!("DELETE FROM holds WHERE id = '{hid}'"))
+        .await
+        .unwrap();
+
+    let result = client
+        .simple_query(&format!(
+            "UPDATE holds SET booking_id = '{}' WHERE id = '{hid}'",
+            Ulid::new()
+        ))
+        .await;
+    assert!(result.is_err(), "committing a released hold must error, not silently succeed");
+}

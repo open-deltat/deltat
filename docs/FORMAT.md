@@ -168,6 +168,9 @@ lexicographically sortable, client-supplied). All times are `Instant` (i64 µs).
 - `CommitHold { hold_id, booking_id, label? }`: **atomic** hold→booking under one lock, excluding the
   named hold from the conflict check. The single most important addition over v1 (Bug 1). Idempotent:
   re-committing an already-committed `booking_id` is a success echo.
+  *(The v1 SQL adapter already carries this verb: `UPDATE holds SET booking_id = $1 [, label = $2]
+  WHERE id = $3`, tag `UPDATE 1`. The idempotent success echo is still v2-only: today re-committing
+  errors because the hold no longer exists.)*
 
 **Bookings** (permanent claims):
 - `ConfirmBooking { id, resource_id, span, label? }`: direct booking without a prior hold.

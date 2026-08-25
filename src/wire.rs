@@ -200,6 +200,13 @@ impl DeltaTHandler {
                 engine.release_hold(id).await.map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
             }
+            Command::CommitHold { hold_id, booking_id, label } => {
+                engine
+                    .commit_hold(hold_id, booking_id, label)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
+            }
             Command::InsertBooking {
                 id,
                 resource_id,
@@ -1519,5 +1526,106 @@ mod tests {
 
         let sub_cmd = rx.try_recv().unwrap();
         assert!(matches!(sub_cmd, SubscriptionCommand::UnsubscribeAll));
+    }
+
+    // ── execute_command: CommitHold ──────────────────────────────
+
+    #[tokio::test]
+    async fn execute_commit_hold_converts_hold_to_booking() {
+        let (handler, _rx, engine) = setup_handler_with_subs();
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+        let hid = Ulid::new();
+        let expires = crate::clock::now_ms() + 60_000;
+        let insert = format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {expires})"#
+        );
+        handler.execute_command(&engine, sql::parse_sql(&insert).unwrap()).await.unwrap();
+
+        let bid = Ulid::new();
+        let commit = format!("UPDATE holds SET booking_id = '{bid}', label = 'picnic' WHERE id = '{hid}'");
+        let responses = handler
+            .execute_command(&engine, sql::parse_sql(&commit).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(responses.len(), 1);
+        match &responses[0] {
+            Response::Execution(tag) => assert_eq!(tag, &Tag::new("UPDATE").with_rows(1)),
+            other => panic!("expected Execution, got {other:?}"),
+        }
+
+        assert!(engine.get_holds(rid).await.unwrap().is_empty());
+        let bookings = engine.get_bookings(rid).await.unwrap();
+        assert_eq!(bookings.len(), 1);
+        assert_eq!(bookings[0].id, bid);
+        assert_eq!(bookings[0].start, 1000);
+        assert_eq!(bookings[0].end, 2000);
+        assert_eq!(bookings[0].label.as_deref(), Some("picnic"));
+    }
+
+    #[tokio::test]
+    async fn execute_commit_hold_unknown_hold_errors() {
+        let (handler, _rx, engine) = setup_handler_with_subs();
+        let commit = format!(
+            "UPDATE holds SET booking_id = '{}' WHERE id = '{}'",
+            Ulid::new(),
+            Ulid::new()
+        );
+        let result = handler.execute_command(&engine, sql::parse_sql(&commit).unwrap()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn commit_hold_over_wire_wins_the_span_against_concurrent_bookers() {
+        // The reason CommitHold exists (AVAIL-07): converting a hold to a booking must never open
+        // a window a competing booker can steal. Race the SQL commit against 7 concurrent
+        // INSERT INTO bookings on the held span of a capacity-1 resource: the commit must always
+        // win and every competitor must get a clean conflict error.
+        let (handler, _rx, engine) = setup_handler_with_subs();
+        let handler = Arc::new(handler);
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+        let hid = Ulid::new();
+        let expires = crate::clock::now_ms() + 60_000;
+        let insert = format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {expires})"#
+        );
+        handler.execute_command(&engine, sql::parse_sql(&insert).unwrap()).await.unwrap();
+
+        let bid = Ulid::new();
+        let mut tasks = Vec::new();
+        {
+            let handler = handler.clone();
+            let engine = engine.clone();
+            let commit = format!("UPDATE holds SET booking_id = '{bid}' WHERE id = '{hid}'");
+            tasks.push(tokio::spawn(async move {
+                handler.execute_command(&engine, sql::parse_sql(&commit).unwrap()).await.is_ok()
+            }));
+        }
+        for _ in 0..7 {
+            let handler = handler.clone();
+            let engine = engine.clone();
+            let steal = format!(
+                r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{}', '{rid}', 1000, 2000)"#,
+                Ulid::new()
+            );
+            tasks.push(tokio::spawn(async move {
+                handler.execute_command(&engine, sql::parse_sql(&steal).unwrap()).await.is_ok()
+            }));
+        }
+
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        assert!(results[0], "the holder's commit must win its own span");
+        assert!(results[1..].iter().all(|ok| !ok), "no competing booking may squeeze in");
+
+        assert!(engine.get_holds(rid).await.unwrap().is_empty());
+        let bookings = engine.get_bookings(rid).await.unwrap();
+        assert_eq!(bookings.len(), 1);
+        assert_eq!(bookings[0].id, bid);
     }
 }
