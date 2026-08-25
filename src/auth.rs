@@ -1,6 +1,8 @@
 //! Cleartext-password auth for the pgwire startup handshake: one shared server password
-//! (`DELTAT_PASSWORD`) verified against every connection.
+//! (`DELTAT_PASSWORD`) verified against every connection, optionally overridden per tenant
+//! (`DELTAT_TENANT_PASSWORDS`) keyed by the connection's database name.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -16,12 +18,47 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 pub struct DeltaTAuthSource {
     password: String,
+    /// Sanitized tenant name -> that tenant's password. A tenant with an entry accepts only its
+    /// own password; the global one no longer opens it.
+    tenant_passwords: HashMap<String, String>,
 }
 
 impl DeltaTAuthSource {
     pub fn new(password: String) -> Self {
-        Self { password }
+        Self::with_tenant_passwords(password, HashMap::new())
     }
+
+    pub fn with_tenant_passwords(
+        password: String,
+        tenant_passwords: HashMap<String, String>,
+    ) -> Self {
+        Self { password, tenant_passwords }
+    }
+}
+
+/// Parse `DELTAT_TENANT_PASSWORDS`: comma-separated `tenant:password` pairs, split on the first
+/// colon so passwords may contain colons (but not commas). Keys are stored sanitized, matching how
+/// the tenant manager keys engines. Malformed or duplicate entries are startup errors: silently
+/// dropping one would leave a tenant open on the global password.
+pub fn parse_tenant_passwords(raw: &str) -> Result<HashMap<String, String>, String> {
+    // Errors name the entry by position, never by content: a malformed entry can contain a
+    // password, and these messages go to logs.
+    let mut map = HashMap::new();
+    for (idx, pair) in raw.split(',').enumerate() {
+        let entry = idx + 1;
+        let (tenant, password) = pair
+            .split_once(':')
+            .ok_or_else(|| format!("tenant password entry {entry} is not tenant:password"))?;
+        if password.is_empty() {
+            return Err(format!("tenant password entry {entry} has an empty password"));
+        }
+        let key = crate::tenant::TenantManager::sanitize(tenant)
+            .map_err(|_| format!("tenant password entry {entry} has an empty tenant name"))?;
+        if map.insert(key.clone(), password.to_string()).is_some() {
+            return Err(format!("duplicate tenant password entry for '{key}'"));
+        }
+    }
+    Ok(map)
 }
 
 // Redact the shared password so it can never reach a log line through a derived Debug.
@@ -33,8 +70,14 @@ impl std::fmt::Debug for DeltaTAuthSource {
 
 #[async_trait]
 impl AuthSource for DeltaTAuthSource {
-    async fn get_password(&self, _login: &LoginInfo) -> PgWireResult<Password> {
-        Ok(Password::new(None, self.password.as_bytes().to_vec()))
+    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
+        // Key the lookup exactly as resolve_engine keys engines: missing database means tenant
+        // "default", and the name is sanitized so an alias cannot dodge its tenant's credential.
+        let tenant_password = crate::tenant::TenantManager::sanitize(login.database().unwrap_or("default"))
+            .ok()
+            .and_then(|key| self.tenant_passwords.get(&key));
+        let password = tenant_password.unwrap_or(&self.password);
+        Ok(Password::new(None, password.as_bytes().to_vec()))
     }
 }
 
@@ -116,6 +159,69 @@ mod tests {
         let password = source.get_password(&login).await.unwrap();
         assert_eq!(password.password(), b"my_secret");
         assert!(password.salt().is_none());
+    }
+
+    fn tenant_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(t, p)| (t.to_string(), p.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tenant_password_overrides_global_only_for_its_tenant() {
+        let source = DeltaTAuthSource::with_tenant_passwords(
+            "global_pw".into(),
+            tenant_map(&[("acme", "acme_pw")]),
+        );
+        let acme = LoginInfo::new(Some("u"), Some("acme"), "127.0.0.1".to_string());
+        assert_eq!(source.get_password(&acme).await.unwrap().password(), b"acme_pw");
+        let globex = LoginInfo::new(Some("u"), Some("globex"), "127.0.0.1".to_string());
+        assert_eq!(source.get_password(&globex).await.unwrap().password(), b"global_pw");
+    }
+
+    #[tokio::test]
+    async fn tenant_password_lookup_uses_sanitized_name() {
+        // "acme!" resolves to tenant "acme"'s engine, so it must resolve to acme's password too:
+        // a raw-name lookup would fall back to the global password and bypass the credential.
+        let source = DeltaTAuthSource::with_tenant_passwords(
+            "global_pw".into(),
+            tenant_map(&[("acme", "acme_pw")]),
+        );
+        let aliased = LoginInfo::new(Some("u"), Some("acme!"), "127.0.0.1".to_string());
+        assert_eq!(source.get_password(&aliased).await.unwrap().password(), b"acme_pw");
+    }
+
+    #[tokio::test]
+    async fn missing_database_authenticates_against_default_tenant() {
+        // resolve_engine maps a missing database to tenant "default"; auth must mirror that.
+        let source = DeltaTAuthSource::with_tenant_passwords(
+            "global_pw".into(),
+            tenant_map(&[("default", "default_pw")]),
+        );
+        let no_db = LoginInfo::new(Some("u"), None, "127.0.0.1".to_string());
+        assert_eq!(source.get_password(&no_db).await.unwrap().password(), b"default_pw");
+    }
+
+    #[test]
+    fn parse_tenant_passwords_splits_pairs_on_first_colon() {
+        let map = parse_tenant_passwords("acme:s1,globex:with:colon").unwrap();
+        assert_eq!(map.get("acme"), Some(&"s1".to_string()));
+        assert_eq!(map.get("globex"), Some(&"with:colon".to_string()));
+    }
+
+    #[test]
+    fn parse_tenant_passwords_stores_sanitized_keys() {
+        let map = parse_tenant_passwords("ac.me:pw").unwrap();
+        assert_eq!(map.get("acme"), Some(&"pw".to_string()));
+    }
+
+    #[test]
+    fn parse_tenant_passwords_rejects_malformed_input() {
+        assert!(parse_tenant_passwords("acme").is_err()); // no colon
+        assert!(parse_tenant_passwords("acme:").is_err()); // empty password
+        assert!(parse_tenant_passwords(":pw").is_err()); // empty tenant
+        assert!(parse_tenant_passwords("acme:x,acme!:y").is_err()); // duplicate after sanitize
     }
 
     #[test]

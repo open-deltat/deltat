@@ -196,6 +196,7 @@ All times are **Unix milliseconds**. Intervals are half-open `[start, end)`, so 
 | `DELTAT_BIND` | `0.0.0.0` | Bind address |
 | `DELTAT_DATA_DIR` | `./data` | WAL storage directory |
 | `DELTAT_PASSWORD` | `deltat` | Connection password |
+| `DELTAT_TENANT_PASSWORDS` | unset | Per-tenant credentials as comma-separated `tenant:password` pairs (passwords may contain colons, not commas). A tenant listed here accepts only its own password; unlisted tenants use `DELTAT_PASSWORD` |
 | `DELTAT_MAX_CONNECTIONS` | `256` | Concurrent connection cap |
 | `DELTAT_COMPACT_THRESHOLD` | `1000` | WAL appends before a compaction runs |
 | `DELTAT_GC_RETENTION_MS` | `604800000` | Age (7 days) past which finished bookings and expired holds are collected |

@@ -781,10 +781,30 @@ async fn forward_resource_events(
     }
 }
 
+/// Single-shared-password entry point; delegates to [`process_connection_with_auth`].
 pub async fn process_connection(
     tcp_socket: TcpStream,
     tenant_manager: Arc<TenantManager>,
     password: String,
+    tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
+    max_conn_age_ms: u64,
+    max_idle_ms: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    process_connection_with_auth(
+        tcp_socket,
+        tenant_manager,
+        Arc::new(DeltaTAuthSource::new(password)),
+        tls_acceptor,
+        max_conn_age_ms,
+        max_idle_ms,
+    )
+    .await
+}
+
+pub async fn process_connection_with_auth(
+    tcp_socket: TcpStream,
+    tenant_manager: Arc<TenantManager>,
+    auth_source: Arc<DeltaTAuthSource>,
     tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
     // Post-auth lifetime guards in ms (0 = disabled). They bound a client that opens a LISTEN and
     // then squats, the only thing that reclaims a connection slot once the global semaphore is
@@ -806,9 +826,7 @@ pub async fn process_connection(
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<NotificationResponse>();
 
     // 3. Per-connection handlers
-    let auth_handler = Arc::new(DeltaTStartupHandler::new(Arc::new(DeltaTAuthSource::new(
-        password,
-    ))));
+    let auth_handler = Arc::new(DeltaTStartupHandler::new(auth_source));
     let handler = Arc::new(DeltaTHandler::with_subscriptions(
         tenant_manager.clone(),
         subscribe_tx,

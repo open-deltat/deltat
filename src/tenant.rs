@@ -105,7 +105,10 @@ impl TenantManager {
 
     /// Strip path-traversal characters, keeping only alphanumerics, `_`, and `-`. A name that is
     /// empty after stripping is rejected so it can never map to a bare `.wal` file.
-    fn sanitize(tenant: &str) -> std::io::Result<String> {
+    ///
+    /// pub(crate): per-tenant password lookup (auth.rs) must key on the same sanitized name this
+    /// module keys engines on, or an alias like "acme!" would bypass tenant "acme"'s credential.
+    pub(crate) fn sanitize(tenant: &str) -> std::io::Result<String> {
         let safe_name: String = tenant
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
