@@ -154,6 +154,11 @@ impl Wal {
     pub fn swap_compact_file(&mut self) -> io::Result<()> {
         let tmp_path = self.path.with_extension("wal.tmp");
         fs::rename(&tmp_path, &self.path)?;
+        // POSIX makes the rename durable only once the directory itself is synced; without this a
+        // power loss can resurrect the pre-compaction inode, losing every record acked to the new
+        // file since the swap while replaying stale state.
+        let dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
+        File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
