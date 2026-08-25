@@ -57,7 +57,6 @@ pub fn parse_sql(sql: &str) -> Result<Command, SqlError> {
 
 fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
     let table = insert_table_name(insert)?;
-    let values = extract_insert_values(insert)?;
     let columns = extract_column_names(insert);
 
     match table.as_str() {
@@ -96,7 +95,16 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
             }
         }
         "holds" => {
-            let (id, resource_id, start, end, expires_at) = parse_hold_row(&values, &columns)?;
+            let all_rows = extract_all_insert_rows(insert)?;
+            // No batch hold path exists in the engine; reject multi-row VALUES loudly rather
+            // than holding only the first slot while reporting success (silent data loss in
+            // the collision-detection domain). The tap SDK places holds one per statement.
+            if all_rows.len() > 1 {
+                return Err(SqlError::Unsupported(
+                    "multi-row INSERT INTO holds (place one hold per statement)".into(),
+                ));
+            }
+            let (id, resource_id, start, end, expires_at) = parse_hold_row(&all_rows[0], &columns)?;
             Ok(Command::InsertHold { id, resource_id, start, end, expires_at })
         }
         "bookings" => {
@@ -585,22 +593,6 @@ fn table_factor_name(tf: &TableFactor) -> Result<String, SqlError> {
 
 fn extract_column_names(insert: &ast::Insert) -> Vec<String> {
     insert.columns.iter().map(|c| c.value.to_lowercase()).collect()
-}
-
-fn extract_insert_values(insert: &ast::Insert) -> Result<Vec<Expr>, SqlError> {
-    let body = insert
-        .source
-        .as_ref()
-        .ok_or(SqlError::Parse("no VALUES".into()))?;
-    match body.body.as_ref() {
-        SetExpr::Values(values) => {
-            if values.rows.is_empty() {
-                return Err(SqlError::Parse("empty VALUES".into()));
-            }
-            Ok(values.rows[0].clone())
-        }
-        _ => Err(SqlError::Parse("expected VALUES".into())),
-    }
 }
 
 /// Parse one resource VALUES row into (id, parent_id, name, capacity, buffer_after). Column-aware
@@ -1265,6 +1257,18 @@ mod tests {
             }
             cmd => panic!("expected InsertHold, got {cmd:?}"),
         }
+    }
+
+    #[test]
+    fn parse_multi_row_insert_holds_is_rejected() {
+        // The engine has no batch hold path; a multi-row holds VALUES must fail loudly. Parsing
+        // only the first row and reporting INSERT success would leave the other slots unheld
+        // while the client believes they are protected.
+        let r = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('01BRZ3NDEKTSV4RRFFQ69G5FAW', '{r}', 1000, 2000, 3000), ('01CRZ3NDEKTSV4RRFFQ69G5FAX', '{r}', 3000, 4000, 5000)"#
+        );
+        assert!(parse_sql(&sql).is_err(), "multi-row holds INSERT must be rejected, not truncated");
     }
 
     #[test]

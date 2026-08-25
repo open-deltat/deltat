@@ -1074,3 +1074,31 @@ async fn hold_expiry_is_clamped_over_wire() {
     );
     assert!(stored > now, "the clamped hold must still be live");
 }
+
+#[tokio::test]
+async fn multi_row_holds_insert_is_rejected_not_truncated() {
+    // A two-row holds VALUES must error as a whole: accepting only the first row with INSERT
+    // success would leave the second slot free for a competitor while the client believes it
+    // is held.
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let rid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+
+    let expires = client_now_ms() + 60_000;
+    let h1 = Ulid::new();
+    let h2 = Ulid::new();
+    let result = client
+        .simple_query(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{h1}', '{rid}', 1000, 2000, {expires}), ('{h2}', '{rid}', 3000, 4000, {expires})"#
+        ))
+        .await;
+    assert!(result.is_err(), "multi-row holds INSERT must be rejected, not truncated");
+
+    let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+    assert!(holds.is_empty(), "no partial hold may land from a rejected statement");
+}
