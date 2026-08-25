@@ -106,7 +106,21 @@ fn flush_and_respond(wal: &mut Wal, batch: &mut Vec<(Event, oneshot::Sender<io::
     let result = flush_batch(wal, batch);
     metrics::histogram!(crate::observability::WAL_FLUSH_DURATION_SECONDS)
         .record(flush_start.elapsed().as_secs_f64());
+    if result.is_err() {
+        recover_wal(wal);
+    }
     respond_batch(batch, &result);
+}
+
+/// A failed flush may leave a torn record on disk; appending more records after it would get
+/// them acknowledged behind bytes replay stops at, silently losing them on the next restart.
+/// Recover (discard the buffer, truncate to the last good boundary) before serving anything
+/// else. A failed recovery poisons the WAL: every append errors and retries recovery, so no
+/// acknowledgement is ever issued on a broken tail.
+fn recover_wal(wal: &mut Wal) {
+    if let Err(e) = wal.recover() {
+        tracing::error!("WAL recovery after a flush failure failed: {e}");
+    }
 }
 
 fn flush_batch(wal: &mut Wal, batch: &mut [(Event, oneshot::Sender<io::Result<()>>)]) -> io::Result<()> {
@@ -156,6 +170,9 @@ fn handle_non_append(wal: &mut Wal, cmd: WalCommand) {
                 Some(e) => Err(e),
                 None => Ok(()),
             };
+            if result.is_err() {
+                recover_wal(wal);
+            }
             let _ = response.send(result);
         }
         WalCommand::Compact { events, response } => {
