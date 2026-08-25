@@ -29,6 +29,11 @@ impl Engine {
         capacity: u32,
         buffer_after: Option<Ms>,
     ) -> Result<(), EngineError> {
+        // Serialize against delete (and concurrent creates): the parent-existence and
+        // duplicate-id checks below are lock-free, and the WAL fsync sits between them and the
+        // index update, so an unserialized delete of the parent in that window would durably
+        // orphan this child (see topology_lock).
+        let _topology = self.topology_lock.lock().await;
         if self.store.resource_count() >= MAX_RESOURCES_PER_TENANT {
             return Err(EngineError::LimitExceeded("too many resources"));
         }
@@ -93,6 +98,10 @@ impl Engine {
     }
 
     pub async fn delete_resource(&self, id: Ulid) -> Result<(), EngineError> {
+        // Serialize against create: has_children below cannot see a child whose create has
+        // passed its parent check but not yet indexed itself, so without this lock the delete
+        // and the create both succeed and the child is durably orphaned (see topology_lock).
+        let _topology = self.topology_lock.lock().await;
         if !self.store.contains_resource(&id) {
             return Err(EngineError::NotFound(id));
         }
@@ -100,8 +109,6 @@ impl Engine {
             return Err(EngineError::HasChildren(id));
         }
 
-        // The contains_resource check above can race a concurrent delete of the same id, so
-        // resolve through Option rather than unwrapping a value that may already be gone.
         let Some(rs) = self.get_resource(&id) else {
             return Err(EngineError::NotFound(id));
         };

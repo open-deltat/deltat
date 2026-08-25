@@ -274,6 +274,14 @@ pub struct Engine {
     /// The compactor and GC tasks both trigger compaction; interleaved pairs would clobber the
     /// recording and could swap a stale snapshot over a newer one.
     pub(super) compact_lock: tokio::sync::Mutex<()>,
+    /// Serializes hierarchy-shape mutations (create, delete). Their existence checks are
+    /// lock-free and their WAL fsync sits between check and index update, so an unserialized
+    /// create(child, parent=P)/delete(P) pair could both succeed and durably orphan the child
+    /// (every availability query on it then errors NotFound(P)); the same window let duplicate-id
+    /// creates both pass the AlreadyExists check. Only create/delete take this lock, and no
+    /// caller holds a resource guard while acquiring it, so it cannot deadlock with the
+    /// per-resource locks. DDL is rare; serializing it through the fsync is cheap.
+    pub(super) topology_lock: tokio::sync::Mutex<()>,
 }
 
 impl Engine {
@@ -303,6 +311,7 @@ impl Engine {
             hold_generation: std::sync::atomic::AtomicU64::new(0),
             max_hold_ttl_ms: crate::limits::DEFAULT_MAX_HOLD_TTL_MS,
             compact_lock: tokio::sync::Mutex::new(()),
+            topology_lock: tokio::sync::Mutex::new(()),
         };
 
         // Replay events: we're the sole owner of these Arcs, so try_read/try_write
@@ -334,6 +343,26 @@ impl Engine {
                             engine.store.apply_event(&mut guard, other);
                         }
                 }
+            }
+        }
+
+        // A WAL written before hierarchy-shape mutations were serialized (topology_lock) can
+        // carry a create/delete interleaving that leaves a child whose parent no longer exists;
+        // its every availability query would error NotFound(parent) forever. Detach such
+        // orphans to roots so they answer queries again; the next compaction snapshots the
+        // detached state and makes the repair durable.
+        for id in engine.store.resource_ids() {
+            let Some(rs) = engine.store.get_resource(&id) else {
+                continue;
+            };
+            let mut guard = rs.try_write().expect("replay: uncontended write");
+            if let Some(pid) = guard.parent_id
+                && !engine.store.contains_resource(&pid)
+            {
+                tracing::warn!("replay: detaching orphaned resource {id} from deleted parent {pid}");
+                guard.parent_id = None;
+                engine.store.detach_parent(&id);
+                engine.store.remove_child(&pid, &id);
             }
         }
 

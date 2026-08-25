@@ -74,6 +74,12 @@ impl InMemoryStore {
         self.parents.get(child).map(|e| *e.value())
     }
 
+    /// Drop `child`'s entry from the lock-free parent index. Only the startup orphan sweep uses
+    /// this: parent links are otherwise immutable, so no live path ever re-parents.
+    pub fn detach_parent(&self, child: &Ulid) {
+        self.parents.remove(child);
+    }
+
     pub fn resource_ids(&self) -> Vec<Ulid> {
         self.resources.iter().map(|e| *e.key()).collect()
     }
