@@ -16,7 +16,10 @@ use super::{Engine, EngineError};
 impl Engine {
     /// Walk up from a resource collecting inherited rules from ancestors.
     ///
-    /// Non-blocking: OVERRIDE. First ancestor with non-blocking rules wins.
+    /// Non-blocking: OVERRIDE. The first ancestor with ANY non-blocking rule (anywhere on its
+    /// timeline, not just inside the query window) wins; ancestors above it contribute no
+    /// non-blocking spans, even when the winner's rules all fall outside the window. Deciding
+    /// per window let the same instant flip open/closed with the query bounds.
     /// Blocking: ACCUMULATE. All ancestors' blocking rules are collected.
     ///
     /// Returns `(inherited_non_blocking, inherited_blocking)` clamped to query.
@@ -79,7 +82,9 @@ impl Engine {
                 }
             }
 
-            if !found_non_blocking && !inherited_non_blocking.is_empty() {
+            // The override is a state fact: an ancestor that defines a schedule wins even when
+            // none of its rules overlap this window (its contribution is then empty = closed).
+            if !found_non_blocking && parent_guard.has_non_blocking_rule() {
                 found_non_blocking = true;
             }
         }

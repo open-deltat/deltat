@@ -1233,6 +1233,79 @@ async fn engine_child_inherits_updated_parent_rules() {
 }
 
 #[tokio::test]
+async fn override_is_window_independent_across_query_bounds() {
+    // Audit finding: the own-vs-inherited OVERRIDE was decided per query window, so the same
+    // instant read open in a narrow query (child's rule outside the window, inherited base wins)
+    // and closed in a wide one (child's rule overlaps, own base wins). The override must be a
+    // state fact: a child that defines its own schedule is closed outside it in EVERY window.
+    let path = test_wal_path("override_window_independent.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let day = 24 * H;
+
+    let parent = Ulid::new();
+    engine.create_resource(parent, None, None, 1, None).await.unwrap();
+    engine
+        .add_rule(Ulid::new(), parent, Span::new(0, 7 * day), false)
+        .await
+        .unwrap();
+
+    let child = Ulid::new();
+    engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
+    // Child's own schedule: Monday 9-17 only.
+    engine
+        .add_rule(Ulid::new(), child, Span::new(9 * H, 17 * H), false)
+        .await
+        .unwrap();
+
+    // Wide query (covers the child's rule): Tuesday is closed.
+    let wide = engine.compute_availability(child, 0, 2 * day, None).await.unwrap();
+    assert_eq!(wide, vec![Span::new(9 * H, 17 * H)]);
+
+    // Narrow query (Tuesday only, child's rule outside the window): Tuesday must STILL be closed.
+    let narrow = engine.compute_availability(child, day, 2 * day, None).await.unwrap();
+    assert!(
+        narrow.is_empty(),
+        "Tue 10:00 flipped open in the narrow window: {narrow:?}"
+    );
+}
+
+#[tokio::test]
+async fn child_rule_outside_parents_own_schedule_is_rejected() {
+    // AVAIL-09 through the same window-scoped override bug: the parent-coverage check evaluated
+    // the parent's availability over the rule's span, where the parent's own schedule did not
+    // overlap, so the check fell through to the grandparent's open time and admitted a child rule
+    // the parent's schedule forbids.
+    let path = test_wal_path("coverage_window_independent.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let grandparent = Ulid::new();
+    engine.create_resource(grandparent, None, None, 1, None).await.unwrap();
+    engine
+        .add_rule(Ulid::new(), grandparent, Span::new(0, 24 * H), false)
+        .await
+        .unwrap();
+
+    let parent = Ulid::new();
+    engine.create_resource(parent, Some(grandparent), None, 1, None).await.unwrap();
+    engine
+        .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
+        .await
+        .unwrap();
+
+    let child = Ulid::new();
+    engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
+    let result = engine
+        .add_rule(Ulid::new(), child, Span::new(18 * H, 20 * H), false)
+        .await;
+    assert!(
+        matches!(result, Err(EngineError::NotCoveredByParent { .. })),
+        "parent is closed [18,20): the child rule must be rejected, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn engine_delete_child_then_parent() {
     let path = test_wal_path("delete_child_parent.wal");
     let notify = Arc::new(NotifyHub::new());

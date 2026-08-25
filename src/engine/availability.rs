@@ -11,8 +11,10 @@ use crate::model::*;
 /// Compute raw free intervals for a resource using its unified interval list
 /// plus inherited rules from ancestors.
 ///
-/// Non-blocking: OVERRIDE. If resource has own non-blocking rules, use those;
-/// otherwise fall back to inherited_non_blocking.
+/// Non-blocking: OVERRIDE. If the resource has ANY own non-blocking rule (anywhere on its
+/// timeline, not just inside the query window), its own schedule is the base; otherwise fall
+/// back to inherited_non_blocking. The decision is a state fact so it cannot flip with the
+/// query bounds.
 /// Blocking: ACCUMULATE. Own blocking + inherited_blocking are all subtracted.
 pub fn availability(
     resource: &ResourceState,
@@ -68,10 +70,10 @@ pub fn availability(
         }
     }
 
-    let mut free = if own_non_blocking.is_empty() {
-        inherited_non_blocking.to_vec()
-    } else {
+    let mut free = if resource.has_non_blocking_rule() {
         own_non_blocking
+    } else {
+        inherited_non_blocking.to_vec()
     };
 
     free.sort_by_key(|s| s.start);
@@ -358,6 +360,21 @@ mod tests {
     }
 
     #[test]
+    fn own_rule_outside_window_still_overrides_inherited() {
+        // The OVERRIDE decision is a state fact, not a window fact: a resource that defines its
+        // own open hours is closed outside them, no matter where the query window lands. Deciding
+        // per window let the same instant read open in a narrow query and closed in a wide one.
+        let rs = make_resource(vec![rule(9 * H, 17 * H, false)]);
+        let inherited = vec![Span::new(18 * H, 20 * H)];
+        let query = Span::new(18 * H, 20 * H);
+        let free = availability(&rs, &query, &inherited, &[], 0);
+        assert!(
+            free.is_empty(),
+            "own schedule must override inherited in every window, got {free:?}"
+        );
+    }
+
+    #[test]
     fn availability_inherited_blocking_accumulates() {
         let rs = make_resource(vec![rule(9 * H, 17 * H, false)]);
         let inherited_blocking = vec![Span::new(12 * H, 13 * H)];
@@ -576,11 +593,12 @@ mod spec {
         query: &Span,
         now: Ms,
     ) -> Vec<Span> {
-        // OVERRIDE rule (AVAIL): own non-blocking, if any overlaps the query, fully
-        // replaces inherited non-blocking as the base of what is open.
+        // OVERRIDE rule (AVAIL): a resource with ANY own non-blocking rule (a state fact,
+        // deliberately NOT scoped to the query window) fully replaces inherited non-blocking
+        // as the base of what is open.
         let own_nb_present = intervals
             .iter()
-            .any(|i| matches!(i.kind, IntervalKind::NonBlocking) && i.span.overlaps(query));
+            .any(|i| matches!(i.kind, IntervalKind::NonBlocking));
 
         let mut runs = Vec::new();
         let mut run_start: Option<Ms> = None;
