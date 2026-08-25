@@ -16,7 +16,7 @@ use crate::model::*;
 use super::availability::subtract_intervals;
 use super::conflict::{
     check_batch_capacity, check_no_conflict, check_no_conflict_excluding, validate_buffer,
-    validate_span, validate_timestamp,
+    validate_capacity, validate_span, validate_timestamp,
 };
 use super::{Engine, EngineError, WalCommand};
 
@@ -32,6 +32,7 @@ impl Engine {
         if self.store.resource_count() >= MAX_RESOURCES_PER_TENANT {
             return Err(EngineError::LimitExceeded("too many resources"));
         }
+        validate_capacity(capacity)?;
         validate_buffer(buffer_after)?;
         if let Some(ref n) = name
             && n.len() > MAX_NAME_LEN {
@@ -439,6 +440,9 @@ impl Engine {
         capacity: Option<u32>,
         buffer_after: Option<Option<Ms>>,
     ) -> Result<(), EngineError> {
+        if let Some(cap) = capacity {
+            validate_capacity(cap)?;
+        }
         if let Some(buffer) = buffer_after {
             validate_buffer(buffer)?;
         }

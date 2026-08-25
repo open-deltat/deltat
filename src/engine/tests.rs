@@ -4496,6 +4496,37 @@ async fn create_resource_name_too_long() {
 }
 
 #[tokio::test]
+async fn create_resource_capacity_zero_rejected() {
+    // Capacity 0 naturally reads as "not bookable", but both the read and the write path lump
+    // it in with 1 (`<= 1` branches), so it silently behaved as a bookable single slot. Reject
+    // it at the boundary instead of defining a surprise semantic.
+    let path = test_wal_path("capacity_zero_create.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let result = engine.create_resource(Ulid::new(), None, None, 0, None).await;
+    assert!(matches!(result, Err(EngineError::LimitExceeded("capacity must be at least 1"))));
+}
+
+#[tokio::test]
+async fn update_resource_capacity_zero_rejected() {
+    // Same boundary on the update path: an existing resource must not be flipped into the
+    // undefined capacity-0 state.
+    let path = test_wal_path("capacity_zero_update.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 2, None).await.unwrap();
+    let result = engine.update_resource(rid, None, Some(0), None).await;
+    assert!(matches!(result, Err(EngineError::LimitExceeded("capacity must be at least 1"))));
+
+    // The rejected update left the stored capacity untouched.
+    let info = engine.list_resources().into_iter().find(|r| r.id == rid).unwrap();
+    assert_eq!(info.capacity, 2);
+}
+
+#[tokio::test]
 async fn hierarchy_too_deep() {
     let path = test_wal_path("limit_hierarchy.wal");
     let notify = Arc::new(NotifyHub::new());

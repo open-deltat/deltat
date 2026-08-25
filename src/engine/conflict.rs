@@ -33,6 +33,16 @@ pub(crate) fn validate_buffer(buffer_after: Option<Ms>) -> Result<(), EngineErro
     Ok(())
 }
 
+/// Capacity 0 reads as "not bookable" but every `<= 1` branch would treat it as a bookable
+/// single slot; reject it at the boundary rather than define that surprise. Pre-existing WAL
+/// events are applied verbatim on replay, so this bounds new writes only.
+pub(crate) fn validate_capacity(capacity: u32) -> Result<(), EngineError> {
+    if capacity == 0 {
+        return Err(EngineError::LimitExceeded("capacity must be at least 1"));
+    }
+    Ok(())
+}
+
 /// A standalone timestamp (e.g. a hold's expires_at) must sit inside the valid window.
 pub(crate) fn validate_timestamp(ts: Ms) -> Result<(), EngineError> {
     use crate::limits::*;
