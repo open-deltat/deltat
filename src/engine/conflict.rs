@@ -130,7 +130,10 @@ pub(crate) fn check_batch_capacity(
     }
     allocs.sort_by_key(|s| s.start);
 
-    if !compute_saturated_spans(&allocs, rs.capacity + 1).is_empty() {
+    // Saturating: capacity is untrusted, and u32::MAX + 1 would panic under overflow-checks.
+    // At the saturated value the threshold is unreachable (alloc counts are batch-bounded), so
+    // a u32::MAX-capacity resource correctly never rejects on concurrency.
+    if !compute_saturated_spans(&allocs, rs.capacity.saturating_add(1)).is_empty() {
         return Err(EngineError::CapacityExceeded(rs.capacity));
     }
     Ok(())

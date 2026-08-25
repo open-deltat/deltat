@@ -2596,6 +2596,27 @@ async fn batch_capacity_accounts_for_committed_load() {
 }
 
 #[tokio::test]
+async fn batch_capacity_u32_max_does_not_overflow() {
+    // Capacity is untrusted (parse_u32 accepts 4294967295). The batch check computes
+    // capacity + 1; with overflow-checks on, a plain `+` panics the connection task on a
+    // capacity-u32::MAX resource. Such a capacity can never saturate, so the batch must commit.
+    let path = test_wal_path("batch_cap_u32_max.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, u32::MAX, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(0, 10000), false).await.unwrap();
+
+    let batch: Vec<_> = (0..2)
+        .map(|_| (Ulid::new(), rid, Span::new(1000, 2000), None))
+        .collect();
+    engine.batch_confirm_bookings(batch).await.unwrap();
+
+    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn sync_stable_unit_multi_night_availability() {
     // SYNC-01: a capacity-2 pool = 2 interchangeable rooms. Two overlapping multi-night stays
     // saturate the middle night; a longer stay spanning it would require switching rooms, so it
