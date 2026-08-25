@@ -346,7 +346,7 @@ impl DeltaTHandler {
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
             Command::SelectResources { parent_id } => {
-                let all = engine.list_resources();
+                let all = engine.list_resources().await;
                 let filtered: Vec<_> = match parent_id {
                     None => all,
                     Some(None) => all.into_iter().filter(|r| r.parent_id.is_none()).collect(),

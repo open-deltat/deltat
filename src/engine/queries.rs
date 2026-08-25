@@ -226,19 +226,23 @@ impl Engine {
         Ok(merged)
     }
 
-    pub fn list_resources(&self) -> Vec<ResourceInfo> {
+    /// Await each resource's read lock like the sibling readers: writers hold their guard across
+    /// the WAL fsync, so a try_read here silently dropped rows under ordinary write load, and a
+    /// caller cannot tell a dropped row from a deleted resource. Locks are taken one at a time
+    /// (never nested), so this cannot deadlock with sorted batch acquisition.
+    pub async fn list_resources(&self) -> Vec<ResourceInfo> {
         let mut result = Vec::new();
         for rid in self.store.resource_ids() {
-            if let Some(rs) = self.store.get_resource(&rid)
-                && let Ok(guard) = rs.try_read() {
-                    result.push(ResourceInfo {
-                        id: guard.id,
-                        parent_id: guard.parent_id,
-                        name: guard.name.clone(),
-                        capacity: guard.capacity,
-                        buffer_after: guard.buffer_after,
-                    });
-                }
+            if let Some(rs) = self.store.get_resource(&rid) {
+                let guard = rs.read().await;
+                result.push(ResourceInfo {
+                    id: guard.id,
+                    parent_id: guard.parent_id,
+                    name: guard.name.clone(),
+                    capacity: guard.capacity,
+                    buffer_after: guard.buffer_after,
+                });
+            }
         }
         result
     }

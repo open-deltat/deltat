@@ -834,6 +834,7 @@ async fn engine_batch_create_resources_creates_all_with_intra_batch_parent() {
     assert!(engine.get_resource(&parent).is_some());
     let children = engine
         .list_resources()
+        .await
         .into_iter()
         .filter(|r| r.parent_id == Some(parent))
         .count();
@@ -3912,7 +3913,7 @@ async fn list_resources_returns_all() {
     engine.create_resource(a, None, Some("Room A".into()), 2, Some(30 * M)).await.unwrap();
     engine.create_resource(b, Some(a), Some("Seat B".into()), 1, None).await.unwrap();
 
-    let mut resources = engine.list_resources();
+    let mut resources = engine.list_resources().await;
     resources.sort_by_key(|r| r.id);
 
     assert_eq!(resources.len(), 2);
@@ -3932,7 +3933,37 @@ async fn list_resources_empty() {
     let path = test_wal_path("list_resources_empty.wal");
     let notify = Arc::new(NotifyHub::new());
     let engine = Engine::new(path, notify).unwrap();
-    assert!(engine.list_resources().is_empty());
+    assert!(engine.list_resources().await.is_empty());
+}
+
+#[tokio::test]
+async fn list_resources_waits_for_a_locked_resource() {
+    // Every mutation holds its resource write guard across the awaited WAL fsync, so under
+    // ordinary write load SELECT * FROM resources races held locks constantly. A listing that
+    // try_reads and skips silently returns an incomplete result with a success status, which a
+    // caller cannot distinguish from the resource not existing. The listing must wait like the
+    // sibling readers (get_rules/get_bookings/get_holds) do.
+    use std::time::Duration;
+
+    let path = test_wal_path("list_resources_locked.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path, notify).unwrap());
+
+    let a = Ulid::new();
+    let b = Ulid::new();
+    engine.create_resource(a, None, None, 1, None).await.unwrap();
+    engine.create_resource(b, None, None, 1, None).await.unwrap();
+
+    let guard = engine.get_resource(&b).unwrap().write_owned().await;
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(guard);
+    });
+
+    let resources = engine.list_resources().await;
+    releaser.await.unwrap();
+
+    assert_eq!(resources.len(), 2, "a locked resource must not vanish from the listing");
 }
 
 #[tokio::test]
@@ -4045,7 +4076,7 @@ async fn update_resource_changes_fields() {
 
     engine.update_resource(rid, Some(Some("New Name".into())), Some(3), Some(Some(15 * M))).await.unwrap();
 
-    let resources = engine.list_resources();
+    let resources = engine.list_resources().await;
     let r = resources.iter().find(|r| r.id == rid).unwrap();
     assert_eq!(r.name, Some("New Name".into()));
     assert_eq!(r.capacity, 3);
@@ -4066,7 +4097,7 @@ async fn update_resource_partial_leaves_other_fields_intact() {
     // Only buffer_after is present; name and capacity are absent (None).
     engine.update_resource(rid, None, None, Some(Some(30 * M))).await.unwrap();
 
-    let resources = engine.list_resources();
+    let resources = engine.list_resources().await;
     let r = resources.iter().find(|r| r.id == rid).unwrap();
     assert_eq!(r.name, Some("Room A".into()), "name must be unchanged");
     assert_eq!(r.capacity, 4, "capacity must be unchanged");
@@ -4074,7 +4105,7 @@ async fn update_resource_partial_leaves_other_fields_intact() {
 
     // Setting name to NULL explicitly (Some(None)) clears it, distinct from leaving it absent.
     engine.update_resource(rid, Some(None), None, None).await.unwrap();
-    let resources = engine.list_resources();
+    let resources = engine.list_resources().await;
     let r = resources.iter().find(|r| r.id == rid).unwrap();
     assert_eq!(r.name, None, "explicit SET name = NULL clears the name");
     assert_eq!(r.capacity, 4, "capacity still unchanged");
@@ -4106,7 +4137,7 @@ async fn update_resource_persists_via_wal() {
 
     // Replay from WAL
     let engine2 = Engine::new(path, notify).unwrap();
-    let resources = engine2.list_resources();
+    let resources = engine2.list_resources().await;
     let r = resources.iter().find(|r| r.id == rid).unwrap();
     assert_eq!(r.name, Some("After".into()));
     assert_eq!(r.capacity, 5);
@@ -4213,7 +4244,7 @@ async fn resource_name_preserved_after_create() {
     let rid = Ulid::new();
     engine.create_resource(rid, None, Some("Theater".into()), 1, None).await.unwrap();
 
-    let resources = engine.list_resources();
+    let resources = engine.list_resources().await;
     assert_eq!(resources[0].name, Some("Theater".into()));
 }
 
@@ -4229,7 +4260,7 @@ async fn resource_name_persists_via_wal() {
     }
 
     let engine2 = Engine::new(path, notify).unwrap();
-    let resources = engine2.list_resources();
+    let resources = engine2.list_resources().await;
     let r = resources.iter().find(|r| r.id == rid).unwrap();
     assert_eq!(r.name, Some("Stadium".into()));
     assert_eq!(r.capacity, 50);
@@ -4270,7 +4301,7 @@ async fn compact_wal_preserves_state() {
     engine.confirm_booking(perm_booking, child, Span::new(14 * H, 15 * H), Some("Team Meeting".into())).await.unwrap();
 
     // Snapshot pre-compact state
-    let resources_before = engine.list_resources();
+    let resources_before = engine.list_resources().await;
     let rules_before = engine.get_rules(child).await.unwrap();
     let bookings_before = engine.get_bookings(child).await.unwrap();
     let avail_before = engine.compute_availability(child, 0, 24 * H, None).await.unwrap();
@@ -4286,7 +4317,7 @@ async fn compact_wal_preserves_state() {
     assert!(size_after < size_before, "compacted WAL ({size_after}) should be smaller than original ({size_before})");
 
     // State should be identical
-    let resources_after = engine.list_resources();
+    let resources_after = engine.list_resources().await;
     assert_eq!(resources_before.len(), resources_after.len());
 
     let rules_after = engine.get_rules(child).await.unwrap();
@@ -4336,7 +4367,7 @@ async fn compact_wal_survives_restart() {
     // Restart from compacted WAL
     let engine2 = Engine::new(path, notify).unwrap();
 
-    let resources = engine2.list_resources();
+    let resources = engine2.list_resources().await;
     assert_eq!(resources.len(), 2);
     let gym = resources.iter().find(|r| r.id == parent).unwrap();
     assert_eq!(gym.name, Some("Gym".into()));
@@ -4377,11 +4408,11 @@ async fn group_commit_batches_appends() {
         h.await.unwrap().unwrap();
     }
 
-    assert_eq!(engine.list_resources().len(), n);
+    assert_eq!(engine.list_resources().await.len(), n);
 
     // Replay WAL from disk, should reconstruct the same N resources
     let engine2 = Engine::new(path, notify).unwrap();
-    assert_eq!(engine2.list_resources().len(), n);
+    assert_eq!(engine2.list_resources().await.len(), n);
 }
 
 #[tokio::test]
@@ -4522,7 +4553,7 @@ async fn update_resource_capacity_zero_rejected() {
     assert!(matches!(result, Err(EngineError::LimitExceeded("capacity must be at least 1"))));
 
     // The rejected update left the stored capacity untouched.
-    let info = engine.list_resources().into_iter().find(|r| r.id == rid).unwrap();
+    let info = engine.list_resources().await.into_iter().find(|r| r.id == rid).unwrap();
     assert_eq!(info.capacity, 2);
 }
 
@@ -5211,7 +5242,7 @@ async fn replay_includes_resource_deleted() {
     assert!(engine2.get_resource(&child).is_none());
     assert!(engine2.get_resource(&parent).is_some());
     // Parent should have no children after replay
-    let resources = engine2.list_resources();
+    let resources = engine2.list_resources().await;
     assert_eq!(resources.len(), 1);
     assert_eq!(resources[0].id, parent);
 }
