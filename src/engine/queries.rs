@@ -22,7 +22,10 @@ impl Engine {
     /// per window let the same instant flip open/closed with the query bounds.
     /// Blocking: ACCUMULATE. All ancestors' blocking rules are collected.
     ///
-    /// Returns `(inherited_non_blocking, inherited_blocking)` clamped to query.
+    /// Returns `(inherited_non_blocking, inherited_blocking, ancestor_has_schedule)`: the rule
+    /// spans clamped to query, plus whether ANY ancestor defines a non-blocking rule anywhere
+    /// (the same state fact the override uses; the T-03 admission check needs it to tell "the
+    /// schedule has no window here" from "no schedule exists").
     ///
     /// The ancestor id chain is snapshotted lock-free from the parent index FIRST, then each
     /// ancestor is read under its own lock one at a time. The caller must NOT hold the queried
@@ -34,7 +37,7 @@ impl Engine {
         resource_id: Ulid,
         parent_id: Option<Ulid>,
         query: &Span,
-    ) -> Result<(Vec<Span>, Vec<Span>), EngineError> {
+    ) -> Result<(Vec<Span>, Vec<Span>, bool), EngineError> {
         // Phase 1: snapshot the ancestor id chain without touching any resource lock.
         let mut chain: Vec<Ulid> = Vec::new();
         let mut visited = HashSet::new();
@@ -92,7 +95,7 @@ impl Engine {
         inherited_non_blocking.sort_by_key(|s| s.start);
         inherited_blocking.sort_by_key(|s| s.start);
 
-        Ok((inherited_non_blocking, inherited_blocking))
+        Ok((inherited_non_blocking, inherited_blocking, found_non_blocking))
     }
 
     pub async fn compute_availability(
@@ -126,7 +129,7 @@ impl Engine {
         // Holding the child guard while awaiting ancestor guards is the ABBA half of a deadlock with
         // batch_confirm_bookings; the parent index makes the walk lock-free (C1).
         let parent_id = self.store.get_parent(&resource_id);
-        let (inherited_non_blocking, inherited_blocking) =
+        let (inherited_non_blocking, inherited_blocking, _) =
             self.collect_inherited_rules(resource_id, parent_id, &query).await?;
 
         let guard = rs.read().await;

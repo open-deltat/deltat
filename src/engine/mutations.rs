@@ -15,8 +15,8 @@ use crate::model::*;
 
 use super::availability::subtract_intervals;
 use super::conflict::{
-    check_batch_capacity, check_no_conflict, check_no_conflict_excluding, validate_buffer,
-    validate_capacity, validate_span, validate_timestamp,
+    check_batch_capacity, check_no_conflict, check_no_conflict_excluding, check_rules_admit,
+    validate_buffer, validate_capacity, validate_span, validate_timestamp,
 };
 use super::{Engine, EngineError, WalCommand};
 
@@ -225,11 +225,18 @@ impl Engine {
         let rs = self
             .get_resource(&resource_id)
             .ok_or(EngineError::NotFound(resource_id))?;
+        // T-03 schedule context, collected BEFORE the write guard (holding it while awaiting
+        // ancestor locks is the ABBA half of a deadlock, C1); own rules are then read under
+        // the guard inside check_rules_admit.
+        let parent_id = self.store.get_parent(&resource_id);
+        let (inherited_nb, inherited_blocking, ancestor_has_schedule) =
+            self.collect_inherited_rules(resource_id, parent_id, &span).await?;
         let mut guard = rs.write().await;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
 
+        check_rules_admit(&guard, &span, &inherited_nb, &inherited_blocking, ancestor_has_schedule)?;
         check_no_conflict(&guard, &span, self.now_ms())?;
 
         // Lower the reaper's earliest-expiry watermark so it will scan once this hold can expire.
@@ -310,11 +317,16 @@ impl Engine {
         let rs = self
             .get_resource(&resource_id)
             .ok_or(EngineError::NotFound(resource_id))?;
+        // T-03 schedule context, collected BEFORE the write guard (C1); see place_hold.
+        let parent_id = self.store.get_parent(&resource_id);
+        let (inherited_nb, inherited_blocking, ancestor_has_schedule) =
+            self.collect_inherited_rules(resource_id, parent_id, &span).await?;
         let mut guard = rs.write().await;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
 
+        check_rules_admit(&guard, &span, &inherited_nb, &inherited_blocking, ancestor_has_schedule)?;
         check_no_conflict(&guard, &span, self.now_ms())?;
 
         let event = Event::BookingConfirmed { id, resource_id, span, label };
@@ -346,6 +358,22 @@ impl Engine {
         resource_ids.sort();
         resource_ids.dedup();
 
+        // T-03 schedule context per resource, collected BEFORE any write guard (C1). The hull
+        // of a resource's member spans bounds its window: every member lies inside it, so the
+        // clamped inherited spans cover each member's admission check.
+        let mut rule_ctx: HashMap<Ulid, (Vec<Span>, Vec<Span>, bool)> = HashMap::new();
+        for rid in &resource_ids {
+            let member_spans = bookings.iter().filter(|(_, r, _, _)| r == rid);
+            let lo = member_spans.clone().map(|(_, _, s, _)| s.start).min();
+            let hi = member_spans.map(|(_, _, s, _)| s.end).max();
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                continue;
+            };
+            let hull = Span::new(lo, hi);
+            let parent_id = self.store.get_parent(rid);
+            rule_ctx.insert(*rid, self.collect_inherited_rules(*rid, parent_id, &hull).await?);
+        }
+
         let mut guards = Vec::with_capacity(resource_ids.len());
         let mut rs_map = HashMap::new();
 
@@ -371,8 +399,10 @@ impl Engine {
 
         for (rid, batch) in &by_resource {
             let guard = &guards[rs_map[rid]];
+            let (inherited_nb, inherited_blocking, ancestor_has_schedule) = &rule_ctx[rid];
 
             for (_, span) in batch {
+                check_rules_admit(guard, span, inherited_nb, inherited_blocking, *ancestor_has_schedule)?;
                 check_no_conflict(guard, span, now)?;
             }
 

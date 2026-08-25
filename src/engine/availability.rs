@@ -26,34 +26,24 @@ pub fn availability(
     let buffer = resource.buffer_after.unwrap_or(0);
     let capacity = resource.capacity;
 
-    // Step 1: Determine base non-blocking spans (using binary search)
-    let mut own_non_blocking: Vec<Span> = Vec::new();
-    let mut own_blocking: Vec<Span> = Vec::new();
-    let mut active_allocs: Vec<Span> = Vec::new();
+    // Steps 1+2: the rule-derived open windows (shared with the T-03 admission check). The
+    // read path opens nothing for an unscheduled chain: it has no windows to enumerate.
+    let (own_non_blocking, own_blocking) = own_rule_spans(resource, query);
+    let base = if resource.has_non_blocking_rule() {
+        own_non_blocking
+    } else {
+        inherited_non_blocking.to_vec()
+    };
+    let mut free = assemble_open_windows(base, own_blocking, inherited_blocking);
 
     // Allocations carry a buffer that extends their effective end, so one ending
     // just before `query.start` can still block the head of the window. Scan a
     // buffer-expanded window (mirrors check_no_conflict) so the read path agrees
-    // with the write path. Rules carry no buffer, so they only count when they
-    // overlap the real query. MIN_VALID_TIMESTAMP_MS is 0, so this stays valid.
+    // with the write path. MIN_VALID_TIMESTAMP_MS is 0, so this stays valid.
     let scan = Span::new(query.start.saturating_sub(buffer).max(0), query.end);
-
+    let mut active_allocs: Vec<Span> = Vec::new();
     for interval in resource.overlapping(&scan) {
         match &interval.kind {
-            IntervalKind::NonBlocking | IntervalKind::Blocking => {
-                if interval.span.end <= query.start {
-                    continue; // entirely before the window, rules have no buffer
-                }
-                let clamped = Span::new(
-                    interval.span.start.max(query.start),
-                    interval.span.end.min(query.end),
-                );
-                if matches!(interval.kind, IntervalKind::NonBlocking) {
-                    own_non_blocking.push(clamped);
-                } else {
-                    own_blocking.push(clamped);
-                }
-            }
             IntervalKind::Hold { expires_at } if *expires_at > now => {
                 let effective_end = interval.span.end.saturating_add(buffer);
                 if effective_end > query.start {
@@ -66,26 +56,8 @@ pub fn availability(
                     active_allocs.push(Span::new(interval.span.start, effective_end));
                 }
             }
-            _ => {} // expired hold
+            _ => {} // rules (handled above), expired holds
         }
-    }
-
-    let mut free = if resource.has_non_blocking_rule() {
-        own_non_blocking
-    } else {
-        inherited_non_blocking.to_vec()
-    };
-
-    free.sort_by_key(|s| s.start);
-    free = merge_overlapping(&free);
-
-    // Step 2: Collect ALL blocking rules (own + inherited)
-    let mut blocked = own_blocking;
-    blocked.extend_from_slice(inherited_blocking);
-    blocked.sort_by_key(|s| s.start);
-
-    if !blocked.is_empty() {
-        free = subtract_intervals(&free, &blocked);
     }
 
     // Step 3: Subtract active allocations (with capacity awareness)
@@ -102,6 +74,50 @@ pub fn availability(
     }
 
     free
+}
+
+/// The resource's own non-blocking and blocking rule spans overlapping `query`, clamped to it.
+/// Rules carry no buffer, so a plain overlap scan is exact. Shared by the read path and the
+/// T-03 admission check so rule collection cannot drift between the two.
+pub(crate) fn own_rule_spans(resource: &ResourceState, query: &Span) -> (Vec<Span>, Vec<Span>) {
+    let mut non_blocking = Vec::new();
+    let mut blocking = Vec::new();
+    for interval in resource.overlapping(query) {
+        match interval.kind {
+            IntervalKind::NonBlocking | IntervalKind::Blocking => {
+                let clamped = Span::new(
+                    interval.span.start.max(query.start),
+                    interval.span.end.min(query.end),
+                );
+                if matches!(interval.kind, IntervalKind::NonBlocking) {
+                    non_blocking.push(clamped);
+                } else {
+                    blocking.push(clamped);
+                }
+            }
+            _ => {}
+        }
+    }
+    (non_blocking, blocking)
+}
+
+/// Assemble the effective open windows from a base schedule and the blocking spans (own +
+/// inherited): sort and merge the base, then subtract every blocking window. The other half of
+/// the read/admission sharing (see `own_rule_spans`).
+pub(crate) fn assemble_open_windows(
+    mut base: Vec<Span>,
+    own_blocking: Vec<Span>,
+    inherited_blocking: &[Span],
+) -> Vec<Span> {
+    base.sort_by_key(|s| s.start);
+    let mut open = merge_overlapping(&base);
+    let mut blocked = own_blocking;
+    blocked.extend_from_slice(inherited_blocking);
+    blocked.sort_by_key(|s| s.start);
+    if !blocked.is_empty() {
+        open = subtract_intervals(&open, &blocked);
+    }
+    open
 }
 
 /// Merge sorted overlapping/adjacent intervals into disjoint intervals.

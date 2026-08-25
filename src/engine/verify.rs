@@ -1,14 +1,14 @@
 //! Cross-path verification (TEST-01 family): the read path and the write path
 //! must agree, and each must match an independent brute-force reference.
 //!
-//! `availability()` (read) tells a client what is bookable; `check_no_conflict()`
-//! (write) decides whether a booking is accepted. If they disagree, a client is
-//! shown a free slot it cannot book (or vice versa). GAP-12 was exactly such a
-//! disagreement on the buffer dimension; these properties regression-lock the
-//! contract across thousands of generated states.
+//! `availability()` (read) tells a client what is bookable; admission (rules +
+//! allocation conflict) decides whether a booking is accepted. If they disagree,
+//! a client is shown a free slot it cannot book (or vice versa). GAP-12 was such
+//! a disagreement on the buffer dimension and T-03 on the rule dimension; these
+//! properties regression-lock the contract across thousands of generated states.
 
 use super::availability::availability;
-use super::conflict::check_no_conflict;
+use super::conflict::{check_no_conflict, check_rules_admit};
 use crate::model::*;
 use proptest::prelude::*;
 
@@ -74,6 +74,16 @@ fn span_strategy() -> impl Strategy<Value = Span> {
 }
 
 fn build(allocs: &[GenAlloc], capacity: u32, buffer: Ms, open_window: Option<Span>) -> ResourceState {
+    build_with_rules(allocs, capacity, buffer, open_window, &[])
+}
+
+fn build_with_rules(
+    allocs: &[GenAlloc],
+    capacity: u32,
+    buffer: Ms,
+    open_window: Option<Span>,
+    blocking: &[Span],
+) -> ResourceState {
     let mut rs = ResourceState::new(ulid::Ulid::new(), None, None, capacity, Some(buffer));
     if let Some(w) = open_window {
         rs.insert_interval(Interval {
@@ -82,45 +92,70 @@ fn build(allocs: &[GenAlloc], capacity: u32, buffer: Ms, open_window: Option<Spa
             kind: IntervalKind::NonBlocking,
         });
     }
+    for b in blocking {
+        rs.insert_interval(Interval {
+            id: ulid::Ulid::new(),
+            span: *b,
+            kind: IntervalKind::Blocking,
+        });
+    }
     for a in allocs {
         rs.insert_interval(a.to_interval());
     }
     rs
 }
 
+/// Open windows biased wide (so probes regularly land inside) but never whole-range only,
+/// so the closed edges are exercised too.
+fn open_window_strategy() -> impl Strategy<Value = Span> {
+    (0i64..RANGE - 1, 8i64..=RANGE).prop_map(|(start, len)| Span::new(start, (start + len).min(RANGE)))
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
 
-    /// The read path and the write path agree on the allocation/capacity/buffer
-    /// dimension. The whole window is open (one non-blocking rule), so the only
-    /// thing that can close an instant is allocation pressure, which both paths
-    /// must compute identically. (The blocking-rule read/write disagreement is
-    /// the separate, still-open T-03, deliberately excluded by generating no
-    /// blocking rules here.)
-    ///
-    /// Buffer is SYMMETRIC (B1): a booking occupies its span PLUS its own turnaround
-    /// `[t, t + 1 + buffer)`, so it is bookable iff that whole footprint is free in the
-    /// read view, not just its raw span. Only probes whose footprint stays inside the
-    /// computed window are asserted, so availability (computed over `[0, RANGE)`) covers it.
+    /// The read path and the write path agree across the RULE dimension (T-03, closed) and the
+    /// allocation/capacity/buffer dimension. States carry a partial open window, blocking rules,
+    /// and allocations; admission = rules (raw span inside the open windows) + allocation
+    /// conflict (symmetric buffered footprint, B1). Two directions:
+    ///  - ACCEPTED probes read free over their whole raw span (a write availability reports as
+    ///    unavailable, rule-blocked included, is never admitted);
+    ///  - probes whose whole buffered footprint reads free are ACCEPTED (no phantom conflicts).
+    /// Between the two sits exactly the documented buffer exemption: a probe whose raw span is
+    /// open but whose turnaround tail leaves the open windows is admitted although the tail
+    /// reads closed (cleanup may run outside open hours).
     #[test]
     fn read_path_agrees_with_write_path(
         allocs in prop::collection::vec(alloc_strategy(), 0..10),
         capacity in 1u32..=3,
         buffer in 0i64..=8,
+        open in open_window_strategy(),
+        blocking in prop::collection::vec(span_strategy(), 0..3),
     ) {
         let query = Span::new(0, RANGE);
-        let rs = build(&allocs, capacity, buffer, Some(query));
+        let rs = build_with_rules(&allocs, capacity, buffer, Some(open), &blocking);
 
         let free = availability(&rs, &query, &[], &[], NOW);
         let last = (RANGE - buffer).max(0);
         for t in 0..last {
-            let write_ok = check_no_conflict(&rs, &Span::new(t, t + 1), NOW).is_ok();
-            let footprint_free = (t..t + 1 + buffer).all(|u| free.iter().any(|s| s.contains_instant(u)));
-            prop_assert_eq!(
-                write_ok, footprint_free,
-                "read/write disagree at t={}: buffered footprint free={}, conflict-check says bookable={}",
-                t, footprint_free, write_ok
-            );
+            let probe = Span::new(t, t + 1);
+            let write_ok = check_rules_admit(&rs, &probe, &[], &[], false).is_ok()
+                && check_no_conflict(&rs, &probe, NOW).is_ok();
+            let raw_free = free.iter().any(|s| s.contains_instant(t));
+            let footprint_free =
+                (t..t + 1 + buffer).all(|u| free.iter().any(|s| s.contains_instant(u)));
+            if write_ok {
+                prop_assert!(
+                    raw_free,
+                    "admitted a probe the read path reports unavailable at t={}", t
+                );
+            }
+            if footprint_free {
+                prop_assert!(
+                    write_ok,
+                    "rejected a probe whose whole buffered footprint reads free at t={}", t
+                );
+            }
         }
     }
 
