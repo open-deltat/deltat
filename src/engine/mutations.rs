@@ -555,13 +555,18 @@ impl Engine {
                 Err(_) => continue,
             };
 
+            // An allocation blocks [start, end + buffer_after) on both the read and the write
+            // path, so dominance is decided on the buffered end: collecting on the raw end
+            // while the turnaround tail still reaches past `now` would silently open time that
+            // admission was rejecting (INV-02). Applied to holds too so the dominance rule
+            // stays uniform; an expired hold's tail blocks nothing, the cost is only retention.
+            let buffer = guard.buffer_after.unwrap_or(0);
             let mut removed_ids = Vec::new();
             guard.intervals.retain(|interval| {
+                let buffered_end = interval.span.end.saturating_add(buffer);
                 let dominated = match &interval.kind {
-                    IntervalKind::Booking { .. } => interval.span.end < cutoff,
-                    IntervalKind::Hold { expires_at } => {
-                        *expires_at <= now && interval.span.end < cutoff
-                    }
+                    IntervalKind::Booking { .. } => buffered_end < cutoff,
+                    IntervalKind::Hold { expires_at } => *expires_at <= now && buffered_end < cutoff,
                     IntervalKind::NonBlocking | IntervalKind::Blocking => false,
                 };
                 if dominated {

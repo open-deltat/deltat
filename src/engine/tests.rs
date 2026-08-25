@@ -4968,6 +4968,43 @@ async fn gc_keeps_future_bookings() {
 }
 
 #[tokio::test]
+async fn gc_keeps_booking_whose_buffer_tail_blocks_the_present() {
+    // A booking occupies [start, end + buffer_after) on both the read and the write path, so its
+    // blocking effect can outlive its raw span by up to the buffer. GC that tests only span.end
+    // against the cutoff collects it while the turnaround window is still active, silently
+    // opening time that admission rejected a moment earlier.
+    let path = test_wal_path("gc_buffer_tail.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    // Turnaround buffer of 24000ms, far larger than the 5000ms retention.
+    engine.create_resource(rid, None, None, 1, Some(24000)).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(1000, 50000), false).await.unwrap();
+
+    let bid = Ulid::new();
+    engine.confirm_booking(bid, rid, Span::new(1000, 2000), None).await.unwrap();
+
+    // A booking inside the turnaround window [2000, 26000) is rejected before GC runs.
+    let probe = Span::new(20000, 21000);
+    assert!(engine.confirm_booking(Ulid::new(), rid, probe, None).await.is_err());
+
+    // now=10000, retention=5000 → cutoff=5000. Raw end 2000 < 5000, but the buffered end
+    // 26000 still blocks the present: the booking must survive.
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 0, "booking with a live buffer tail was collected");
+
+    // The turnaround invariant holds across GC: the same probe is still rejected.
+    assert!(
+        engine.confirm_booking(Ulid::new(), rid, probe, None).await.is_err(),
+        "GC opened the still-active turnaround window"
+    );
+
+    // Once the buffered end passes the cutoff too, the booking is collectable.
+    let collected = engine.gc_past_intervals(32000, 5000);
+    assert_eq!(collected, 1);
+}
+
+#[tokio::test]
 async fn gc_keeps_rules() {
     let path = test_wal_path("gc_keeps_rules.wal");
     let notify = Arc::new(NotifyHub::new());
