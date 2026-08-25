@@ -34,6 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .filter(|v| *v >= 0) // a negative retention would push the GC cutoff into the future
         .unwrap_or(604_800_000); // 7 days
+    let max_hold_ttl_ms: i64 = std::env::var("DELTAT_MAX_HOLD_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v| *v >= 0) // a negative ceiling would clamp every hold into the past
+        .unwrap_or(deltat::limits::DEFAULT_MAX_HOLD_TTL_MS);
     // Post-auth connection lifetime guards (0 = disabled, the default; long-lived LISTEN is a
     // legitimate product use). A public deployment sets these to bound idle/squatting streams.
     let max_conn_age_ms: u64 = std::env::var("DELTAT_MAX_CONN_AGE_MS")
@@ -53,7 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure data directory exists
     std::fs::create_dir_all(&data_dir)?;
 
-    let tenant_manager = Arc::new(TenantManager::new(PathBuf::from(&data_dir), compact_threshold, gc_retention_ms));
+    let tenant_manager = Arc::new(
+        TenantManager::new(PathBuf::from(&data_dir), compact_threshold, gc_retention_ms)
+            .with_max_hold_ttl(max_hold_ttl_ms),
+    );
     let semaphore = Arc::new(Semaphore::new(max_connections));
 
     let addr = format!("{bind}:{port}");

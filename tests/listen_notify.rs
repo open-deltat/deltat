@@ -1039,3 +1039,38 @@ async fn commit_hold_on_released_hold_errors_via_simple_query() {
         .await;
     assert!(result.is_err(), "committing a released hold must error, not silently succeed");
 }
+
+// ── Hold expiry authority (AVAIL-08) over the wire ───────────────
+
+#[tokio::test]
+async fn hold_expiry_is_clamped_over_wire() {
+    // A hold requesting a year-3000 expiry must come back with a server-clamped expires_at,
+    // not the requested value: otherwise the span is squatted forever (the reaper only
+    // releases holds whose expiry has passed).
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let rid = Ulid::new();
+    let hid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+    let requested: i64 = 32_503_680_000_000; // year 3000, the validation maximum
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {requested})"#
+        ))
+        .await
+        .unwrap();
+
+    let rows = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+    assert_eq!(rows.len(), 1);
+    let stored: i64 = rows[0].1.parse().unwrap();
+    let now = client_now_ms();
+    assert!(
+        stored < requested && stored <= now + 3_600_000,
+        "expires_at must be server-clamped (default max TTL 1h), got {stored}"
+    );
+    assert!(stored > now, "the clamped hold must still be live");
+}

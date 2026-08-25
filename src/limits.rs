@@ -9,6 +9,10 @@ pub const MAX_QUERY_WINDOW_MS: i64 = 90 * 86_400_000; // 90 days
 pub const MAX_SPAN_DURATION_MS: i64 = 3650 * 86_400_000; // ~10 years
 pub const MIN_VALID_TIMESTAMP_MS: i64 = 0; // epoch
 pub const MAX_VALID_TIMESTAMP_MS: i64 = 32_503_680_000_000; // year 3000
+/// Ceiling on how far past the server's own clock a hold may expire (AVAIL-08). `place_hold`
+/// clamps the client-requested `expires_at` to `now + this`; `DELTAT_MAX_HOLD_TTL_MS` overrides
+/// it at startup.
+pub const DEFAULT_MAX_HOLD_TTL_MS: i64 = 3_600_000; // 1 hour
 pub const MAX_BATCH_SIZE: usize = 1_000;
 #[cfg(not(test))]
 pub const MAX_IN_CLAUSE_IDS: usize = 1_000;

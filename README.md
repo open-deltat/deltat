@@ -125,7 +125,9 @@ DELETE FROM bookings WHERE id = '01J...';
 
 ### Holds
 
-Temporary segments that auto-expire.
+Temporary segments that auto-expire. `expires_at` is a request: the server clamps it to its own
+clock plus `DELTAT_MAX_HOLD_TTL_MS` (default 1 hour), so a skewed client clock can never squat a
+span indefinitely. Read the hold back with `SELECT * FROM holds` to see the effective expiry.
 
 ```sql
 -- Hold for 15 minutes
@@ -197,6 +199,7 @@ All times are **Unix milliseconds**. Intervals are half-open `[start, end)`, so 
 | `DELTAT_MAX_CONNECTIONS` | `256` | Concurrent connection cap |
 | `DELTAT_COMPACT_THRESHOLD` | `1000` | WAL appends before a compaction runs |
 | `DELTAT_GC_RETENTION_MS` | `604800000` | Age (7 days) past which finished bookings and expired holds are collected |
+| `DELTAT_MAX_HOLD_TTL_MS` | `3600000` | Ceiling (1 hour) on hold lifetime: a hold's requested `expires_at` is clamped to server now + this |
 | `DELTAT_METRICS_PORT` | unset | Prometheus `/metrics` port; metrics are off when unset |
 | `DELTAT_TLS_CERT` | unset | PEM certificate path; TLS is off unless both cert and key are set |
 | `DELTAT_TLS_KEY` | unset | PEM private key path; TLS is off unless both cert and key are set |

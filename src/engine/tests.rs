@@ -5845,3 +5845,134 @@ async fn concurrent_ancestor_walk_and_batch_do_not_deadlock() {
         "ancestor walk and batch deadlocked"
     );
 }
+
+// ══════════════════════════════════════════════════════════════
+// Hold expiry authority (AVAIL-08): the server clock clamps client expiry
+// ══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn place_hold_clamps_far_future_expiry_to_default_cap() {
+    // A client-supplied expires_at is a request, not an assignment: the server clamps it to
+    // now + the max hold TTL so a skewed or hostile clock can never squat a span until year 3000.
+    let path = test_wal_path("clamp_default_cap.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    engine
+        .place_hold(Ulid::new(), rid, Span::new(1000, 2000), MAX_VALID_TIMESTAMP_MS)
+        .await
+        .unwrap();
+
+    let holds = engine.get_holds(rid).await.unwrap();
+    assert_eq!(holds.len(), 1);
+    assert!(
+        holds[0].expires_at <= now_ms() + 3_600_000,
+        "expiry must be clamped to now + the default max hold TTL, got {}",
+        holds[0].expires_at
+    );
+    assert!(holds[0].expires_at > now_ms(), "the clamped hold must still be live");
+}
+
+#[tokio::test]
+async fn place_hold_clamp_uses_injected_clock_and_configured_cap() {
+    // Deterministic clamp: with a TestClock at T and a 60s cap, any request past T + 60_000
+    // stores exactly T + 60_000. The server clock, not the client's, decides the ceiling.
+    let path = test_wal_path("clamp_configured_cap.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let engine = Engine::with_clock(path, notify, clock).unwrap().with_max_hold_ttl(60_000);
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    engine
+        .place_hold(Ulid::new(), rid, Span::new(1000, 2000), 999_999_999_999)
+        .await
+        .unwrap();
+
+    let holds = engine.get_holds(rid).await.unwrap();
+    assert_eq!(holds[0].expires_at, 1_060_000);
+}
+
+#[tokio::test]
+async fn place_hold_within_cap_keeps_requested_expiry() {
+    // The clamp is a ceiling, not an assignment: a request under now + cap is stored verbatim,
+    // so short checkout holds keep their exact client-chosen expiry.
+    let path = test_wal_path("clamp_within_cap.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let engine = Engine::with_clock(path, notify, clock).unwrap().with_max_hold_ttl(60_000);
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    engine.place_hold(Ulid::new(), rid, Span::new(1000, 2000), 1_030_000).await.unwrap();
+
+    let holds = engine.get_holds(rid).await.unwrap();
+    assert_eq!(holds[0].expires_at, 1_030_000);
+}
+
+#[tokio::test]
+async fn place_hold_still_rejects_out_of_range_expiry() {
+    // Input validation is unchanged by the clamp: an absurd timestamp past year 3000 is still
+    // rejected outright rather than silently clamped into acceptance.
+    let path = test_wal_path("clamp_still_validates.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    let result = engine
+        .place_hold(Ulid::new(), rid, Span::new(1000, 2000), MAX_VALID_TIMESTAMP_MS + 1)
+        .await;
+    assert!(matches!(result, Err(EngineError::LimitExceeded("timestamp out of range"))));
+}
+
+#[tokio::test]
+async fn clamped_hold_expiry_survives_replay_verbatim() {
+    // Replay applies HoldPlaced events as durably written: the clamped expiry is replayed
+    // verbatim, never re-clamped against the (later) clock or a different configured cap.
+    let path = test_wal_path("clamp_replay.wal");
+    let rid = Ulid::new();
+    {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let engine = Engine::with_clock(path.clone(), Arc::new(NotifyHub::new()), clock)
+            .unwrap()
+            .with_max_hold_ttl(60_000);
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+        engine
+            .place_hold(Ulid::new(), rid, Span::new(1000, 2000), 999_999_999_999)
+            .await
+            .unwrap();
+        assert_eq!(engine.get_holds(rid).await.unwrap()[0].expires_at, 1_060_000);
+    }
+
+    let clock = Arc::new(TestClock::new(5_000_000));
+    let engine = Engine::with_clock(path, Arc::new(NotifyHub::new()), clock)
+        .unwrap()
+        .with_max_hold_ttl(1);
+    let holds = engine.get_holds(rid).await.unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].expires_at, 1_060_000);
+}
+
+#[tokio::test]
+async fn formerly_unreapable_hold_expires_once_the_cap_passes() {
+    // The point of the whole fix: a hold that requested a year-3000 expiry used to be
+    // unreapable forever; clamped, the reaper collects it as soon as now passes the cap.
+    let path = test_wal_path("clamp_reapable.wal");
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let engine = Engine::with_clock(path, Arc::new(NotifyHub::new()), clock.clone())
+        .unwrap()
+        .with_max_hold_ttl(60_000);
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    let hid = Ulid::new();
+    engine.place_hold(hid, rid, Span::new(1000, 2000), MAX_VALID_TIMESTAMP_MS).await.unwrap();
+
+    assert!(engine.collect_expired_holds(engine.now_ms()).is_empty(), "still live under the cap");
+
+    clock.advance(60_001);
+    let due = engine.collect_expired_holds(engine.now_ms());
+    assert_eq!(due, vec![(hid, rid)]);
+}

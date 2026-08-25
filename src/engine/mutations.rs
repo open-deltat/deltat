@@ -209,6 +209,11 @@ impl Engine {
     ) -> Result<(), EngineError> {
         validate_span(&span)?;
         validate_timestamp(expires_at)?;
+        // AVAIL-08: the server clock is the expiry authority. The client's expires_at is a
+        // request; clamping it to now + max_hold_ttl_ms means a skewed or hostile client clock
+        // can never park a hold beyond the operator's ceiling (the reaper only releases holds
+        // whose expiry has passed, so an uncapped far-future hold would squat its span forever).
+        let expires_at = expires_at.min(self.now_ms().saturating_add(self.max_hold_ttl_ms));
         let rs = self
             .get_resource(&resource_id)
             .ok_or(EngineError::NotFound(resource_id))?;

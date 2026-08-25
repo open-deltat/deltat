@@ -21,6 +21,7 @@ pub struct TenantManager {
     data_dir: PathBuf,
     compact_threshold: u64,
     gc_retention_ms: i64,
+    max_hold_ttl_ms: i64,
 }
 
 impl TenantManager {
@@ -30,7 +31,14 @@ impl TenantManager {
             data_dir,
             compact_threshold,
             gc_retention_ms,
+            max_hold_ttl_ms: DEFAULT_MAX_HOLD_TTL_MS,
         }
+    }
+
+    /// Override the hold-lifetime ceiling every tenant engine is created with (AVAIL-08).
+    pub fn with_max_hold_ttl(mut self, max_hold_ttl_ms: i64) -> Self {
+        self.max_hold_ttl_ms = max_hold_ttl_ms;
+        self
     }
 
     /// Get or lazily create an engine for the given tenant.
@@ -69,7 +77,8 @@ impl TenantManager {
             Entry::Vacant(e) => {
                 let wal_path = self.data_dir.join(format!("{safe_name}.wal"));
                 let notify = Arc::new(NotifyHub::new());
-                let engine = Arc::new(Engine::new(wal_path, notify)?);
+                let engine =
+                    Arc::new(Engine::new(wal_path, notify)?.with_max_hold_ttl(self.max_hold_ttl_ms));
 
                 // Spawn reaper + compactor + GC for this tenant
                 let reaper_engine = engine.clone();

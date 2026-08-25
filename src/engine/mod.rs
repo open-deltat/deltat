@@ -267,6 +267,9 @@ pub struct Engine {
     /// publishes its recomputed (higher) watermark if it is unchanged afterwards, otherwise a
     /// concurrent placement lowered the watermark and must not be clobbered.
     pub(super) hold_generation: std::sync::atomic::AtomicU64,
+    /// Ceiling on hold lifetime (AVAIL-08): `place_hold` clamps the requested `expires_at` to
+    /// `now + this`, making the server clock the expiry authority.
+    max_hold_ttl_ms: Ms,
     /// Serializes `compact_wal` so the writer sees strictly paired CompactBegin/Compact commands.
     /// The compactor and GC tasks both trigger compaction; interleaved pairs would clobber the
     /// recording and could swap a stale snapshot over a newer one.
@@ -298,6 +301,7 @@ impl Engine {
             clock,
             earliest_hold_expiry: std::sync::atomic::AtomicI64::new(i64::MIN),
             hold_generation: std::sync::atomic::AtomicU64::new(0),
+            max_hold_ttl_ms: crate::limits::DEFAULT_MAX_HOLD_TTL_MS,
             compact_lock: tokio::sync::Mutex::new(()),
         };
 
@@ -334,6 +338,13 @@ impl Engine {
         }
 
         Ok(engine)
+    }
+
+    /// Override the hold-lifetime ceiling (AVAIL-08). Applies to future `place_hold` calls only;
+    /// replayed events keep the expiry they were durably written with.
+    pub fn with_max_hold_ttl(mut self, max_hold_ttl_ms: Ms) -> Self {
+        self.max_hold_ttl_ms = max_hold_ttl_ms;
+        self
     }
 
     /// Write event to WAL via the background group-commit writer.
