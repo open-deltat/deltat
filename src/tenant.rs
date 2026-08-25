@@ -128,7 +128,7 @@ mod tests {
     use crate::model::*;
 
     fn test_data_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("deltat_test_tenant").join(name);
+        let dir = std::env::temp_dir().join(format!("deltat_test_tenant_{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -273,5 +273,16 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("too many tenants"));
+    }
+
+    #[test]
+    fn test_data_dir_dir_is_namespaced_per_process() {
+        // Two cargo test processes sharing one dir delete and replay each other's files.
+        let path = test_data_dir("pid_probe");
+        let dir = path.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            dir.contains(&std::process::id().to_string()),
+            "tenant test dir {dir} is shared across processes"
+        );
     }
 }

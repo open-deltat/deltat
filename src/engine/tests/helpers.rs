@@ -48,9 +48,20 @@ pub(crate) fn hold(start: Ms, end: Ms, expires_at: Ms) -> Interval {
 }
 
 pub(crate) fn test_wal_path(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("deltat_test_engine");
+    let dir = std::env::temp_dir().join(format!("deltat_test_engine_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     let _ = std::fs::remove_file(&path);
     path
+}
+
+#[test]
+fn test_wal_path_dir_is_namespaced_per_process() {
+    // Two cargo test processes sharing one dir delete and replay each other's WAL files.
+    let path = test_wal_path("pid_probe.wal");
+    let dir = path.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        dir.contains(&std::process::id().to_string()),
+        "engine test WAL dir {dir} is shared across processes"
+    );
 }
