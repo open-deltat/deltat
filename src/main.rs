@@ -20,7 +20,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = std::env::var("DELTAT_PORT").unwrap_or_else(|_| "5433".into());
     let bind = std::env::var("DELTAT_BIND").unwrap_or_else(|_| "0.0.0.0".into());
     let data_dir = std::env::var("DELTAT_DATA_DIR").unwrap_or_else(|_| "./data".into());
-    let password = std::env::var("DELTAT_PASSWORD").unwrap_or_else(|_| "deltat".into());
+    let password = match deltat::auth::resolve_password(std::env::var("DELTAT_PASSWORD").ok()) {
+        deltat::auth::ServerPassword::Configured(p) => p,
+        deltat::auth::ServerPassword::Generated(p) => {
+            // Printed to stdout exactly once so the quickstart works without shipping the old
+            // known default "deltat". Set DELTAT_PASSWORD to skip this.
+            println!("----------------------------------------------------------------");
+            println!("  DELTAT_PASSWORD is not set. Generated a random password:");
+            println!();
+            println!("      {p}");
+            println!();
+            println!("  It changes on every restart and is not shown again.");
+            println!("  Set DELTAT_PASSWORD to use a stable password.");
+            println!("----------------------------------------------------------------");
+            p
+        }
+    };
+    // Optional per-tenant credentials: tenants listed here accept only their own password.
+    // Malformed input is a startup error, never a silently weaker auth config.
+    let tenant_passwords = match std::env::var("DELTAT_TENANT_PASSWORDS") {
+        Ok(raw) => deltat::auth::parse_tenant_passwords(&raw)
+            .map_err(|e| format!("invalid DELTAT_TENANT_PASSWORDS: {e}"))?,
+        Err(_) => std::collections::HashMap::new(),
+    };
+    let auth_source = Arc::new(deltat::auth::DeltaTAuthSource::with_tenant_passwords(
+        password,
+        tenant_passwords,
+    ));
     let max_connections: usize = std::env::var("DELTAT_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -117,12 +143,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 metrics::counter!(deltat::observability::CONNECTIONS_TOTAL).increment(1);
                 metrics::gauge!(deltat::observability::CONNECTIONS_ACTIVE).increment(1.0);
                 let tm = tenant_manager.clone();
-                let pw = password.clone();
+                let auth = auth_source.clone();
                 let tls = tls_acceptor.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit; // held until connection closes
-                    if let Err(e) = wire::process_connection(socket, tm, pw, tls, max_conn_age_ms, max_idle_ms).await {
+                    if let Err(e) = wire::process_connection_with_auth(socket, tm, auth, tls, max_conn_age_ms, max_idle_ms).await {
                         tracing::error!("connection error from {peer}: {e}");
                     }
                     metrics::gauge!(deltat::observability::CONNECTIONS_ACTIVE).decrement(1.0);
