@@ -34,7 +34,7 @@ use ulid::Ulid;
 
 use crate::auth::DeltaTAuthSource;
 use crate::engine::Engine;
-use crate::limits::{MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
+use crate::limits::{MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
 use crate::model::*;
 use crate::command::Command;
 use crate::sql;
@@ -578,11 +578,13 @@ impl QueryParser for DeltaTQueryParser {
         C: ClientInfo + Unpin + Send + Sync,
     {
         enforce_query_len(sql.len())?;
+        // Reject a hostile $N index at Parse time so an over-limit statement is never stored.
+        checked_param_count(sql)?;
         Ok(sql.to_string())
     }
 
     fn get_parameter_types(&self, stmt: &String) -> PgWireResult<Vec<Type>> {
-        Ok(vec![Type::VARCHAR; count_params(stmt)])
+        Ok(vec![Type::VARCHAR; checked_param_count(stmt)?])
     }
 
     fn get_result_schema(
@@ -634,7 +636,7 @@ impl ExtendedQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
-        let param_types = vec![Type::VARCHAR; count_params(&target.statement)];
+        let param_types = vec![Type::VARCHAR; checked_param_count(&target.statement)?];
         Ok(DescribeStatementResponse::new(param_types, schema_for_sql(&target.statement)))
     }
 
@@ -667,6 +669,20 @@ fn parse_param_index(chars: &[char], digit_start: usize) -> (Option<usize>, usiz
         .parse::<usize>()
         .ok();
     (n, j)
+}
+
+/// Count the highest $N placeholder, rejecting indices over MAX_PARAMS so the result can safely
+/// size a `vec![Type; N]`. SQLSTATE 54000 = program_limit_exceeded, matching enforce_query_len.
+fn checked_param_count(sql: &str) -> PgWireResult<usize> {
+    let count = count_params(sql);
+    if count > MAX_PARAMS {
+        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "54000".into(),
+            format!("parameter index ${count} exceeds the maximum of {MAX_PARAMS}"),
+        ))));
+    }
+    Ok(count)
 }
 
 /// Count the highest $N parameter placeholder in the SQL string.
@@ -1124,6 +1140,28 @@ mod tests {
     fn count_params_dollar_no_digit() {
         // "$" followed by non-digit should not count
         assert_eq!(count_params("SELECT $foo"), 0);
+    }
+
+    // ── checked_param_count / MAX_PARAMS ─────────────────────────
+
+    #[test]
+    fn checked_param_count_rejects_over_limit_index() {
+        // A ~20-byte statement must never size an allocation from its raw $N index: an index over
+        // MAX_PARAMS is rejected with an error, not fed to vec![Type; N].
+        assert!(checked_param_count("SELECT $9999999999").is_err());
+        assert!(checked_param_count(&format!("SELECT ${}", MAX_PARAMS + 1)).is_err());
+    }
+
+    #[test]
+    fn checked_param_count_accepts_at_limit() {
+        assert_eq!(checked_param_count(&format!("SELECT ${MAX_PARAMS}")).unwrap(), MAX_PARAMS);
+        assert_eq!(checked_param_count("SELECT $1, $2").unwrap(), 2);
+    }
+
+    #[test]
+    fn get_parameter_types_rejects_over_limit_index() {
+        let parser = DeltaTQueryParser;
+        assert!(parser.get_parameter_types(&"SELECT $70000".to_string()).is_err());
     }
 
     // ── schema_for_sql ───────────────────────────────────────────

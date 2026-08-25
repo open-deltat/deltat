@@ -33,4 +33,8 @@ pub const MAX_NAME_LEN: usize = 1_000;
 pub const MAX_LABEL_LEN: usize = 10_000;
 pub const MAX_TENANT_NAME_LEN: usize = 256;
 pub const MAX_QUERY_LEN: usize = 1_048_576; // 1MB
+/// Highest `$N` placeholder index a statement may name. Postgres's Bind message carries the
+/// parameter count as a u16, so no real client can exceed this; a larger index in the SQL text is
+/// hostile input and is rejected before it can size an allocation.
+pub const MAX_PARAMS: usize = 65_535;
 pub const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 100;
