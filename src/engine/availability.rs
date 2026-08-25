@@ -211,49 +211,7 @@ pub fn compute_saturated_spans(allocs: &[Span], capacity: u32) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const H: Ms = 3_600_000;
-    const M: Ms = 60_000;
-
-    fn make_resource(intervals: Vec<Interval>) -> ResourceState {
-        make_resource_with_capacity(intervals, 1, None)
-    }
-
-    fn make_resource_with_capacity(intervals: Vec<Interval>, capacity: u32, buffer_after: Option<Ms>) -> ResourceState {
-        let mut rs = ResourceState::new(ulid::Ulid::new(), None, None, capacity, buffer_after);
-        for i in intervals {
-            rs.insert_interval(i);
-        }
-        rs
-    }
-
-    fn rule(start: Ms, end: Ms, blocking: bool) -> Interval {
-        Interval {
-            id: ulid::Ulid::new(),
-            span: Span::new(start, end),
-            kind: if blocking {
-                IntervalKind::Blocking
-            } else {
-                IntervalKind::NonBlocking
-            },
-        }
-    }
-
-    fn booking(start: Ms, end: Ms) -> Interval {
-        Interval {
-            id: ulid::Ulid::new(),
-            span: Span::new(start, end),
-            kind: IntervalKind::Booking { label: None },
-        }
-    }
-
-    fn hold(start: Ms, end: Ms, expires_at: Ms) -> Interval {
-        Interval {
-            id: ulid::Ulid::new(),
-            span: Span::new(start, end),
-            kind: IntervalKind::Hold { expires_at },
-        }
-    }
+    use crate::engine::tests::helpers::{booking, hold, make_resource, make_resource_with_capacity, rule, H, M};
 
     // ── subtract_intervals ────────────────────────────────
 
