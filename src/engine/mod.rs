@@ -52,6 +52,19 @@ pub(super) enum WalCommand {
         events: Vec<Event>,
         response: oneshot::Sender<io::Result<()>>,
     },
+    /// Start recording every event acked from here on, until the matching `Compact` arrives.
+    /// `compact_wal` sends this BEFORE it snapshots: appends processed after it are fsynced into
+    /// the old file (and acked), which the compaction swap replaces, so the `Compact` handler
+    /// writes the recording into the new file after the snapshot events. Without it those
+    /// acknowledged records would be erased and lost on the next replay. A recorded event may
+    /// already be captured in the snapshot (its resource was snapshotted after the apply), so
+    /// the handler drops recorded additions whose id the snapshot carries. Interval mutations
+    /// acked before this command are always in the snapshot: they hold the resource write lock
+    /// from before the append until after the apply, and the snapshot read waits on that lock.
+    /// Begin/Compact pairs never interleave: `compact_wal` serializes under `compact_lock`.
+    CompactBegin {
+        response: oneshot::Sender<()>,
+    },
     Compact {
         events: Vec<Event>,
         response: oneshot::Sender<io::Result<()>>,
@@ -68,6 +81,8 @@ pub(super) enum WalCommand {
 /// 4. Single flush_sync for the whole batch.
 /// 5. Respond Ok to all senders.
 async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
+    // Events acked between CompactBegin and Compact; None outside a compaction window.
+    let mut recording: Option<Vec<Event>> = None;
     while let Some(cmd) = rx.recv().await {
         match cmd {
             WalCommand::Append { event, response } => {
@@ -81,8 +96,8 @@ async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
                         }
                         Ok(other) => {
                             // Flush current batch first, then handle the non-append command
-                            flush_and_respond(&mut wal, &mut batch);
-                            handle_non_append(&mut wal, other);
+                            flush_and_respond(&mut wal, &mut batch, &mut recording);
+                            handle_non_append(&mut wal, other, &mut recording);
                             break;
                         }
                         Err(_) => break, // channel empty, flush batch
@@ -90,17 +105,21 @@ async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
                 }
 
                 if !batch.is_empty() {
-                    flush_and_respond(&mut wal, &mut batch);
+                    flush_and_respond(&mut wal, &mut batch, &mut recording);
                 }
             }
-            other => handle_non_append(&mut wal, other),
+            other => handle_non_append(&mut wal, other, &mut recording),
         }
     }
 }
 
 /// Record the batch-size and flush-duration metrics, flush the buffered batch under one fsync, and
 /// respond to every sender. Shared by the two flush sites in `wal_writer_loop`.
-fn flush_and_respond(wal: &mut Wal, batch: &mut Vec<(Event, oneshot::Sender<io::Result<()>>)>) {
+fn flush_and_respond(
+    wal: &mut Wal,
+    batch: &mut Vec<(Event, oneshot::Sender<io::Result<()>>)>,
+    recording: &mut Option<Vec<Event>>,
+) {
     metrics::histogram!(crate::observability::WAL_FLUSH_BATCH_SIZE).record(batch.len() as f64);
     let flush_start = std::time::Instant::now();
     let result = flush_batch(wal, batch);
@@ -109,6 +128,12 @@ fn flush_and_respond(wal: &mut Wal, batch: &mut Vec<(Event, oneshot::Sender<io::
     if result.is_err() {
         recover_wal(wal);
     }
+    // Only acked events are recorded: a failed batch was reported lost to its callers and never
+    // applied to memory, so re-appending it into the compacted file would resurrect it.
+    if result.is_ok()
+        && let Some(rec) = recording {
+            rec.extend(batch.iter().map(|(event, _)| event.clone()));
+        }
     respond_batch(batch, &result);
 }
 
@@ -153,7 +178,7 @@ fn respond_batch(batch: &mut Vec<(Event, oneshot::Sender<io::Result<()>>)>, resu
     }
 }
 
-fn handle_non_append(wal: &mut Wal, cmd: WalCommand) {
+fn handle_non_append(wal: &mut Wal, cmd: WalCommand, recording: &mut Option<Vec<Event>>) {
     match cmd {
         WalCommand::AppendAtomic { events, response } => {
             // Buffer every event, then one flush_sync, the same shape as flush_batch but for a
@@ -172,10 +197,17 @@ fn handle_non_append(wal: &mut Wal, cmd: WalCommand) {
             };
             if result.is_err() {
                 recover_wal(wal);
+            } else if let Some(rec) = recording {
+                rec.extend(events);
             }
             let _ = response.send(result);
         }
+        WalCommand::CompactBegin { response } => {
+            *recording = Some(Vec::new());
+            let _ = response.send(());
+        }
         WalCommand::Compact { events, response } => {
+            let events = merge_recorded(events, recording.take().unwrap_or_default());
             let result = Wal::write_compact_file(wal.path(), &events)
                 .and_then(|()| wal.swap_compact_file());
             let _ = response.send(result);
@@ -184,6 +216,40 @@ fn handle_non_append(wal: &mut Wal, cmd: WalCommand) {
             let _ = response.send(wal.appends_since_compact());
         }
         WalCommand::Append { .. } => unreachable!(),
+    }
+}
+
+/// Append the events recorded during the compaction window onto the snapshot events, dropping the
+/// ones the snapshot already captured. Only addition events can duplicate: a create replayed twice
+/// would reset the resource (wiping the snapshot intervals replayed before it) and an interval
+/// added twice would double-count against capacity, so additions whose id the snapshot carries
+/// are dropped. Updates, removals, and deletes replay idempotently on top of either state and
+/// are kept unconditionally (a removal already reflected in the snapshot replays as a no-op).
+fn merge_recorded(mut snapshot: Vec<Event>, recorded: Vec<Event>) -> Vec<Event> {
+    let snapshot_ids: std::collections::HashSet<Ulid> =
+        snapshot.iter().filter_map(added_id).collect();
+    snapshot.extend(
+        recorded
+            .into_iter()
+            .filter(|event| added_id(event).is_none_or(|id| !snapshot_ids.contains(&id))),
+    );
+    snapshot
+}
+
+/// The id an event introduces, for `merge_recorded`'s duplicate check. Only the four addition
+/// kinds introduce state keyed by a fresh id; every other kind mutates or removes existing state.
+fn added_id(event: &Event) -> Option<Ulid> {
+    match event {
+        Event::ResourceCreated { id, .. }
+        | Event::RuleAdded { id, .. }
+        | Event::HoldPlaced { id, .. }
+        | Event::BookingConfirmed { id, .. } => Some(*id),
+        Event::ResourceUpdated { .. }
+        | Event::ResourceDeleted { .. }
+        | Event::RuleUpdated { .. }
+        | Event::RuleRemoved { .. }
+        | Event::HoldReleased { .. }
+        | Event::BookingCancelled { .. } => None,
     }
 }
 
@@ -201,6 +267,10 @@ pub struct Engine {
     /// publishes its recomputed (higher) watermark if it is unchanged afterwards, otherwise a
     /// concurrent placement lowered the watermark and must not be clobbered.
     pub(super) hold_generation: std::sync::atomic::AtomicU64,
+    /// Serializes `compact_wal` so the writer sees strictly paired CompactBegin/Compact commands.
+    /// The compactor and GC tasks both trigger compaction; interleaved pairs would clobber the
+    /// recording and could swap a stale snapshot over a newer one.
+    pub(super) compact_lock: tokio::sync::Mutex<()>,
 }
 
 impl Engine {
@@ -228,6 +298,7 @@ impl Engine {
             clock,
             earliest_hold_expiry: std::sync::atomic::AtomicI64::new(i64::MIN),
             hold_generation: std::sync::atomic::AtomicU64::new(0),
+            compact_lock: tokio::sync::Mutex::new(()),
         };
 
         // Replay events: we're the sole owner of these Arcs, so try_read/try_write

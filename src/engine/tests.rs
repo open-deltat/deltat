@@ -5214,6 +5214,128 @@ async fn compact_wal_waits_for_a_locked_resource() {
     assert!(engine.get_resource(&id).is_some());
 }
 
+#[tokio::test]
+async fn resource_created_during_compaction_window_survives_replay() {
+    // A write acked while compact_wal is snapshotting is fsynced into the OLD wal file; the
+    // compaction swap must not erase it. Stall the snapshot on r1's write lock, create r2 during
+    // the stall (create holds no per-resource lock, so it goes straight through), finish
+    // compaction, then replay the file: r2's acknowledged create must still be there.
+    use std::time::Duration;
+
+    let path = test_wal_path("compact_window_create.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path.clone(), notify).unwrap());
+    let r1 = Ulid::new();
+    engine.create_resource(r1, None, None, 1, None).await.unwrap();
+
+    let rs = engine.get_resource(&r1).unwrap();
+    let guard = rs.write().await;
+
+    let compactor = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.compact_wal().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await; // compactor is now blocked on r1
+
+    let r2 = Ulid::new();
+    engine.create_resource(r2, None, None, 1, None).await.unwrap();
+
+    drop(guard);
+    compactor.await.unwrap().unwrap();
+
+    let replayed = Wal::replay(&path).unwrap();
+    assert!(
+        replayed
+            .iter()
+            .any(|e| matches!(e, Event::ResourceCreated { id, .. } if *id == r2)),
+        "acknowledged create during the compaction window must survive the swap"
+    );
+}
+
+#[tokio::test]
+async fn booking_acked_during_compaction_window_survives_replay_exactly_once() {
+    // Same stall as above, but for a lock-holding mutation on an already-live resource. Whether
+    // the booking lands before or after r2's snapshot read depends on the snapshot loop's
+    // iteration order, so this covers whichever path runs: recorded-only (the booking missed the
+    // snapshot and must come from the recording) or snapshotted (the recorded duplicate must be
+    // dropped). Either way replay must yield the booking exactly once.
+    use std::time::Duration;
+
+    let path = test_wal_path("compact_window_booking.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Arc::new(Engine::new(path.clone(), notify).unwrap());
+    let r1 = Ulid::new();
+    let r2 = Ulid::new();
+    engine.create_resource(r1, None, None, 1, None).await.unwrap();
+    engine.create_resource(r2, None, None, 1, None).await.unwrap();
+
+    let rs = engine.get_resource(&r1).unwrap();
+    let guard = rs.write().await;
+
+    let compactor = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.compact_wal().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await; // compactor is now inside its window
+
+    let booking_id = Ulid::new();
+    engine
+        .confirm_booking(booking_id, r2, Span::new(10 * H, 11 * H), None)
+        .await
+        .unwrap();
+
+    drop(guard);
+    compactor.await.unwrap().unwrap();
+
+    let replayed = Wal::replay(&path).unwrap();
+    let occurrences = replayed
+        .iter()
+        .filter(|e| matches!(e, Event::BookingConfirmed { id, .. } if *id == booking_id))
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "acknowledged booking during the compaction window must survive the swap exactly once"
+    );
+}
+
+#[test]
+fn merge_recorded_drops_snapshotted_additions_and_keeps_the_rest() {
+    let rid = Ulid::new();
+    let create = Event::ResourceCreated {
+        id: rid,
+        parent_id: None,
+        name: None,
+        capacity: 1,
+        buffer_after: None,
+    };
+    let snapshotted_booking = Event::BookingConfirmed {
+        id: Ulid::new(),
+        resource_id: rid,
+        span: Span::new(0, H),
+        label: None,
+    };
+    let new_hold = Event::HoldPlaced {
+        id: Ulid::new(),
+        resource_id: rid,
+        span: Span::new(H, 2 * H),
+        expires_at: 3 * H,
+    };
+    // A removal whose interval is already gone from the snapshot replays as a no-op, so it is
+    // kept unconditionally rather than matched against the snapshot.
+    let stale_release = Event::HoldReleased { id: Ulid::new(), resource_id: rid };
+
+    let snapshot = vec![create.clone(), snapshotted_booking.clone()];
+    let recorded = vec![
+        create.clone(),             // duplicate: replaying it would reset the resource
+        snapshotted_booking.clone(), // duplicate: replaying it would double-count capacity
+        new_hold.clone(),
+        stale_release.clone(),
+    ];
+
+    let merged = merge_recorded(snapshot, recorded);
+    assert_eq!(merged, vec![create, snapshotted_booking, new_hold, stale_release]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_bookings_on_capacity_one_admit_exactly_one() {
     // INV-09: the per-resource write lock serializes mutations, so racing many bookings for the

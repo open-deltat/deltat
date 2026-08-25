@@ -572,6 +572,20 @@ impl Engine {
 
     /// Compact the WAL by rewriting it with only the events needed to recreate the current state.
     pub async fn compact_wal(&self) -> Result<(), EngineError> {
+        let _serialize = self.compact_lock.lock().await;
+
+        // Open the recording window BEFORE snapshotting: a mutation acked while the snapshot loop
+        // runs lands in the old file the swap replaces, so the writer must capture it and carry it
+        // into the compacted file, or the acknowledged write is erased (see WalCommand::CompactBegin).
+        let (begin_tx, begin_rx) = oneshot::channel();
+        self.wal_tx
+            .send(WalCommand::CompactBegin { response: begin_tx })
+            .await
+            .map_err(|_| EngineError::WalError("WAL writer shut down".into()))?;
+        begin_rx
+            .await
+            .map_err(|_| EngineError::WalError("WAL writer dropped response".into()))?;
+
         // Snapshot each resource under an awaited read lock. A resource mid-mutation holds its
         // write lock across an awaited WAL append, so try_read would fail; unwrapping it panics
         // the compactor and skipping it would drop the resource from the rewritten WAL. Await
