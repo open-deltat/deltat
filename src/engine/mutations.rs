@@ -15,8 +15,8 @@ use crate::model::*;
 
 use super::availability::subtract_intervals;
 use super::conflict::{
-    check_batch_capacity, check_no_conflict, check_no_conflict_excluding, validate_buffer,
-    validate_span, validate_timestamp,
+    check_batch_capacity, check_no_conflict, check_no_conflict_excluding, check_rules_admit,
+    validate_buffer, validate_capacity, validate_span, validate_timestamp,
 };
 use super::{Engine, EngineError, WalCommand};
 
@@ -29,9 +29,15 @@ impl Engine {
         capacity: u32,
         buffer_after: Option<Ms>,
     ) -> Result<(), EngineError> {
+        // Serialize against delete (and concurrent creates): the parent-existence and
+        // duplicate-id checks below are lock-free, and the WAL fsync sits between them and the
+        // index update, so an unserialized delete of the parent in that window would durably
+        // orphan this child (see topology_lock).
+        let _topology = self.topology_lock.lock().await;
         if self.store.resource_count() >= MAX_RESOURCES_PER_TENANT {
             return Err(EngineError::LimitExceeded("too many resources"));
         }
+        validate_capacity(capacity)?;
         validate_buffer(buffer_after)?;
         if let Some(ref n) = name
             && n.len() > MAX_NAME_LEN {
@@ -92,6 +98,10 @@ impl Engine {
     }
 
     pub async fn delete_resource(&self, id: Ulid) -> Result<(), EngineError> {
+        // Serialize against create: has_children below cannot see a child whose create has
+        // passed its parent check but not yet indexed itself, so without this lock the delete
+        // and the create both succeed and the child is durably orphaned (see topology_lock).
+        let _topology = self.topology_lock.lock().await;
         if !self.store.contains_resource(&id) {
             return Err(EngineError::NotFound(id));
         }
@@ -99,8 +109,6 @@ impl Engine {
             return Err(EngineError::HasChildren(id));
         }
 
-        // The contains_resource check above can race a concurrent delete of the same id, so
-        // resolve through Option rather than unwrapping a value that may already be gone.
         let Some(rs) = self.get_resource(&id) else {
             return Err(EngineError::NotFound(id));
         };
@@ -209,14 +217,26 @@ impl Engine {
     ) -> Result<(), EngineError> {
         validate_span(&span)?;
         validate_timestamp(expires_at)?;
+        // AVAIL-08: the server clock is the expiry authority. The client's expires_at is a
+        // request; clamping it to now + max_hold_ttl_ms means a skewed or hostile client clock
+        // can never park a hold beyond the operator's ceiling (the reaper only releases holds
+        // whose expiry has passed, so an uncapped far-future hold would squat its span forever).
+        let expires_at = expires_at.min(self.now_ms().saturating_add(self.max_hold_ttl_ms));
         let rs = self
             .get_resource(&resource_id)
             .ok_or(EngineError::NotFound(resource_id))?;
+        // T-03 schedule context, collected BEFORE the write guard (holding it while awaiting
+        // ancestor locks is the ABBA half of a deadlock, C1); own rules are then read under
+        // the guard inside check_rules_admit.
+        let parent_id = self.store.get_parent(&resource_id);
+        let (inherited_nb, inherited_blocking, ancestor_has_schedule) =
+            self.collect_inherited_rules(resource_id, parent_id, &span).await?;
         let mut guard = rs.write().await;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
 
+        check_rules_admit(&guard, &span, &inherited_nb, &inherited_blocking, ancestor_has_schedule)?;
         check_no_conflict(&guard, &span, self.now_ms())?;
 
         // Lower the reaper's earliest-expiry watermark so it will scan once this hold can expire.
@@ -297,11 +317,16 @@ impl Engine {
         let rs = self
             .get_resource(&resource_id)
             .ok_or(EngineError::NotFound(resource_id))?;
+        // T-03 schedule context, collected BEFORE the write guard (C1); see place_hold.
+        let parent_id = self.store.get_parent(&resource_id);
+        let (inherited_nb, inherited_blocking, ancestor_has_schedule) =
+            self.collect_inherited_rules(resource_id, parent_id, &span).await?;
         let mut guard = rs.write().await;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
 
+        check_rules_admit(&guard, &span, &inherited_nb, &inherited_blocking, ancestor_has_schedule)?;
         check_no_conflict(&guard, &span, self.now_ms())?;
 
         let event = Event::BookingConfirmed { id, resource_id, span, label };
@@ -333,6 +358,22 @@ impl Engine {
         resource_ids.sort();
         resource_ids.dedup();
 
+        // T-03 schedule context per resource, collected BEFORE any write guard (C1). The hull
+        // of a resource's member spans bounds its window: every member lies inside it, so the
+        // clamped inherited spans cover each member's admission check.
+        let mut rule_ctx: HashMap<Ulid, (Vec<Span>, Vec<Span>, bool)> = HashMap::new();
+        for rid in &resource_ids {
+            let member_spans = bookings.iter().filter(|(_, r, _, _)| r == rid);
+            let lo = member_spans.clone().map(|(_, _, s, _)| s.start).min();
+            let hi = member_spans.map(|(_, _, s, _)| s.end).max();
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                continue;
+            };
+            let hull = Span::new(lo, hi);
+            let parent_id = self.store.get_parent(rid);
+            rule_ctx.insert(*rid, self.collect_inherited_rules(*rid, parent_id, &hull).await?);
+        }
+
         let mut guards = Vec::with_capacity(resource_ids.len());
         let mut rs_map = HashMap::new();
 
@@ -358,8 +399,10 @@ impl Engine {
 
         for (rid, batch) in &by_resource {
             let guard = &guards[rs_map[rid]];
+            let (inherited_nb, inherited_blocking, ancestor_has_schedule) = &rule_ctx[rid];
 
             for (_, span) in batch {
+                check_rules_admit(guard, span, inherited_nb, inherited_blocking, *ancestor_has_schedule)?;
                 check_no_conflict(guard, span, now)?;
             }
 
@@ -434,6 +477,9 @@ impl Engine {
         capacity: Option<u32>,
         buffer_after: Option<Option<Ms>>,
     ) -> Result<(), EngineError> {
+        if let Some(cap) = capacity {
+            validate_capacity(cap)?;
+        }
         if let Some(buffer) = buffer_after {
             validate_buffer(buffer)?;
         }
@@ -546,13 +592,18 @@ impl Engine {
                 Err(_) => continue,
             };
 
+            // An allocation blocks [start, end + buffer_after) on both the read and the write
+            // path, so dominance is decided on the buffered end: collecting on the raw end
+            // while the turnaround tail still reaches past `now` would silently open time that
+            // admission was rejecting (INV-02). Applied to holds too so the dominance rule
+            // stays uniform; an expired hold's tail blocks nothing, the cost is only retention.
+            let buffer = guard.buffer_after.unwrap_or(0);
             let mut removed_ids = Vec::new();
             guard.intervals.retain(|interval| {
+                let buffered_end = interval.span.end.saturating_add(buffer);
                 let dominated = match &interval.kind {
-                    IntervalKind::Booking { .. } => interval.span.end < cutoff,
-                    IntervalKind::Hold { expires_at } => {
-                        *expires_at <= now && interval.span.end < cutoff
-                    }
+                    IntervalKind::Booking { .. } => buffered_end < cutoff,
+                    IntervalKind::Hold { expires_at } => *expires_at <= now && buffered_end < cutoff,
                     IntervalKind::NonBlocking | IntervalKind::Blocking => false,
                 };
                 if dominated {
@@ -572,6 +623,20 @@ impl Engine {
 
     /// Compact the WAL by rewriting it with only the events needed to recreate the current state.
     pub async fn compact_wal(&self) -> Result<(), EngineError> {
+        let _serialize = self.compact_lock.lock().await;
+
+        // Open the recording window BEFORE snapshotting: a mutation acked while the snapshot loop
+        // runs lands in the old file the swap replaces, so the writer must capture it and carry it
+        // into the compacted file, or the acknowledged write is erased (see WalCommand::CompactBegin).
+        let (begin_tx, begin_rx) = oneshot::channel();
+        self.wal_tx
+            .send(WalCommand::CompactBegin { response: begin_tx })
+            .await
+            .map_err(|_| EngineError::WalError("WAL writer shut down".into()))?;
+        begin_rx
+            .await
+            .map_err(|_| EngineError::WalError("WAL writer dropped response".into()))?;
+
         // Snapshot each resource under an awaited read lock. A resource mid-mutation holds its
         // write lock across an awaited WAL append, so try_read would fail; unwrapping it panics
         // the compactor and skipping it would drop the resource from the rewritten WAL. Await

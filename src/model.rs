@@ -133,6 +133,15 @@ impl ResourceState {
         }
     }
 
+    /// Whether this resource defines its own non-blocking (open-hours) schedule anywhere on its
+    /// timeline. The OVERRIDE decision (MODEL-06) hangs on this state fact alone, never on a
+    /// query window, so the same instant cannot read open or closed depending on query bounds.
+    pub fn has_non_blocking_rule(&self) -> bool {
+        self.intervals
+            .iter()
+            .any(|i| matches!(i.kind, IntervalKind::NonBlocking))
+    }
+
     /// Return only intervals whose span overlaps the query window.
     /// Uses binary search to skip intervals starting at or after `query.end`.
     pub fn overlapping(&self, query: &Span) -> impl Iterator<Item = &Interval> {

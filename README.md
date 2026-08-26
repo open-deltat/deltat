@@ -66,6 +66,11 @@ DELTAT_PASSWORD=secret deltat
 
 Or build from source: `cargo install --git https://github.com/open-deltat/deltat.git`
 
+Without `DELTAT_PASSWORD`, deltat generates a random password and prints it once at startup.
+Anyone holding the password has full read/write access to every tenant (see `DELTAT_TENANT_PASSWORDS`
+below to scope credentials per tenant), and auth is cleartext unless TLS is configured, so on
+anything but localhost set a strong password and `DELTAT_TLS_CERT`/`DELTAT_TLS_KEY`.
+
 Connect on port 5433:
 
 ```bash
@@ -125,7 +130,9 @@ DELETE FROM bookings WHERE id = '01J...';
 
 ### Holds
 
-Temporary segments that auto-expire.
+Temporary segments that auto-expire. `expires_at` is a request: the server clamps it to its own
+clock plus `DELTAT_MAX_HOLD_TTL_MS` (default 1 hour), so a skewed client clock can never squat a
+span indefinitely. Read the hold back with `SELECT * FROM holds` to see the effective expiry.
 
 ```sql
 -- Hold for 15 minutes
@@ -133,6 +140,11 @@ INSERT INTO holds (id, resource_id, start, "end", expires_at)
 VALUES ('01J...', '01J...', 1706000000000, 1706003600000, 1706000900000);
 
 DELETE FROM holds WHERE id = '01J...';
+
+-- Commit the hold: atomically convert it into a booking on the held span.
+-- One lock, one WAL flush; there is no release-then-rebook gap for a
+-- competing booker to steal. label is optional.
+UPDATE holds SET booking_id = '01J...', label = 'seat 14F' WHERE id = '01J...';
 ```
 
 ### Availability
@@ -188,10 +200,12 @@ All times are **Unix milliseconds**. Intervals are half-open `[start, end)`, so 
 | `DELTAT_PORT` | `5433` | Listen port |
 | `DELTAT_BIND` | `0.0.0.0` | Bind address |
 | `DELTAT_DATA_DIR` | `./data` | WAL storage directory |
-| `DELTAT_PASSWORD` | `deltat` | Connection password |
+| `DELTAT_PASSWORD` | generated | Connection password. Unset means a random one is generated and printed once at startup |
+| `DELTAT_TENANT_PASSWORDS` | unset | Per-tenant credentials as comma-separated `tenant:password` pairs (passwords may contain colons, not commas). A tenant listed here accepts only its own password; unlisted tenants use `DELTAT_PASSWORD` |
 | `DELTAT_MAX_CONNECTIONS` | `256` | Concurrent connection cap |
 | `DELTAT_COMPACT_THRESHOLD` | `1000` | WAL appends before a compaction runs |
 | `DELTAT_GC_RETENTION_MS` | `604800000` | Age (7 days) past which finished bookings and expired holds are collected |
+| `DELTAT_MAX_HOLD_TTL_MS` | `3600000` | Ceiling (1 hour) on hold lifetime: a hold's requested `expires_at` is clamped to server now + this |
 | `DELTAT_METRICS_PORT` | unset | Prometheus `/metrics` port; metrics are off when unset |
 | `DELTAT_TLS_CERT` | unset | PEM certificate path; TLS is off unless both cert and key are set |
 | `DELTAT_TLS_KEY` | unset | PEM private key path; TLS is off unless both cert and key are set |

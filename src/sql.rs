@@ -57,7 +57,6 @@ pub fn parse_sql(sql: &str) -> Result<Command, SqlError> {
 
 fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
     let table = insert_table_name(insert)?;
-    let values = extract_insert_values(insert)?;
     let columns = extract_column_names(insert);
 
     match table.as_str() {
@@ -96,52 +95,31 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
             }
         }
         "holds" => {
-            let (id, resource_id, start, end, expires_at) = parse_hold_row(&values, &columns)?;
+            let all_rows = extract_all_insert_rows(insert)?;
+            // No batch hold path exists in the engine; reject multi-row VALUES loudly rather
+            // than holding only the first slot while reporting success (silent data loss in
+            // the collision-detection domain). The tap SDK places holds one per statement.
+            if all_rows.len() > 1 {
+                return Err(SqlError::Unsupported(
+                    "multi-row INSERT INTO holds (place one hold per statement)".into(),
+                ));
+            }
+            let (id, resource_id, start, end, expires_at) = parse_hold_row(&all_rows[0], &columns)?;
             Ok(Command::InsertHold { id, resource_id, start, end, expires_at })
         }
         "bookings" => {
             let all_rows = extract_all_insert_rows(insert)?;
-            let label_idx = columns.iter().position(|c| c == "label");
-
             if all_rows.len() == 1 {
-                let values = &all_rows[0];
-                if !columns.is_empty() && values.len() != columns.len() {
-                    return Err(SqlError::WrongArity("bookings", columns.len(), values.len()));
-                }
-                if values.len() < 4 {
-                    return Err(SqlError::WrongArity("bookings", 4, values.len()));
-                }
-                let label = cell(values, label_idx)
-                    .map(parse_string_or_null)
-                    .transpose()?
-                    .flatten();
-                Ok(Command::InsertBooking {
-                    id: parse_ulid(&values[0])?,
-                    resource_id: parse_ulid(&values[1])?,
-                    start: parse_i64(&values[2])?,
-                    end: parse_i64(&values[3])?,
-                    label,
-                })
+                let (id, resource_id, start, end, label) =
+                    parse_booking_row(&all_rows[0], &columns)?;
+                Ok(Command::InsertBooking { id, resource_id, start, end, label })
             } else {
                 let mut bookings = Vec::with_capacity(all_rows.len());
                 for (i, row) in all_rows.iter().enumerate() {
-                    if !columns.is_empty() && row.len() != columns.len() {
-                        return Err(SqlError::WrongArity("bookings row", columns.len(), row.len()));
-                    }
-                    if row.len() < 4 {
-                        return Err(SqlError::WrongArity("bookings row", 4, row.len()));
-                    }
-                    let label = cell(row, label_idx)
-                        .map(|e| parse_string_or_null(e).map_err(|e| SqlError::Parse(format!("row {i}: {e}"))))
-                        .transpose()?
-                        .flatten();
-                    bookings.push((
-                        parse_ulid(&row[0]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                        parse_ulid(&row[1]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                        parse_i64(&row[2]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                        parse_i64(&row[3]).map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                        label,
-                    ));
+                    bookings.push(
+                        parse_booking_row(row, &columns)
+                            .map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
+                    );
                 }
                 Ok(Command::BatchInsertBookings { bookings })
             }
@@ -414,6 +392,28 @@ fn parse_update(
                 blocking: blocking.ok_or(SqlError::MissingFilter("blocking"))?,
             })
         }
+        "holds" => {
+            // The one UPDATE a hold supports: assigning booking_id commits the hold, converting
+            // it into a booking atomically (Command::CommitHold). Span and resource come from the
+            // hold itself, so only booking_id and label are assignable.
+            let mut booking_id: Option<Ulid> = None;
+            let mut label: Option<String> = None;
+
+            for a in assignments {
+                let col = assignment_column_name(a)?;
+                match col.as_str() {
+                    "booking_id" => booking_id = Some(parse_ulid_expr(&a.value)?),
+                    "label" => label = parse_string_or_null(&a.value)?,
+                    _ => {}
+                }
+            }
+
+            Ok(Command::CommitHold {
+                hold_id: id,
+                booking_id: booking_id.ok_or(SqlError::MissingFilter("booking_id"))?,
+                label,
+            })
+        }
         _ => Err(SqlError::Unsupported(format!("UPDATE {table_name}"))),
     }
 }
@@ -565,22 +565,6 @@ fn extract_column_names(insert: &ast::Insert) -> Vec<String> {
     insert.columns.iter().map(|c| c.value.to_lowercase()).collect()
 }
 
-fn extract_insert_values(insert: &ast::Insert) -> Result<Vec<Expr>, SqlError> {
-    let body = insert
-        .source
-        .as_ref()
-        .ok_or(SqlError::Parse("no VALUES".into()))?;
-    match body.body.as_ref() {
-        SetExpr::Values(values) => {
-            if values.rows.is_empty() {
-                return Err(SqlError::Parse("empty VALUES".into()));
-            }
-            Ok(values.rows[0].clone())
-        }
-        _ => Err(SqlError::Parse("expected VALUES".into())),
-    }
-}
-
 /// Parse one resource VALUES row into (id, parent_id, name, capacity, buffer_after). Column-aware
 /// when a column list is present, with the legacy positional order (id, parent_id, capacity,
 /// buffer_after) as the fallback. Shared by the single-row (InsertResource) and multi-row
@@ -693,6 +677,42 @@ fn parse_hold_row(values: &[Expr], columns: &[String]) -> Result<(Ulid, Ulid, Ms
         parse_i64(get("start", 2)?)?,
         parse_i64(get("end", 3)?)?,
         parse_i64(get("expires_at", 4)?)?,
+    ))
+}
+
+/// Parse one `bookings` VALUES row into (id, resource_id, start, end, label), honoring a declared
+/// column list. Positional order (the fallback) is (id, resource_id, start, end, label), with
+/// label optional. Unknown declared columns are rejected: matching one to nothing would silently
+/// drop its value, and a typo like `labell` must not lose the label.
+fn parse_booking_row(
+    values: &[Expr],
+    columns: &[String],
+) -> Result<(Ulid, Ulid, Ms, Ms, Option<String>), SqlError> {
+    check_column_arity("bookings", columns, values)?;
+    if let Some(unknown) = columns.iter().find(|c| {
+        !matches!(c.as_str(), "id" | "resource_id" | "start" | "end" | "label")
+    }) {
+        return Err(SqlError::Parse(format!("unknown bookings column: {unknown}")));
+    }
+    // Positional rows share the WrongArity message with the siblings; with a column list present
+    // the arity already matches, so a missing field is named instead of counted.
+    if columns.is_empty() && values.len() < 4 {
+        return Err(SqlError::WrongArity("bookings", 4, values.len()));
+    }
+    let get = |name: &'static str, pos: usize| {
+        col_value(columns, values, name, pos)
+            .ok_or_else(|| SqlError::Parse(format!("bookings INSERT missing required column: {name}")))
+    };
+    let label = col_value(columns, values, "label", 4)
+        .map(parse_string_or_null)
+        .transpose()?
+        .flatten();
+    Ok((
+        parse_ulid(get("id", 0)?)?,
+        parse_ulid(get("resource_id", 1)?)?,
+        parse_i64(get("start", 2)?)?,
+        parse_i64(get("end", 3)?)?,
+        label,
     ))
 }
 
@@ -1246,6 +1266,95 @@ mod tests {
     }
 
     #[test]
+    fn parse_multi_row_insert_holds_is_rejected() {
+        // The engine has no batch hold path; a multi-row holds VALUES must fail loudly. Parsing
+        // only the first row and reporting INSERT success would leave the other slots unheld
+        // while the client believes they are protected.
+        let r = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('01BRZ3NDEKTSV4RRFFQ69G5FAW', '{r}', 1000, 2000, 3000), ('01CRZ3NDEKTSV4RRFFQ69G5FAX', '{r}', 3000, 4000, 5000)"#
+        );
+        assert!(parse_sql(&sql).is_err(), "multi-row holds INSERT must be rejected, not truncated");
+    }
+
+    #[test]
+    fn parse_insert_booking_honors_reordered_columns() {
+        // resource_id declared before id. Both are ULIDs, so a positional parse would silently
+        // swap them and land the booking on the wrong resource; the column-aware parse must land
+        // each value on its named field.
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let res = "01BRZ3NDEKTSV4RRFFQ69G5FAW";
+        let sql = format!(
+            r#"INSERT INTO bookings (resource_id, id, start, "end", label) VALUES ('{res}', '{id}', 1000, 2000, 'swapped')"#
+        );
+        match parse_sql(&sql).unwrap() {
+            Command::InsertBooking { id: bid, resource_id, start, end, label } => {
+                assert_eq!(bid.to_string(), id);
+                assert_eq!(resource_id.to_string(), res);
+                assert_eq!(start, 1000);
+                assert_eq!(end, 2000);
+                assert_eq!(label.as_deref(), Some("swapped"));
+            }
+            cmd => panic!("expected InsertBooking, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_batch_insert_bookings_honors_reordered_columns() {
+        let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAW";
+        let res = "01CRZ3NDEKTSV4RRFFQ69G5FAX";
+        let sql = format!(
+            r#"INSERT INTO bookings (resource_id, id, start, "end") VALUES ('{res}', '{id1}', 1000, 2000), ('{res}', '{id2}', 3000, 4000)"#
+        );
+        match parse_sql(&sql).unwrap() {
+            Command::BatchInsertBookings { bookings } => {
+                assert_eq!(bookings.len(), 2);
+                assert_eq!(bookings[0].0.to_string(), id1); // id
+                assert_eq!(bookings[0].1.to_string(), res); // resource_id
+                assert_eq!(bookings[1].0.to_string(), id2);
+                assert_eq!(bookings[1].1.to_string(), res);
+            }
+            cmd => panic!("expected BatchInsertBookings, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_booking_rejects_unknown_column() {
+        // A misspelled label column must error; matching it to nothing would silently drop the
+        // supplied value.
+        let r = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!(
+            r#"INSERT INTO bookings (id, resource_id, start, "end", labell) VALUES ('{r}', '{r}', 1000, 2000, 'lost')"#
+        );
+        assert!(parse_sql(&sql).is_err(), "unknown bookings column must be rejected");
+    }
+
+    #[test]
+    fn parse_insert_booking_missing_required_column_errors() {
+        // Columns (id, resource_id, start, label) with a numeric-string label: a positional parse
+        // would read the label value as end and commit a wrong span; the named parse must report
+        // the missing end column.
+        let r = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!(
+            "INSERT INTO bookings (id, resource_id, start, label) VALUES ('{r}', '{r}', 1000, '2000')"
+        );
+        assert!(parse_sql(&sql).is_err(), "missing required end column must be rejected");
+    }
+
+    #[test]
+    fn parse_insert_booking_positional_label() {
+        // Without a column list the canonical order is (id, resource_id, start, end, label); the
+        // fifth value is the label, not silently dropped.
+        let r = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!("INSERT INTO bookings VALUES ('{r}', '{r}', 1000, 2000, 'Standup')");
+        match parse_sql(&sql).unwrap() {
+            Command::InsertBooking { label, .. } => assert_eq!(label.as_deref(), Some("Standup")),
+            cmd => panic!("expected InsertBooking, got {cmd:?}"),
+        }
+    }
+
+    #[test]
     fn parse_insert_rule_column_arity_mismatch_does_not_panic() {
         // Declared 5 columns, supplied 4 values: sqlparser accepts it; the parser must return a
         // clean WrongArity, never index out of bounds.
@@ -1687,6 +1796,52 @@ mod tests {
     fn parse_update_rule_missing_field() {
         // Missing blocking field should error
         let sql = r#"UPDATE rules SET start = 5000, "end" = 10000 WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'"#;
+        assert!(parse_sql(sql).is_err());
+    }
+
+    // ── UPDATE holds (commit hold -> booking) ────────────────────
+
+    #[test]
+    fn parse_update_holds_commits_hold() {
+        let sql = "UPDATE holds SET booking_id = '01BX5ZZKBKACTAV9WEVGEMMVRZ' WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        match parse_sql(sql).unwrap() {
+            Command::CommitHold { hold_id, booking_id, label } => {
+                assert_eq!(hold_id.to_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+                assert_eq!(booking_id.to_string(), "01BX5ZZKBKACTAV9WEVGEMMVRZ");
+                assert_eq!(label, None);
+            }
+            cmd => panic!("expected CommitHold, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_holds_with_label() {
+        let sql = "UPDATE holds SET booking_id = '01BX5ZZKBKACTAV9WEVGEMMVRZ', label = 'seat 14F' WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        match parse_sql(sql).unwrap() {
+            Command::CommitHold { label, .. } => assert_eq!(label, Some("seat 14F".to_string())),
+            cmd => panic!("expected CommitHold, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_holds_null_label_is_no_label() {
+        let sql = "UPDATE holds SET booking_id = '01BX5ZZKBKACTAV9WEVGEMMVRZ', label = NULL WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        match parse_sql(sql).unwrap() {
+            Command::CommitHold { label, .. } => assert_eq!(label, None),
+            cmd => panic!("expected CommitHold, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_holds_missing_booking_id_errors() {
+        // label alone is not a commit; booking_id is the one required assignment.
+        let sql = "UPDATE holds SET label = 'x' WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        assert!(parse_sql(sql).is_err());
+    }
+
+    #[test]
+    fn parse_update_holds_missing_where_id_errors() {
+        let sql = "UPDATE holds SET booking_id = '01BX5ZZKBKACTAV9WEVGEMMVRZ'";
         assert!(parse_sql(sql).is_err());
     }
 

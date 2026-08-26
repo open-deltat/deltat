@@ -921,3 +921,215 @@ async fn multiple_events_on_same_channel() {
     }
     assert_eq!(count, 3, "should receive all 3 notifications");
 }
+
+// ── Commit hold (atomic hold -> booking) over the wire ───────────
+
+/// Real client wall-clock for hold-expiry fixtures. The Clock seam bans ambient time in the
+/// engine, not in external test clients simulating a booker.
+#[allow(clippy::disallowed_methods)]
+fn client_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+async fn setup_held_span(client: &tokio_postgres::Client) -> (Ulid, Ulid) {
+    let rid = Ulid::new();
+    let hid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+    let expires = client_now_ms() + 60_000;
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {expires})"#
+        ))
+        .await
+        .unwrap();
+    (rid, hid)
+}
+
+/// Rows of a simple-query SELECT, as (first-column, last-column) text pairs.
+async fn select_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<(String, String)> {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).unwrap_or_default().to_string(),
+                row.get(row.len() - 1).unwrap_or_default().to_string(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn commit_hold_via_simple_query() {
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let (rid, hid) = setup_held_span(&client).await;
+
+    let bid = Ulid::new();
+    let messages = client
+        .simple_query(&format!(
+            "UPDATE holds SET booking_id = '{bid}', label = 'picnic' WHERE id = '{hid}'"
+        ))
+        .await
+        .unwrap();
+    let affected = messages.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::CommandComplete(n) => Some(*n),
+        _ => None,
+    });
+    assert_eq!(affected, Some(1), "CommandComplete must report UPDATE 1");
+
+    let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+    assert!(holds.is_empty(), "the committed hold must be gone");
+    let bookings =
+        select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+    assert_eq!(bookings.len(), 1);
+    assert_eq!(bookings[0].0, bid.to_string());
+    assert_eq!(bookings[0].1, "picnic");
+}
+
+#[tokio::test]
+async fn commit_hold_via_extended_query() {
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let (rid, hid) = setup_held_span(&client).await;
+
+    let bid = Ulid::new();
+    let affected = client
+        .execute(
+            "UPDATE holds SET booking_id = $1 WHERE id = $2",
+            &[&bid.to_string(), &hid.to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "CommandComplete must report UPDATE 1");
+
+    let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+    assert!(holds.is_empty(), "the committed hold must be gone");
+    let bookings =
+        select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+    assert_eq!(bookings.len(), 1);
+    assert_eq!(bookings[0].0, bid.to_string());
+}
+
+#[tokio::test]
+async fn commit_hold_on_released_hold_errors_via_simple_query() {
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let (_rid, hid) = setup_held_span(&client).await;
+
+    client
+        .batch_execute(&format!("DELETE FROM holds WHERE id = '{hid}'"))
+        .await
+        .unwrap();
+
+    let result = client
+        .simple_query(&format!(
+            "UPDATE holds SET booking_id = '{}' WHERE id = '{hid}'",
+            Ulid::new()
+        ))
+        .await;
+    assert!(result.is_err(), "committing a released hold must error, not silently succeed");
+}
+
+// ── Hold expiry authority (AVAIL-08) over the wire ───────────────
+
+#[tokio::test]
+async fn hold_expiry_is_clamped_over_wire() {
+    // A hold requesting a year-3000 expiry must come back with a server-clamped expires_at,
+    // not the requested value: otherwise the span is squatted forever (the reaper only
+    // releases holds whose expiry has passed).
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let rid = Ulid::new();
+    let hid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+    let requested: i64 = 32_503_680_000_000; // year 3000, the validation maximum
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {requested})"#
+        ))
+        .await
+        .unwrap();
+
+    let rows = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+    assert_eq!(rows.len(), 1);
+    let stored: i64 = rows[0].1.parse().unwrap();
+    let now = client_now_ms();
+    assert!(
+        stored < requested && stored <= now + 3_600_000,
+        "expires_at must be server-clamped (default max TTL 1h), got {stored}"
+    );
+    assert!(stored > now, "the clamped hold must still be live");
+}
+
+#[tokio::test]
+async fn multi_row_holds_insert_is_rejected_not_truncated() {
+    // A two-row holds VALUES must error as a whole: accepting only the first row with INSERT
+    // success would leave the second slot free for a competitor while the client believes it
+    // is held.
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let rid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+
+    let expires = client_now_ms() + 60_000;
+    let h1 = Ulid::new();
+    let h2 = Ulid::new();
+    let result = client
+        .simple_query(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{h1}', '{rid}', 1000, 2000, {expires}), ('{h2}', '{rid}', 3000, 4000, {expires})"#
+        ))
+        .await;
+    assert!(result.is_err(), "multi-row holds INSERT must be rejected, not truncated");
+
+    let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+    assert!(holds.is_empty(), "no partial hold may land from a rejected statement");
+}
+
+#[tokio::test]
+async fn reordered_booking_insert_round_trips() {
+    // A column list declaring resource_id before id is valid PostgreSQL; the booking must land
+    // on the declared resource with the declared id, not on whatever the positional order says.
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let rid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+
+    // A live span: an ancient one can lose a race with the GC first tick (7-day retention)
+    // and vanish before the SELECT, which is not what this test is about.
+    let start = client_now_ms() + 3_600_000;
+    let end = start + 3_600_000;
+    let bid = Ulid::new();
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO bookings (resource_id, id, start, "end", label) VALUES ('{rid}', '{bid}', {start}, {end}, 'swapped')"#
+        ))
+        .await
+        .expect("reordered column list is valid SQL and must succeed");
+
+    let rows = select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+    assert_eq!(rows.len(), 1, "the booking must land on the declared resource");
+    assert_eq!(rows[0].0, bid.to_string(), "the booking must carry the declared id");
+    assert_eq!(rows[0].1, "swapped");
+}
