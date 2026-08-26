@@ -11,6 +11,7 @@ mod hardening;
 mod hierarchy;
 mod hierarchy_toctou;
 mod limits;
+mod metrics;
 mod multi_availability;
 mod queries;
 mod verticals;

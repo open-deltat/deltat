@@ -39,6 +39,7 @@ pub async fn start_test_server() -> (SocketAddr, Arc<TenantManager>) {
                     None,
                     0,
                     0,
+                    0,
                 )
                 .await;
             });
