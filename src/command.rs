@@ -65,6 +65,14 @@ pub enum Command {
     DeleteHold {
         id: Ulid,
     },
+    /// Atomically convert a live hold into a booking (AVAIL-07). The booking takes exactly the
+    /// held span on the hold's resource; the hold is excluded from its own conflict check, so
+    /// there is no release-then-rebook window a competing booker could win.
+    CommitHold {
+        hold_id: Ulid,
+        booking_id: Ulid,
+        label: Option<String>,
+    },
     InsertBooking {
         id: Ulid,
         resource_id: Ulid,

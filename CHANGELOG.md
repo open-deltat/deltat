@@ -17,6 +17,12 @@ All notable changes to deltat are documented here. The format follows
 - The shared password is redacted from `DeltaTAuthSource`'s `Debug`.
 
 ### Fixed
+- A torn or corrupt record at the WAL tail no longer poisons the log: `Wal::open` truncates back
+  to the last good record boundary, so writes acknowledged after a crash survive later replays
+  instead of silently vanishing behind the tear. Corruption in the middle of the log (a bad record
+  followed by valid data) is now a hard error instead of a silent stop. A failed flush recovers the
+  tail (or poisons the WAL so appends keep failing) rather than appending acknowledged records
+  behind partial bytes.
 - `delete_resource` no longer panics on a TOCTOU unwrap and now reclaims its notify channel.
 - WAL compaction awaits a read lock instead of `try_read().expect()`, so a mid-mutation resource can
   no longer panic the compactor or be dropped from the rewritten WAL.

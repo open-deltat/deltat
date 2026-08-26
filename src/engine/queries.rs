@@ -16,10 +16,16 @@ use super::{Engine, EngineError};
 impl Engine {
     /// Walk up from a resource collecting inherited rules from ancestors.
     ///
-    /// Non-blocking: OVERRIDE. First ancestor with non-blocking rules wins.
+    /// Non-blocking: OVERRIDE. The first ancestor with ANY non-blocking rule (anywhere on its
+    /// timeline, not just inside the query window) wins; ancestors above it contribute no
+    /// non-blocking spans, even when the winner's rules all fall outside the window. Deciding
+    /// per window let the same instant flip open/closed with the query bounds.
     /// Blocking: ACCUMULATE. All ancestors' blocking rules are collected.
     ///
-    /// Returns `(inherited_non_blocking, inherited_blocking)` clamped to query.
+    /// Returns `(inherited_non_blocking, inherited_blocking, ancestor_has_schedule)`: the rule
+    /// spans clamped to query, plus whether ANY ancestor defines a non-blocking rule anywhere
+    /// (the same state fact the override uses; the T-03 admission check needs it to tell "the
+    /// schedule has no window here" from "no schedule exists").
     ///
     /// The ancestor id chain is snapshotted lock-free from the parent index FIRST, then each
     /// ancestor is read under its own lock one at a time. The caller must NOT hold the queried
@@ -31,7 +37,7 @@ impl Engine {
         resource_id: Ulid,
         parent_id: Option<Ulid>,
         query: &Span,
-    ) -> Result<(Vec<Span>, Vec<Span>), EngineError> {
+    ) -> Result<(Vec<Span>, Vec<Span>, bool), EngineError> {
         // Phase 1: snapshot the ancestor id chain without touching any resource lock.
         let mut chain: Vec<Ulid> = Vec::new();
         let mut visited = HashSet::new();
@@ -79,7 +85,9 @@ impl Engine {
                 }
             }
 
-            if !found_non_blocking && !inherited_non_blocking.is_empty() {
+            // The override is a state fact: an ancestor that defines a schedule wins even when
+            // none of its rules overlap this window (its contribution is then empty = closed).
+            if !found_non_blocking && parent_guard.has_non_blocking_rule() {
                 found_non_blocking = true;
             }
         }
@@ -87,7 +95,7 @@ impl Engine {
         inherited_non_blocking.sort_by_key(|s| s.start);
         inherited_blocking.sort_by_key(|s| s.start);
 
-        Ok((inherited_non_blocking, inherited_blocking))
+        Ok((inherited_non_blocking, inherited_blocking, found_non_blocking))
     }
 
     pub async fn compute_availability(
@@ -121,7 +129,7 @@ impl Engine {
         // Holding the child guard while awaiting ancestor guards is the ABBA half of a deadlock with
         // batch_confirm_bookings; the parent index makes the walk lock-free (C1).
         let parent_id = self.store.get_parent(&resource_id);
-        let (inherited_non_blocking, inherited_blocking) =
+        let (inherited_non_blocking, inherited_blocking, _) =
             self.collect_inherited_rules(resource_id, parent_id, &query).await?;
 
         let guard = rs.read().await;
@@ -221,19 +229,23 @@ impl Engine {
         Ok(merged)
     }
 
-    pub fn list_resources(&self) -> Vec<ResourceInfo> {
+    /// Await each resource's read lock like the sibling readers: writers hold their guard across
+    /// the WAL fsync, so a try_read here silently dropped rows under ordinary write load, and a
+    /// caller cannot tell a dropped row from a deleted resource. Locks are taken one at a time
+    /// (never nested), so this cannot deadlock with sorted batch acquisition.
+    pub async fn list_resources(&self) -> Vec<ResourceInfo> {
         let mut result = Vec::new();
         for rid in self.store.resource_ids() {
-            if let Some(rs) = self.store.get_resource(&rid)
-                && let Ok(guard) = rs.try_read() {
-                    result.push(ResourceInfo {
-                        id: guard.id,
-                        parent_id: guard.parent_id,
-                        name: guard.name.clone(),
-                        capacity: guard.capacity,
-                        buffer_after: guard.buffer_after,
-                    });
-                }
+            if let Some(rs) = self.store.get_resource(&rid) {
+                let guard = rs.read().await;
+                result.push(ResourceInfo {
+                    id: guard.id,
+                    parent_id: guard.parent_id,
+                    name: guard.name.clone(),
+                    capacity: guard.capacity,
+                    buffer_after: guard.buffer_after,
+                });
+            }
         }
         result
     }

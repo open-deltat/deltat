@@ -71,7 +71,7 @@ mod tests {
     use ulid::Ulid;
 
     fn test_wal_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("deltat_test_reaper");
+        let dir = std::env::temp_dir().join(format!("deltat_test_reaper_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);
@@ -108,5 +108,16 @@ mod tests {
 
         let expired_after = engine.collect_expired_holds(now);
         assert!(expired_after.is_empty());
+    }
+
+    #[test]
+    fn test_wal_path_dir_is_namespaced_per_process() {
+        // Two cargo test processes sharing one dir delete and replay each other's files.
+        let path = test_wal_path("pid_probe.wal");
+        let dir = path.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            dir.contains(&std::process::id().to_string()),
+            "reaper test dir {dir} is shared across processes"
+        );
     }
 }

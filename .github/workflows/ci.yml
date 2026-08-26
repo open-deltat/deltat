@@ -23,6 +23,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib -- --skip create_resource_too_many --skip interval_limit
       - run: cargo test --test listen_notify
+      - run: cargo test --test extended_query
+      - run: cargo test --test auth_isolation
       # Run the suite under the release profile too, so the release-only overflow-checks
       # guard (Cargo.toml [profile.release]) actually exercises the boundary arithmetic.
       - run: cargo test --release --lib -- --skip create_resource_too_many --skip interval_limit

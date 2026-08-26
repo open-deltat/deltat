@@ -62,6 +62,7 @@ pub fn command_label(cmd: &Command) -> &'static str {
         Command::DeleteRule { .. } => "delete_rule",
         Command::InsertHold { .. } => "insert_hold",
         Command::DeleteHold { .. } => "delete_hold",
+        Command::CommitHold { .. } => "commit_hold",
         Command::InsertBooking { .. } => "insert_booking",
         Command::BatchInsertBookings { .. } => "batch_insert_bookings",
         Command::DeleteBooking { .. } => "delete_booking",

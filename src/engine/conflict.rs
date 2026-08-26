@@ -7,7 +7,9 @@ use ulid::Ulid;
 
 use crate::model::*;
 
-use super::availability::compute_saturated_spans;
+use super::availability::{
+    assemble_open_windows, compute_saturated_spans, own_rule_spans, subtract_intervals,
+};
 use super::EngineError;
 
 pub(crate) fn validate_span(span: &Span) -> Result<(), EngineError> {
@@ -33,6 +35,16 @@ pub(crate) fn validate_buffer(buffer_after: Option<Ms>) -> Result<(), EngineErro
     Ok(())
 }
 
+/// Capacity 0 reads as "not bookable" but every `<= 1` branch would treat it as a bookable
+/// single slot; reject it at the boundary rather than define that surprise. Pre-existing WAL
+/// events are applied verbatim on replay, so this bounds new writes only.
+pub(crate) fn validate_capacity(capacity: u32) -> Result<(), EngineError> {
+    if capacity == 0 {
+        return Err(EngineError::LimitExceeded("capacity must be at least 1"));
+    }
+    Ok(())
+}
+
 /// A standalone timestamp (e.g. a hold's expires_at) must sit inside the valid window.
 pub(crate) fn validate_timestamp(ts: Ms) -> Result<(), EngineError> {
     use crate::limits::*;
@@ -44,6 +56,39 @@ pub(crate) fn validate_timestamp(ts: Ms) -> Result<(), EngineError> {
 
 pub(crate) fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Result<(), EngineError> {
     check_no_conflict_excluding(rs, span, now, None)
+}
+
+/// T-03: admission agrees with the read path on rules. The candidate's RAW span must lie inside
+/// the effective open windows: the base schedule (own non-blocking rules when the resource
+/// defines any anywhere, else the nearest scheduling ancestor's) minus every blocking window,
+/// assembled by the same helpers `availability()` uses. Two deliberate asymmetries with the
+/// read view, both documented in REQUIREMENTS.md (T-03):
+///  - a chain with no non-blocking rule anywhere defines no schedule: open hours cannot
+///    constrain (collision-detector mode; the read path reports zero availability for such a
+///    resource because it has no windows to enumerate), but blocking rules still reject;
+///  - the turnaround buffer is exempt: cleanup may run outside open hours, so only the raw
+///    span is checked here while the buffered footprint stays the allocation check's concern.
+pub(crate) fn check_rules_admit(
+    rs: &ResourceState,
+    span: &Span,
+    inherited_non_blocking: &[Span],
+    inherited_blocking: &[Span],
+    ancestor_has_schedule: bool,
+) -> Result<(), EngineError> {
+    let (own_non_blocking, own_blocking) = own_rule_spans(rs, span);
+    let base = if rs.has_non_blocking_rule() {
+        own_non_blocking
+    } else if ancestor_has_schedule {
+        inherited_non_blocking.to_vec()
+    } else {
+        vec![*span]
+    };
+    let open = assemble_open_windows(base, own_blocking, inherited_blocking);
+    let closed = subtract_intervals(&[*span], &open);
+    if !closed.is_empty() {
+        return Err(EngineError::ClosedBySchedule { span: *span, closed });
+    }
+    Ok(())
 }
 
 /// Conflict check that ignores one allocation by id. Used by `commit_hold`: a hold being converted
@@ -130,7 +175,10 @@ pub(crate) fn check_batch_capacity(
     }
     allocs.sort_by_key(|s| s.start);
 
-    if !compute_saturated_spans(&allocs, rs.capacity + 1).is_empty() {
+    // Saturating: capacity is untrusted, and u32::MAX + 1 would panic under overflow-checks.
+    // At the saturated value the threshold is unreachable (alloc counts are batch-bounded), so
+    // a u32::MAX-capacity resource correctly never rejects on concurrency.
+    if !compute_saturated_spans(&allocs, rs.capacity.saturating_add(1)).is_empty() {
         return Err(EngineError::CapacityExceeded(rs.capacity));
     }
     Ok(())

@@ -21,6 +21,7 @@ pub struct TenantManager {
     data_dir: PathBuf,
     compact_threshold: u64,
     gc_retention_ms: i64,
+    max_hold_ttl_ms: i64,
 }
 
 impl TenantManager {
@@ -30,7 +31,14 @@ impl TenantManager {
             data_dir,
             compact_threshold,
             gc_retention_ms,
+            max_hold_ttl_ms: DEFAULT_MAX_HOLD_TTL_MS,
         }
+    }
+
+    /// Override the hold-lifetime ceiling every tenant engine is created with (AVAIL-08).
+    pub fn with_max_hold_ttl(mut self, max_hold_ttl_ms: i64) -> Self {
+        self.max_hold_ttl_ms = max_hold_ttl_ms;
+        self
     }
 
     /// Get or lazily create an engine for the given tenant.
@@ -69,7 +77,8 @@ impl TenantManager {
             Entry::Vacant(e) => {
                 let wal_path = self.data_dir.join(format!("{safe_name}.wal"));
                 let notify = Arc::new(NotifyHub::new());
-                let engine = Arc::new(Engine::new(wal_path, notify)?);
+                let engine =
+                    Arc::new(Engine::new(wal_path, notify)?.with_max_hold_ttl(self.max_hold_ttl_ms));
 
                 // Spawn reaper + compactor + GC for this tenant
                 let reaper_engine = engine.clone();
@@ -96,7 +105,10 @@ impl TenantManager {
 
     /// Strip path-traversal characters, keeping only alphanumerics, `_`, and `-`. A name that is
     /// empty after stripping is rejected so it can never map to a bare `.wal` file.
-    fn sanitize(tenant: &str) -> std::io::Result<String> {
+    ///
+    /// pub(crate): per-tenant password lookup (auth.rs) must key on the same sanitized name this
+    /// module keys engines on, or an alias like "acme!" would bypass tenant "acme"'s credential.
+    pub(crate) fn sanitize(tenant: &str) -> std::io::Result<String> {
         let safe_name: String = tenant
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
@@ -119,7 +131,7 @@ mod tests {
     use crate::model::*;
 
     fn test_data_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("deltat_test_tenant").join(name);
+        let dir = std::env::temp_dir().join(format!("deltat_test_tenant_{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -264,5 +276,16 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("too many tenants"));
+    }
+
+    #[test]
+    fn test_data_dir_dir_is_namespaced_per_process() {
+        // Two cargo test processes sharing one dir delete and replay each other's files.
+        let path = test_data_dir("pid_probe");
+        let dir = path.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            dir.contains(&std::process::id().to_string()),
+            "tenant test dir {dir} is shared across processes"
+        );
     }
 }

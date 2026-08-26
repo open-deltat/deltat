@@ -13,6 +13,12 @@ pub enum EngineError {
         rule_span: Span,
         uncovered: Vec<Span>,
     },
+    /// T-03: the candidate span leaves the effective open windows (outside the schedule's
+    /// non-blocking base, or inside a blocking window, own or inherited).
+    ClosedBySchedule {
+        span: Span,
+        closed: Vec<Span>,
+    },
     CycleDetected(Ulid),
     HasChildren(Ulid),
     CapacityExceeded(u32),
@@ -34,6 +40,13 @@ impl std::fmt::Display for EngineError {
                     f,
                     "rule [{}, {}) not covered by parent availability; uncovered: {:?}",
                     rule_span.start, rule_span.end, uncovered
+                )
+            }
+            EngineError::ClosedBySchedule { span, closed } => {
+                write!(
+                    f,
+                    "span [{}, {}) is outside open windows or blocked; closed: {:?}",
+                    span.start, span.end, closed
                 )
             }
             EngineError::CycleDetected(id) => write!(f, "cycle detected at resource: {id}"),

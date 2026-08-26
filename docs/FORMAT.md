@@ -164,10 +164,16 @@ lexicographically sortable, client-supplied). All times are `Instant` (i64 µs).
 - `PlaceHold { id, resource_id, span, ttl?: i64 }`: **`ttl` is a duration; the node assigns
   `expires_at` from its own clock and returns it opaque.** (v1's client-supplied absolute `expires_at`
   is removed, V2-DESIGN §2 Bug 2.)
+  *(v1 interim: the SQL adapter still accepts an absolute `expires_at` but clamps it to the server
+  clock plus `DELTAT_MAX_HOLD_TTL_MS`, default 1 hour, so the server is already the expiry
+  authority; the `ttl` duration contract lands with this format.)*
 - `ReleaseHold { id }`
 - `CommitHold { hold_id, booking_id, label? }`: **atomic** hold→booking under one lock, excluding the
   named hold from the conflict check. The single most important addition over v1 (Bug 1). Idempotent:
   re-committing an already-committed `booking_id` is a success echo.
+  *(The v1 SQL adapter already carries this verb: `UPDATE holds SET booking_id = $1 [, label = $2]
+  WHERE id = $3`, tag `UPDATE 1`. The idempotent success echo is still v2-only: today re-committing
+  errors because the hold no longer exists.)*
 
 **Bookings** (permanent claims):
 - `ConfirmBooking { id, resource_id, span, label? }`: direct booking without a prior hold.
@@ -287,7 +293,7 @@ When v1.0 freezes, this corpus *is* the spec; this document is its prose compani
 - Confirm the per-resource monotonic sequence number is derivable now (§6) so federation stays a seam.
 - Confirm no external consumer has byte-persisted v1 data before the ms→µs widening (the one breaking
   change; the audit found no released wire clients).
-- Decide the `ttl` clamp bounds (`MIN`/`MAX`/`DEFAULT` hold lifetime) and whether `Affected.expires_at`
+- Decide the `ttl` clamp bounds (`MIN`/`MAX`/`DEFAULT` hold lifetime; v1 ships a 1-hour max via `DELTAT_MAX_HOLD_TTL_MS`) and whether `Affected.expires_at`
   is the right channel for returning assigned expiry, or a dedicated `HoldPlaced` response variant.
 - Ratify the hold-capability model (V2-DESIGN §9 Q1): does `CommitHold` authorize on possession of
   `hold_id`, and if so does the format need a capability secret field reserved now?

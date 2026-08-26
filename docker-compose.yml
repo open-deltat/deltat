@@ -6,7 +6,9 @@ services:
     volumes:
       - deltat-data:/data
     environment:
-      - DELTAT_PASSWORD=deltat
+      # No default on purpose: export DELTAT_PASSWORD or put it in a .env file next to this
+      # compose file. A fixed known password here would be a public credential.
+      - DELTAT_PASSWORD=${DELTAT_PASSWORD:?set DELTAT_PASSWORD in your environment or .env file}
     restart: unless-stopped
 
 volumes:
