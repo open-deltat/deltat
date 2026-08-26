@@ -60,7 +60,7 @@ deltat is the reference implementation of [TAP](https://github.com/open-deltat/t
 
 ```bash
 docker run -p 5433:5433 -e DELTAT_PASSWORD=secret -v deltat-data:/data \
-  ghcr.io/open-deltat/deltat:0.2.0
+  ghcr.io/open-deltat/deltat:0.3.0
 ```
 
 Or install the crate, which needs a Rust toolchain:
