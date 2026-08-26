@@ -93,6 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // The local log_min_duration_statement: statements at or over this many ms are warned
+    // about and counted. Unset, unparseable, or 0 disables it.
+    let slow_query_ms: u64 = std::env::var("DELTAT_SLOW_QUERY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let tls_cert = std::env::var("DELTAT_TLS_CERT").ok();
     let tls_key = std::env::var("DELTAT_TLS_KEY").ok();
@@ -171,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // idle/max-age guards close inside the wire loop and return Ok, so those
                     // count as "normal" here. Startup failures log at warn with the peer since
                     // a debug-level auth failure would hide credential stuffing.
-                    let reason = match wire::process_connection_with_auth(socket, tm, auth, tls, max_conn_age_ms, max_idle_ms).await {
+                    let reason = match wire::process_connection_with_auth(socket, tm, auth, tls, max_conn_age_ms, max_idle_ms, slow_query_ms).await {
                         Ok(()) => "normal",
                         Err(e) => {
                             tracing::warn!("connection failed from {peer}: {e}");

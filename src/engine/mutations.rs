@@ -261,8 +261,8 @@ impl Engine {
     }
 
     /// Same removal as `release_hold`, counted as an expiry instead of a release. The reaper
-    /// calls this so the abandonment arithmetic (placed minus committed minus released minus
-    /// expired) stays exact: a reaped hold must not inflate the released count.
+    /// calls this so a reaped hold does not inflate the released count (HOLDS_EXPIRED_TOTAL
+    /// documents the abandonment arithmetic that depends on it).
     pub async fn expire_hold(&self, id: Ulid) -> Result<Ulid, EngineError> {
         let resource_id = self.remove_hold(id).await?;
         metrics::counter!(crate::observability::HOLDS_EXPIRED_TOTAL).increment(1);

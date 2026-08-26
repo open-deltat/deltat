@@ -50,6 +50,7 @@ pub struct DeltaTHandler {
     tenant_manager: Arc<TenantManager>,
     query_parser: Arc<DeltaTQueryParser>,
     subscribe_tx: Option<mpsc::UnboundedSender<SubscriptionCommand>>,
+    slow_query_threshold_ms: u64,
 }
 
 impl DeltaTHandler {
@@ -59,6 +60,7 @@ impl DeltaTHandler {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: None,
+            slow_query_threshold_ms: 0,
         }
     }
 
@@ -70,11 +72,16 @@ impl DeltaTHandler {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: Some(subscribe_tx),
+            slow_query_threshold_ms: 0,
         }
     }
 
-    /// The tenant is the pgwire database name; each tenant gets its own engine and WAL, and
-    /// every per-query metric is labeled with it (cardinality is bounded by MAX_TENANTS).
+    pub fn with_slow_query_threshold(mut self, threshold_ms: u64) -> Self {
+        self.slow_query_threshold_ms = threshold_ms;
+        self
+    }
+
+    /// The tenant is the pgwire database name; each tenant gets its own engine and WAL.
     fn tenant_name<C: ClientInfo>(client: &C) -> String {
         client
             .metadata()
@@ -83,15 +90,16 @@ impl DeltaTHandler {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    fn resolve_engine<C: ClientInfo>(&self, client: &C) -> PgWireResult<Arc<Engine>> {
+    /// Resolves the client's engine and the tenant label every per-query metric carries.
+    /// The label is the sanitized name engines are keyed on, not the raw database name:
+    /// raw aliases that differ only in stripped punctuation ("acme!", "a.c.m.e") all reach
+    /// tenant "acme"'s engine, so labeling with the raw name would mint a fresh series per
+    /// alias and the exporter's cardinality would no longer be bounded by MAX_TENANTS.
+    fn resolve_engine<C: ClientInfo>(&self, client: &C) -> PgWireResult<(Arc<Engine>, String)> {
         let db = Self::tenant_name(client);
-        self.tenant_manager.get_or_create(&db).map_err(|e| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "08006".into(),
-                format!("tenant error: {e}"),
-            )))
-        })
+        let tenant = TenantManager::sanitize(&db).map_err(tenant_err)?;
+        let engine = self.tenant_manager.get_or_create(&db).map_err(tenant_err)?;
+        Ok((engine, tenant))
     }
 
     fn parse_channel_resource_id(channel: &str) -> PgWireResult<Ulid> {
@@ -114,9 +122,8 @@ impl DeltaTHandler {
     /// The single statement funnel for both protocols: length check, parse, execute, metrics.
     ///
     /// The clock opens before the parse so a statement's recorded latency includes parsing, and
-    /// a statement rejected before execution still lands in PARSE_ERRORS_TOTAL: machine clients
-    /// emit malformed SQL at a nonzero rate, and rejections that appear in no metric are how
-    /// that goes unnoticed.
+    /// a statement rejected before execution still lands in PARSE_ERRORS_TOTAL: a rejection
+    /// that appears in no metric goes unnoticed.
     async fn run_statement(
         &self,
         engine: &Engine,
@@ -158,7 +165,7 @@ impl DeltaTHandler {
             .increment(1);
         metrics::histogram!(crate::observability::QUERY_DURATION_SECONDS, "command" => label, "tenant" => tenant.to_string())
             .record(elapsed.as_secs_f64());
-        record_slow_query(label, tenant, elapsed, slow_query_threshold_ms());
+        record_slow_query(label, tenant, elapsed, self.slow_query_threshold_ms);
         result.map_err(PgWireError::from)
     }
 
@@ -567,8 +574,7 @@ impl SimpleQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
-        let engine = self.resolve_engine(client)?;
-        let tenant = Self::tenant_name(client);
+        let (engine, tenant) = self.resolve_engine(client)?;
         self.run_statement(&engine, &tenant, query).await
     }
 }
@@ -645,8 +651,7 @@ impl ExtendedQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
-        let engine = self.resolve_engine(client)?;
-        let tenant = Self::tenant_name(client);
+        let (engine, tenant) = self.resolve_engine(client)?;
         let sql = substitute_params(portal);
         let mut responses = self.run_statement(&engine, &tenant, &sql).await?;
         Ok(responses.remove(0))
@@ -821,6 +826,7 @@ pub async fn process_connection(
     tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
     max_conn_age_ms: u64,
     max_idle_ms: u64,
+    slow_query_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     process_connection_with_auth(
         tcp_socket,
@@ -829,6 +835,7 @@ pub async fn process_connection(
         tls_acceptor,
         max_conn_age_ms,
         max_idle_ms,
+        slow_query_ms,
     )
     .await
 }
@@ -843,6 +850,8 @@ pub async fn process_connection_with_auth(
     // full, so they are the real defense against connection-exhaustion DoS.
     max_conn_age_ms: u64,
     max_idle_ms: u64,
+    // Statements at or over this many ms are warned about and counted; 0 disables it.
+    slow_query_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Negotiate TLS
     let mut socket: Framed<
@@ -859,10 +868,10 @@ pub async fn process_connection_with_auth(
 
     // 3. Per-connection handlers
     let auth_handler = Arc::new(DeltaTStartupHandler::new(auth_source));
-    let handler = Arc::new(DeltaTHandler::with_subscriptions(
-        tenant_manager.clone(),
-        subscribe_tx,
-    ));
+    let handler = Arc::new(
+        DeltaTHandler::with_subscriptions(tenant_manager.clone(), subscribe_tx)
+            .with_slow_query_threshold(slow_query_ms),
+    );
     let noop = Arc::new(NoopHandler);
 
     // 4. Forwarder tasks state
@@ -986,7 +995,7 @@ pub async fn process_connection_with_auth(
                             }
                             // Resolve the engine to get the notify hub
                             let engine = match handler.resolve_engine(&socket) {
-                                Ok(e) => e,
+                                Ok((e, _)) => e,
                                 Err(_) => continue,
                             };
                             // Defense in depth against a delete racing between the LISTEN's
@@ -1123,18 +1132,6 @@ fn engine_err(e: crate::engine::EngineError) -> PgWireError {
     )))
 }
 
-/// DELTAT_SLOW_QUERY_MS, the local log_min_duration_statement: statements taking at least this
-/// many ms are warned about and counted. Unset, unparseable, or 0 disables it. Read once, like
-/// every other DELTAT_ knob (main.rs fixes them at startup).
-fn slow_query_threshold_ms() -> u64 {
-    static THRESHOLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *THRESHOLD_MS.get_or_init(|| parse_slow_query_ms(std::env::var("DELTAT_SLOW_QUERY_MS").ok()))
-}
-
-fn parse_slow_query_ms(raw: Option<String>) -> u64 {
-    raw.and_then(|v| v.parse().ok()).unwrap_or(0)
-}
-
 /// Logs the command label, never the statement text: query text can carry customer
 /// identifiers, and nothing else in this file logs it either.
 fn record_slow_query(command: &'static str, tenant: &str, elapsed: Duration, threshold_ms: u64) {
@@ -1153,6 +1150,14 @@ fn span_err(msg: &'static str) -> PgWireError {
         "ERROR".into(),
         "22007".into(),
         msg.into(),
+    )))
+}
+
+fn tenant_err(e: std::io::Error) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        "08006".into(),
+        format!("tenant error: {e}"),
     )))
 }
 
@@ -1779,90 +1784,25 @@ mod tests {
 
     // ── metrics recording ────────────────────────────────────────
 
-    use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
-    use std::sync::Mutex;
+    use crate::test_metrics::{block_on, with_metrics};
 
-    /// Log-everything local recorder: each counter increment and histogram sample is kept with
-    /// its full label set, so tests can assert exactly what a code path recorded.
-    #[derive(Default)]
-    struct MetricLog {
-        counters: Mutex<Vec<(Key, u64)>>,
-        histograms: Mutex<Vec<(Key, f64)>>,
-    }
-
-    impl MetricLog {
-        /// Sum of increments to counter `name`, restricted to entries carrying every label pair.
-        fn counter_total(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
-            self.counters
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(key, _)| key_matches(key, name, labels))
-                .map(|(_, v)| v)
-                .sum()
-        }
-
-        fn histogram_recorded(&self, name: &str, labels: &[(&str, &str)]) -> bool {
-            self.histograms.lock().unwrap().iter().any(|(key, _)| key_matches(key, name, labels))
-        }
-    }
-
-    fn key_matches(key: &Key, name: &str, labels: &[(&str, &str)]) -> bool {
-        key.name() == name
-            && labels
-                .iter()
-                .all(|(lk, lv)| key.labels().any(|l| l.key() == *lk && l.value() == *lv))
-    }
-
-    struct RecordingHandle {
-        key: Key,
-        log: Arc<MetricLog>,
-    }
-
-    impl metrics::CounterFn for RecordingHandle {
-        fn increment(&self, value: u64) {
-            self.log.counters.lock().unwrap().push((self.key.clone(), value));
-        }
-        fn absolute(&self, _value: u64) {}
-    }
-
-    impl metrics::HistogramFn for RecordingHandle {
-        fn record(&self, value: f64) {
-            self.log.histograms.lock().unwrap().push((self.key.clone(), value));
-        }
-    }
-
-    struct TestRecorder(Arc<MetricLog>);
-
-    impl Recorder for TestRecorder {
-        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-        fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
-            Counter::from_arc(Arc::new(RecordingHandle { key: key.clone(), log: self.0.clone() }))
-        }
-        fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
-            Gauge::noop()
-        }
-        fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
-            Histogram::from_arc(Arc::new(RecordingHandle { key: key.clone(), log: self.0.clone() }))
-        }
-    }
-
-    /// Run `f` with a fresh local recorder and hand back what it captured. The recorder is
-    /// thread-local, so async work goes through `block_on` (current-thread runtime) inside `f`.
-    fn with_metrics<T>(f: impl FnOnce() -> T) -> (Arc<MetricLog>, T) {
-        let log = Arc::new(MetricLog::default());
-        let out = metrics::with_local_recorder(&TestRecorder(log.clone()), f);
-        (log, out)
-    }
-
-    fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(fut)
+    #[tokio::test]
+    async fn resolve_engine_returns_the_sanitized_tenant_label() {
+        // Raw aliases like "acme!" pass auth and reach tenant "acme"'s engine (sanitize
+        // collapses them), so the metric label must be the sanitized engine key: labeling
+        // with the raw name mints a fresh series per alias, unbounded by MAX_TENANTS.
+        let dir = std::env::temp_dir().join("deltat_test_wire_tenant_label");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tm = Arc::new(TenantManager::new(dir, 1000, 604_800_000));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handler = DeltaTHandler::with_subscriptions(tm, tx);
+        let mut client =
+            pgwire::api::DefaultClient::<String>::new("127.0.0.1:0".parse().unwrap(), false);
+        client
+            .metadata_mut()
+            .insert("database".to_string(), "acme!".to_string());
+        let (_engine, tenant) = handler.resolve_engine(&client).unwrap();
+        assert_eq!(tenant, "acme");
     }
 
     #[test]
@@ -1926,13 +1866,6 @@ mod tests {
         assert_eq!(log.counter_total(crate::observability::PARSE_ERRORS_TOTAL, &[]), 2);
         // Neither rejection became a Command, so the query counter must not move.
         assert_eq!(log.counter_total(crate::observability::QUERIES_TOTAL, &[]), 0);
-    }
-
-    #[test]
-    fn parse_slow_query_ms_treats_unset_and_junk_as_disabled() {
-        assert_eq!(parse_slow_query_ms(None), 0);
-        assert_eq!(parse_slow_query_ms(Some("250".into())), 250);
-        assert_eq!(parse_slow_query_ms(Some("junk".into())), 0);
     }
 
     #[test]

@@ -204,8 +204,8 @@ fn handle_non_append(wal: &mut Wal, cmd: WalCommand, recording: &mut Option<Vec<
         WalCommand::AppendAtomic { events, response } => {
             // Buffer every event, then one flush_sync, the same shape as flush_batch but for a
             // single response. Always flush so partial bytes don't leak into the next write.
-            // Same histograms as flush_and_respond: this is the terminal write of the booking
-            // flow, the fsync whose durability latency matters most.
+            // This is the terminal write of the booking flow, the fsync whose durability
+            // latency matters most.
             metrics::histogram!(crate::observability::WAL_FLUSH_BATCH_SIZE)
                 .record(events.len() as f64);
             let flush_start = std::time::Instant::now();
