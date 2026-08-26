@@ -206,7 +206,10 @@ All times are **Unix milliseconds**. Intervals are half-open `[start, end)`, so 
 | `DELTAT_COMPACT_THRESHOLD` | `1000` | WAL appends before a compaction runs |
 | `DELTAT_GC_RETENTION_MS` | `604800000` | Age (7 days) past which finished bookings and expired holds are collected |
 | `DELTAT_MAX_HOLD_TTL_MS` | `3600000` | Ceiling (1 hour) on hold lifetime: a hold's requested `expires_at` is clamped to server now + this |
-| `DELTAT_METRICS_PORT` | unset | Prometheus `/metrics` port; metrics are off when unset |
+| `DELTAT_METRICS_PORT` | unset | Prometheus `/metrics` port; metrics are off when unset (see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)) |
+| `DELTAT_LOG_FORMAT` | `text` | Log output format. `json` (case-insensitive) emits newline-delimited JSON for log collectors; anything else means human-readable text |
+| `DELTAT_SLOW_QUERY_MS` | `0` | Statements taking at least this many ms are logged at `warn` and counted. `0` disables the slow-query log |
+| `RUST_LOG` | `info` | Log level filter in [tracing `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html), e.g. `deltat=debug`. Unset or unparseable falls back to `info` |
 | `DELTAT_TLS_CERT` | unset | PEM certificate path; TLS is off unless both cert and key are set |
 | `DELTAT_TLS_KEY` | unset | PEM private key path; TLS is off unless both cert and key are set |
 
