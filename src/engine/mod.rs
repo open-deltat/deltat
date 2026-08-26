@@ -143,15 +143,33 @@ fn flush_and_respond(
 /// else. A failed recovery poisons the WAL: every append errors and retries recovery, so no
 /// acknowledgement is ever issued on a broken tail.
 fn recover_wal(wal: &mut Wal) {
-    if let Err(e) = wal.recover() {
-        tracing::error!("WAL recovery after a flush failure failed: {e}");
+    match wal.recover() {
+        Ok(()) => wal_poisoned_gauge(wal).set(0.0),
+        Err(e) => {
+            tracing::error!("WAL recovery after a flush failure failed: {e}");
+            wal_poisoned_gauge(wal).set(1.0);
+        }
     }
+}
+
+/// The per-tenant poison gauge. The tenant label is the WAL filename's stem: the tenant
+/// manager derives the path as `<data_dir>/<tenant>.wal`, and this is the only tenant
+/// identity the writer task has.
+fn wal_poisoned_gauge(wal: &Wal) -> metrics::Gauge {
+    let tenant = wal
+        .path()
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    metrics::gauge!(crate::observability::WAL_POISONED, "tenant" => tenant)
 }
 
 fn flush_batch(wal: &mut Wal, batch: &mut [(Event, oneshot::Sender<io::Result<()>>)]) -> io::Result<()> {
     let mut append_err: Option<io::Error> = None;
     for (event, _) in batch.iter() {
         if let Err(e) = wal.append_buffered(event) {
+            metrics::counter!(crate::observability::WAL_ERRORS_TOTAL, "kind" => "append")
+                .increment(1);
             append_err = Some(e);
             break;
         }
@@ -159,6 +177,9 @@ fn flush_batch(wal: &mut Wal, batch: &mut [(Event, oneshot::Sender<io::Result<()
     // Always flush, even on append error, so partially buffered bytes
     // don't leak into the next batch (callers were told this batch failed).
     let flush_err = wal.flush_sync().err();
+    if flush_err.is_some() {
+        metrics::counter!(crate::observability::WAL_ERRORS_TOTAL, "kind" => "flush").increment(1);
+    }
     if let Some(e) = append_err {
         return Err(e);
     }
@@ -183,14 +204,27 @@ fn handle_non_append(wal: &mut Wal, cmd: WalCommand, recording: &mut Option<Vec<
         WalCommand::AppendAtomic { events, response } => {
             // Buffer every event, then one flush_sync, the same shape as flush_batch but for a
             // single response. Always flush so partial bytes don't leak into the next write.
+            // Same histograms as flush_and_respond: this is the terminal write of the booking
+            // flow, the fsync whose durability latency matters most.
+            metrics::histogram!(crate::observability::WAL_FLUSH_BATCH_SIZE)
+                .record(events.len() as f64);
+            let flush_start = std::time::Instant::now();
             let mut append_err = None;
             for event in &events {
                 if let Err(e) = wal.append_buffered(event) {
+                    metrics::counter!(crate::observability::WAL_ERRORS_TOTAL, "kind" => "append")
+                        .increment(1);
                     append_err = Some(e);
                     break;
                 }
             }
             let flush_err = wal.flush_sync().err();
+            if flush_err.is_some() {
+                metrics::counter!(crate::observability::WAL_ERRORS_TOTAL, "kind" => "flush")
+                    .increment(1);
+            }
+            metrics::histogram!(crate::observability::WAL_FLUSH_DURATION_SECONDS)
+                .record(flush_start.elapsed().as_secs_f64());
             let result = match append_err.or(flush_err) {
                 Some(e) => Err(e),
                 None => Ok(()),
@@ -208,8 +242,18 @@ fn handle_non_append(wal: &mut Wal, cmd: WalCommand, recording: &mut Option<Vec<
         }
         WalCommand::Compact { events, response } => {
             let events = merge_recorded(events, recording.take().unwrap_or_default());
+            // The rewrite and swap run inline in this single writer task, so every write on the
+            // tenant queues behind this duration.
+            let compact_start = std::time::Instant::now();
             let result = Wal::write_compact_file(wal.path(), &events)
                 .and_then(|()| wal.swap_compact_file());
+            metrics::histogram!(crate::observability::WAL_COMPACTION_DURATION_SECONDS)
+                .record(compact_start.elapsed().as_secs_f64());
+            // A successful swap replaces whatever tail a failed flush left, clearing the
+            // poisoned state (see swap_compact_file), so the gauge follows it down.
+            if result.is_ok() {
+                wal_poisoned_gauge(wal).set(0.0);
+            }
             let _ = response.send(result);
         }
         WalCommand::AppendsSinceCompact { response } => {

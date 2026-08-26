@@ -249,10 +249,27 @@ impl Engine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let event = Event::HoldPlaced { id, resource_id, span, expires_at };
-        self.persist_and_apply(resource_id, &mut guard, &event).await
+        self.persist_and_apply(resource_id, &mut guard, &event).await?;
+        metrics::counter!(crate::observability::HOLDS_PLACED_TOTAL).increment(1);
+        Ok(())
     }
 
     pub async fn release_hold(&self, id: Ulid) -> Result<Ulid, EngineError> {
+        let resource_id = self.remove_hold(id).await?;
+        metrics::counter!(crate::observability::HOLDS_RELEASED_TOTAL).increment(1);
+        Ok(resource_id)
+    }
+
+    /// Same removal as `release_hold`, counted as an expiry instead of a release. The reaper
+    /// calls this so the abandonment arithmetic (placed minus committed minus released minus
+    /// expired) stays exact: a reaped hold must not inflate the released count.
+    pub async fn expire_hold(&self, id: Ulid) -> Result<Ulid, EngineError> {
+        let resource_id = self.remove_hold(id).await?;
+        metrics::counter!(crate::observability::HOLDS_EXPIRED_TOTAL).increment(1);
+        Ok(resource_id)
+    }
+
+    async fn remove_hold(&self, id: Ulid) -> Result<Ulid, EngineError> {
         let (resource_id, mut guard) = self.resolve_entity_write(&id).await?;
         find_interval_of_kind(&guard, &id, is_hold)?;
         let event = Event::HoldReleased { id, resource_id };
@@ -299,6 +316,8 @@ impl Engine {
         self.notify.send(resource_id, &book);
         self.notify_ancestors(parent_id, &release);
         self.notify_ancestors(parent_id, &book);
+        metrics::counter!(crate::observability::HOLDS_COMMITTED_TOTAL).increment(1);
+        metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL).increment(1);
         Ok(())
     }
 
@@ -330,7 +349,9 @@ impl Engine {
         check_no_conflict(&guard, &span, self.now_ms())?;
 
         let event = Event::BookingConfirmed { id, resource_id, span, label };
-        self.persist_and_apply(resource_id, &mut guard, &event).await
+        self.persist_and_apply(resource_id, &mut guard, &event).await?;
+        metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL).increment(1);
+        Ok(())
     }
 
     /// Atomically book multiple slots. All-or-nothing: if any booking conflicts,
@@ -455,6 +476,8 @@ impl Engine {
                 self.notify_ancestors(parent_id, event);
             }
         }
+        metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL)
+            .increment(events.len() as u64);
 
         Ok(())
     }
@@ -464,6 +487,7 @@ impl Engine {
         find_interval_of_kind(&guard, &id, is_booking)?;
         let event = Event::BookingCancelled { id, resource_id };
         self.persist_and_apply(resource_id, &mut guard, &event).await?;
+        metrics::counter!(crate::observability::BOOKINGS_DELETED_TOTAL).increment(1);
         Ok(resource_id)
     }
 
@@ -618,6 +642,8 @@ impl Engine {
             collected += removed_ids.len();
         }
 
+        metrics::counter!(crate::observability::GC_INTERVALS_COLLECTED_TOTAL)
+            .increment(collected as u64);
         collected
     }
 

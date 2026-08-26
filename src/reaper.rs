@@ -19,7 +19,7 @@ pub async fn run_reaper(engine: Arc<Engine>) {
         let now = engine.now_ms();
         let expired = engine.collect_expired_holds(now);
         for (hold_id, _resource_id) in expired {
-            match engine.release_hold(hold_id).await {
+            match engine.expire_hold(hold_id).await {
                 Ok(_) => info!("reaped expired hold {hold_id}"),
                 Err(e) => {
                     // May already have been released, that's fine
