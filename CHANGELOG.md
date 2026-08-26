@@ -6,6 +6,29 @@ All notable changes to deltat are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- The `/metrics` endpoint (`DELTAT_METRICS_PORT`) now reports what the server is actually doing:
+  per-command query rates and latencies labelled by tenant with error kinds split out, connection
+  churn and close reasons, WAL flush and compaction timing, a per-tenant poisoned-WAL gauge, the
+  hold funnel (placed, committed, released, expired), booking and GC counters, rejected statements,
+  and dropped LISTEN notifications. Documented metric by metric in `docs/OBSERVABILITY.md`, with an
+  importable Grafana dashboard in `grafana/deltat.json`.
+- Machine-readable logs: `DELTAT_LOG_FORMAT=json` switches output to newline-delimited JSON for log
+  collectors, `RUST_LOG` filtering is honored and documented, and a panic in a connection task is
+  routed through the log stream instead of dying on stderr outside it.
+- A slow-query log: statements at or over `DELTAT_SLOW_QUERY_MS` are logged at `warn` with the
+  command and tenant, never the statement text, and counted, so a latency regression names its
+  culprit. This is the `log_min_duration_statement` equivalent Postgres operators expect.
+
+### Changed
+- Errors cross the wire with real SQLSTATEs instead of a catch-all `P0001`. Retryable contention (a
+  lost race for a span, or capacity filling first) reports `40001`, the code PostgreSQL drivers
+  already treat as "retry"; client mistakes and server faults report their own codes, so a caller
+  can branch on the class of failure instead of parsing message text.
+
+All of it stays off by default and is switchable independently: no `DELTAT_METRICS_PORT` means no
+endpoint and no per-query recording at all, and logs stay human-readable unless asked otherwise.
+
 ## [0.2.0] - 2026-08-26
 
 The security and durability release. A full-repo audit produced 24 confirmed findings across

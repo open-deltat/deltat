@@ -50,6 +50,7 @@ pub struct DeltaTHandler {
     tenant_manager: Arc<TenantManager>,
     query_parser: Arc<DeltaTQueryParser>,
     subscribe_tx: Option<mpsc::UnboundedSender<SubscriptionCommand>>,
+    slow_query_threshold_ms: u64,
 }
 
 impl DeltaTHandler {
@@ -59,6 +60,7 @@ impl DeltaTHandler {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: None,
+            slow_query_threshold_ms: 0,
         }
     }
 
@@ -70,22 +72,34 @@ impl DeltaTHandler {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: Some(subscribe_tx),
+            slow_query_threshold_ms: 0,
         }
     }
 
-    fn resolve_engine<C: ClientInfo>(&self, client: &C) -> PgWireResult<Arc<Engine>> {
-        let db = client
+    pub fn with_slow_query_threshold(mut self, threshold_ms: u64) -> Self {
+        self.slow_query_threshold_ms = threshold_ms;
+        self
+    }
+
+    /// The tenant is the pgwire database name; each tenant gets its own engine and WAL.
+    fn tenant_name<C: ClientInfo>(client: &C) -> String {
+        client
             .metadata()
             .get("database")
             .cloned()
-            .unwrap_or_else(|| "default".to_string());
-        self.tenant_manager.get_or_create(&db).map_err(|e| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "08006".into(),
-                format!("tenant error: {e}"),
-            )))
-        })
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Resolves the client's engine and the tenant label every per-query metric carries.
+    /// The label is the sanitized name engines are keyed on, not the raw database name:
+    /// raw aliases that differ only in stripped punctuation ("acme!", "a.c.m.e") all reach
+    /// tenant "acme"'s engine, so labeling with the raw name would mint a fresh series per
+    /// alias and the exporter's cardinality would no longer be bounded by MAX_TENANTS.
+    fn resolve_engine<C: ClientInfo>(&self, client: &C) -> PgWireResult<(Arc<Engine>, String)> {
+        let db = Self::tenant_name(client);
+        let tenant = TenantManager::sanitize(&db).map_err(tenant_err)?;
+        let engine = self.tenant_manager.get_or_create(&db).map_err(tenant_err)?;
+        Ok((engine, tenant))
     }
 
     fn parse_channel_resource_id(channel: &str) -> PgWireResult<Ulid> {
@@ -105,27 +119,65 @@ impl DeltaTHandler {
         })
     }
 
+    /// The single statement funnel for both protocols: length check, parse, execute, metrics.
+    ///
+    /// The clock opens before the parse so a statement's recorded latency includes parsing, and
+    /// a statement rejected before execution still lands in PARSE_ERRORS_TOTAL: a rejection
+    /// that appears in no metric goes unnoticed.
+    async fn run_statement(
+        &self,
+        engine: &Engine,
+        tenant: &str,
+        sql: &str,
+    ) -> PgWireResult<Vec<Response>> {
+        let start = std::time::Instant::now();
+        let parsed = enforce_query_len(sql.len()).and_then(|()| sql::parse_sql(sql).map_err(sql_err));
+        let cmd = match parsed {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                metrics::counter!(crate::observability::PARSE_ERRORS_TOTAL).increment(1);
+                return Err(e);
+            }
+        };
+        self.execute_command(engine, tenant, cmd, start).await
+    }
+
+    /// `start` is the caller's clock, opened before parsing, so the recorded duration covers
+    /// the whole statement rather than just engine time.
     async fn execute_command(
         &self,
         engine: &Engine,
+        tenant: &str,
         cmd: Command,
+        start: std::time::Instant,
     ) -> PgWireResult<Vec<Response>> {
         let label = crate::observability::command_label(&cmd);
-        let start = std::time::Instant::now();
         let result = self.execute_command_inner(engine, cmd).await;
-        let status = if result.is_ok() { "ok" } else { "error" };
-        metrics::counter!(crate::observability::QUERIES_TOTAL, "command" => label, "status" => status)
-            .increment(1);
-        metrics::histogram!(crate::observability::QUERY_DURATION_SECONDS, "command" => label)
-            .record(start.elapsed().as_secs_f64());
-        result
+        let elapsed = start.elapsed();
+        // "kind" separates the expected steady state (conflicts) from real failures. Values stay
+        // bounded: the EngineError kinds plus "none" (success) and "other" (non-engine errors).
+        let (status, kind) = match &result {
+            Ok(_) => ("ok", "none"),
+            Err(WireError::Engine(e)) => ("error", e.kind()),
+            Err(WireError::Pg(_)) => ("error", "other"),
+        };
+        record_query_metrics(
+            label,
+            status,
+            kind,
+            tenant,
+            elapsed,
+            crate::observability::enabled(),
+        );
+        record_slow_query(label, tenant, elapsed, self.slow_query_threshold_ms);
+        result.map_err(PgWireError::from)
     }
 
     async fn execute_command_inner(
         &self,
         engine: &Engine,
         cmd: Command,
-    ) -> PgWireResult<Vec<Response>> {
+    ) -> Result<Vec<Response>, WireError> {
         match cmd {
             Command::InsertResource {
                 id,
@@ -136,17 +188,16 @@ impl DeltaTHandler {
             } => {
                 engine
                     .create_resource(id, parent_id, name, capacity, buffer_after)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
             }
             Command::BatchInsertResources { resources } => {
                 let count = resources.len();
-                engine.batch_create_resources(resources).await.map_err(engine_err)?;
+                engine.batch_create_resources(resources).await?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
             }
             Command::DeleteResource { id } => {
-                engine.delete_resource(id).await.map_err(engine_err)?;
+                engine.delete_resource(id).await?;
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
             }
             Command::InsertRule {
@@ -159,8 +210,7 @@ impl DeltaTHandler {
                 let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
                     .add_rule(id, resource_id, span, blocking)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
             }
             Command::BatchInsertRules { rules } => {
@@ -173,11 +223,11 @@ impl DeltaTHandler {
                             .map_err(span_err)
                     })
                     .collect::<PgWireResult<Vec<_>>>()?;
-                engine.batch_add_rules(batch).await.map_err(engine_err)?;
+                engine.batch_add_rules(batch).await?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
             }
             Command::DeleteRule { id } => {
-                engine.remove_rule(id).await.map_err(engine_err)?;
+                engine.remove_rule(id).await?;
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
             }
             Command::InsertHold {
@@ -190,19 +240,17 @@ impl DeltaTHandler {
                 let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
                     .place_hold(id, resource_id, span, expires_at)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
             }
             Command::DeleteHold { id } => {
-                engine.release_hold(id).await.map_err(engine_err)?;
+                engine.release_hold(id).await?;
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
             }
             Command::CommitHold { hold_id, booking_id, label } => {
                 engine
                     .commit_hold(hold_id, booking_id, label)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
             Command::InsertBooking {
@@ -215,8 +263,7 @@ impl DeltaTHandler {
                 let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
                     .confirm_booking(id, resource_id, span, label)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
             }
             Command::BatchInsertBookings { bookings } => {
@@ -231,12 +278,11 @@ impl DeltaTHandler {
                     .collect::<PgWireResult<Vec<_>>>()?;
                 engine
                     .batch_confirm_bookings(batch)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
             }
             Command::DeleteBooking { id } => {
-                engine.cancel_booking(id).await.map_err(engine_err)?;
+                engine.cancel_booking(id).await?;
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
             }
             Command::SelectAvailability {
@@ -247,8 +293,7 @@ impl DeltaTHandler {
             } => {
                 let slots = engine
                     .compute_availability(resource_id, start, end, min_duration)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
 
                 let schema = Arc::new(availability_schema());
 
@@ -278,8 +323,7 @@ impl DeltaTHandler {
             } => {
                 let slots = engine
                     .compute_multi_availability(&resource_ids, start, end, min_available, min_duration)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
 
                 let schema = Arc::new(multi_availability_schema());
 
@@ -306,8 +350,7 @@ impl DeltaTHandler {
             } => {
                 let slots = engine
                     .get_availability_multi(&resource_ids, start, end, min_duration)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
 
                 // Per-resource rows reuse the single-availability schema (resource_id, start, end).
                 let schema = Arc::new(availability_schema());
@@ -331,16 +374,14 @@ impl DeltaTHandler {
             Command::UpdateResource { id, name, capacity, buffer_after } => {
                 engine
                     .update_resource(id, name, capacity, buffer_after)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
             Command::UpdateRule { id, start, end, blocking } => {
                 let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
                     .update_rule(id, span, blocking)
-                    .await
-                    .map_err(engine_err)?;
+                    .await?;
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
             Command::SelectResources { parent_id } => {
@@ -360,7 +401,7 @@ impl DeltaTHandler {
                 }))
             }
             Command::SelectRules { resource_id } => {
-                let rules = engine.get_rules(resource_id).await.map_err(engine_err)?;
+                let rules = engine.get_rules(resource_id).await?;
                 Ok(encode_rows(Arc::new(rules_schema()), rules, |e, r| {
                     e.encode_field(&r.id.to_string())?;
                     e.encode_field(&r.resource_id.to_string())?;
@@ -370,7 +411,7 @@ impl DeltaTHandler {
                 }))
             }
             Command::SelectBookings { resource_id } => {
-                let bookings = engine.get_bookings(resource_id).await.map_err(engine_err)?;
+                let bookings = engine.get_bookings(resource_id).await?;
                 Ok(encode_rows(Arc::new(bookings_schema()), bookings, |e, b| {
                     e.encode_field(&b.id.to_string())?;
                     e.encode_field(&b.resource_id.to_string())?;
@@ -380,7 +421,7 @@ impl DeltaTHandler {
                 }))
             }
             Command::SelectHolds { resource_id } => {
-                let holds = engine.get_holds(resource_id).await.map_err(engine_err)?;
+                let holds = engine.get_holds(resource_id).await?;
                 Ok(encode_rows(Arc::new(holds_schema()), holds, |e, h| {
                     e.encode_field(&h.id.to_string())?;
                     e.encode_field(&h.resource_id.to_string())?;
@@ -390,7 +431,7 @@ impl DeltaTHandler {
                 }))
             }
             Command::SelectBookingsMulti { resource_ids } => {
-                let bookings = engine.get_bookings_multi(&resource_ids).await.map_err(engine_err)?;
+                let bookings = engine.get_bookings_multi(&resource_ids).await?;
                 Ok(encode_rows(Arc::new(bookings_schema()), bookings, |e, b| {
                     e.encode_field(&b.id.to_string())?;
                     e.encode_field(&b.resource_id.to_string())?;
@@ -400,7 +441,7 @@ impl DeltaTHandler {
                 }))
             }
             Command::SelectHoldsMulti { resource_ids } => {
-                let holds = engine.get_holds_multi(&resource_ids).await.map_err(engine_err)?;
+                let holds = engine.get_holds_multi(&resource_ids).await?;
                 Ok(encode_rows(Arc::new(holds_schema()), holds, |e, h| {
                     e.encode_field(&h.id.to_string())?;
                     e.encode_field(&h.resource_id.to_string())?;
@@ -421,7 +462,8 @@ impl DeltaTHandler {
                         "ERROR".into(),
                         "42704".into(),
                         format!("resource does not exist: {resource_id}"),
-                    ))));
+                    )))
+                    .into());
                 }
                 if let Some(ref tx) = self.subscribe_tx {
                     let _ = tx.send(SubscriptionCommand::Subscribe(resource_id));
@@ -536,10 +578,8 @@ impl SimpleQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
-        enforce_query_len(query.len())?;
-        let engine = self.resolve_engine(client)?;
-        let cmd = sql::parse_sql(query).map_err(sql_err)?;
-        self.execute_command(&engine, cmd).await
+        let (engine, tenant) = self.resolve_engine(client)?;
+        self.run_statement(&engine, &tenant, query).await
     }
 }
 
@@ -615,11 +655,9 @@ impl ExtendedQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
-        let engine = self.resolve_engine(client)?;
+        let (engine, tenant) = self.resolve_engine(client)?;
         let sql = substitute_params(portal);
-        enforce_query_len(sql.len())?;
-        let cmd = sql::parse_sql(&sql).map_err(sql_err)?;
-        let mut responses = self.execute_command(&engine, cmd).await?;
+        let mut responses = self.run_statement(&engine, &tenant, &sql).await?;
         Ok(responses.remove(0))
     }
 
@@ -775,7 +813,10 @@ async fn forward_resource_events(
                     break;
                 }
             }
-            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Lagged(missed)) => {
+                metrics::counter!(crate::observability::NOTIFICATIONS_LAGGED_TOTAL)
+                    .increment(missed);
+            }
             Err(RecvError::Closed) => break,
         }
     }
@@ -789,6 +830,7 @@ pub async fn process_connection(
     tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
     max_conn_age_ms: u64,
     max_idle_ms: u64,
+    slow_query_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     process_connection_with_auth(
         tcp_socket,
@@ -797,6 +839,7 @@ pub async fn process_connection(
         tls_acceptor,
         max_conn_age_ms,
         max_idle_ms,
+        slow_query_ms,
     )
     .await
 }
@@ -811,6 +854,8 @@ pub async fn process_connection_with_auth(
     // full, so they are the real defense against connection-exhaustion DoS.
     max_conn_age_ms: u64,
     max_idle_ms: u64,
+    // Statements at or over this many ms are warned about and counted; 0 disables it.
+    slow_query_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Negotiate TLS
     let mut socket: Framed<
@@ -827,10 +872,10 @@ pub async fn process_connection_with_auth(
 
     // 3. Per-connection handlers
     let auth_handler = Arc::new(DeltaTStartupHandler::new(auth_source));
-    let handler = Arc::new(DeltaTHandler::with_subscriptions(
-        tenant_manager.clone(),
-        subscribe_tx,
-    ));
+    let handler = Arc::new(
+        DeltaTHandler::with_subscriptions(tenant_manager.clone(), subscribe_tx)
+            .with_slow_query_threshold(slow_query_ms),
+    );
     let noop = Arc::new(NoopHandler);
 
     // 4. Forwarder tasks state
@@ -954,7 +999,7 @@ pub async fn process_connection_with_auth(
                             }
                             // Resolve the engine to get the notify hub
                             let engine = match handler.resolve_engine(&socket) {
-                                Ok(e) => e,
+                                Ok((e, _)) => e,
                                 Err(_) => continue,
                             };
                             // Defense in depth against a delete racing between the LISTEN's
@@ -1050,12 +1095,79 @@ fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
     }
 }
 
+/// An engine error keeps its typed form until [`DeltaTHandler::execute_command`] has read its
+/// kind for the metric labels; everything already wire-shaped (parse, span, protocol) passes
+/// through untouched.
+enum WireError {
+    Engine(crate::engine::EngineError),
+    Pg(PgWireError),
+}
+
+impl From<crate::engine::EngineError> for WireError {
+    fn from(e: crate::engine::EngineError) -> Self {
+        WireError::Engine(e)
+    }
+}
+
+impl From<PgWireError> for WireError {
+    fn from(e: PgWireError) -> Self {
+        WireError::Pg(e)
+    }
+}
+
+impl From<WireError> for PgWireError {
+    fn from(e: WireError) -> Self {
+        match e {
+            WireError::Engine(e) => engine_err(e),
+            WireError::Pg(e) => e,
+        }
+    }
+}
+
+/// The taxonomy boundary: every engine error crosses the wire exactly once, so this is where
+/// ENGINE_ERRORS_TOTAL fires and where the error's own SQLSTATE (retryable 40001 contention
+/// vs client mistakes vs server faults) replaces a catch-all code.
+/// Records the per-query counter and latency, or skips both when no recorder is installed.
+///
+/// These are the only labelled calls on the query path. The metrics macros build the label set
+/// before consulting the recorder, so leaving them unguarded allocates the tenant label twice per
+/// statement even with the exporter switched off. `enabled` is a parameter rather than a direct
+/// read so the skip is testable without mutating shared state under a parallel test runner.
+fn record_query_metrics(
+    label: &'static str,
+    status: &'static str,
+    kind: &'static str,
+    tenant: &str,
+    elapsed: std::time::Duration,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    metrics::counter!(crate::observability::QUERIES_TOTAL, "command" => label, "status" => status, "kind" => kind, "tenant" => tenant.to_string())
+        .increment(1);
+    metrics::histogram!(crate::observability::QUERY_DURATION_SECONDS, "command" => label, "tenant" => tenant.to_string())
+        .record(elapsed.as_secs_f64());
+}
+
 fn engine_err(e: crate::engine::EngineError) -> PgWireError {
+    metrics::counter!(crate::observability::ENGINE_ERRORS_TOTAL, "kind" => e.kind()).increment(1);
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".into(),
-        "P0001".into(),
+        e.sqlstate().into(),
         e.to_string(),
     )))
+}
+
+/// Logs the command label, never the statement text: query text can carry customer
+/// identifiers, and nothing else in this file logs it either.
+fn record_slow_query(command: &'static str, tenant: &str, elapsed: Duration, threshold_ms: u64) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    if threshold_ms == 0 || elapsed_ms < threshold_ms {
+        return;
+    }
+    tracing::warn!(command, tenant, elapsed_ms, threshold_ms, "slow query");
+    metrics::counter!(crate::observability::SLOW_QUERIES_TOTAL, "command" => command).increment(1);
 }
 
 /// Reject an invalid time range from untrusted SQL input cleanly, instead of letting
@@ -1065,6 +1177,14 @@ fn span_err(msg: &'static str) -> PgWireError {
         "ERROR".into(),
         "22007".into(),
         msg.into(),
+    )))
+}
+
+fn tenant_err(e: std::io::Error) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        "08006".into(),
+        format!("tenant error: {e}"),
     )))
 }
 
@@ -1471,6 +1591,16 @@ mod tests {
         path
     }
 
+    /// Direct-command shim for tests that build a Command by hand; the protocol paths reach
+    /// execute_command through run_statement, which opens the clock itself.
+    async fn exec(
+        handler: &DeltaTHandler,
+        engine: &Engine,
+        cmd: Command,
+    ) -> PgWireResult<Vec<Response>> {
+        handler.execute_command(engine, "test", cmd, std::time::Instant::now()).await
+    }
+
     fn setup_handler_with_subs() -> (
         DeltaTHandler,
         mpsc::UnboundedReceiver<SubscriptionCommand>,
@@ -1498,7 +1628,7 @@ mod tests {
         engine.create_resource(rid, None, None, 1, None).await.unwrap();
         let channel = format!("resource_{rid}");
         let cmd = Command::Listen { channel };
-        let responses = handler.execute_command(&engine, cmd).await.unwrap();
+        let responses = exec(&handler, &engine, cmd).await.unwrap();
         assert_eq!(responses.len(), 1);
 
         let sub_cmd = rx.try_recv().unwrap();
@@ -1516,7 +1646,7 @@ mod tests {
         let (handler, mut rx, engine) = setup_handler_with_subs();
         let rid = Ulid::new(); // never created
         let cmd = Command::Listen { channel: format!("resource_{rid}") };
-        let result = handler.execute_command(&engine, cmd).await;
+        let result = exec(&handler, &engine, cmd).await;
         assert!(result.is_err());
         // And no Subscribe command was queued for the forwarder loop.
         assert!(rx.try_recv().is_err());
@@ -1528,7 +1658,7 @@ mod tests {
         let cmd = Command::Listen {
             channel: "bad_channel".into(),
         };
-        let result = handler.execute_command(&engine, cmd).await;
+        let result = exec(&handler, &engine, cmd).await;
         assert!(result.is_err());
     }
 
@@ -1549,7 +1679,7 @@ mod tests {
         engine.create_resource(rid, None, None, 1, None).await.unwrap();
         let channel = format!("resource_{rid}");
         let cmd = Command::Listen { channel };
-        let responses = handler.execute_command(&engine, cmd).await.unwrap();
+        let responses = exec(&handler, &engine, cmd).await.unwrap();
         assert_eq!(responses.len(), 1);
         // No subscribe_tx, so no command sent, just returns LISTEN tag
     }
@@ -1560,7 +1690,7 @@ mod tests {
         let rid = Ulid::new();
         let channel = format!("resource_{rid}");
         let cmd = Command::Unlisten { channel };
-        let responses = handler.execute_command(&engine, cmd).await.unwrap();
+        let responses = exec(&handler, &engine, cmd).await.unwrap();
         assert_eq!(responses.len(), 1);
 
         let sub_cmd = rx.try_recv().unwrap();
@@ -1574,7 +1704,7 @@ mod tests {
     async fn execute_unlisten_all_sends_command() {
         let (handler, mut rx, engine) = setup_handler_with_subs();
         let cmd = Command::UnlistenAll;
-        let responses = handler.execute_command(&engine, cmd).await.unwrap();
+        let responses = exec(&handler, &engine, cmd).await.unwrap();
         assert_eq!(responses.len(), 1);
 
         let sub_cmd = rx.try_recv().unwrap();
@@ -1594,14 +1724,11 @@ mod tests {
         let insert = format!(
             r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {expires})"#
         );
-        handler.execute_command(&engine, sql::parse_sql(&insert).unwrap()).await.unwrap();
+        handler.run_statement(&engine, "test", &insert).await.unwrap();
 
         let bid = Ulid::new();
         let commit = format!("UPDATE holds SET booking_id = '{bid}', label = 'picnic' WHERE id = '{hid}'");
-        let responses = handler
-            .execute_command(&engine, sql::parse_sql(&commit).unwrap())
-            .await
-            .unwrap();
+        let responses = handler.run_statement(&engine, "test", &commit).await.unwrap();
         assert_eq!(responses.len(), 1);
         match &responses[0] {
             Response::Execution(tag) => assert_eq!(tag, &Tag::new("UPDATE").with_rows(1)),
@@ -1625,7 +1752,7 @@ mod tests {
             Ulid::new(),
             Ulid::new()
         );
-        let result = handler.execute_command(&engine, sql::parse_sql(&commit).unwrap()).await;
+        let result = handler.run_statement(&engine, "test", &commit).await;
         assert!(result.is_err());
     }
 
@@ -1645,7 +1772,7 @@ mod tests {
         let insert = format!(
             r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {expires})"#
         );
-        handler.execute_command(&engine, sql::parse_sql(&insert).unwrap()).await.unwrap();
+        handler.run_statement(&engine, "test", &insert).await.unwrap();
 
         let bid = Ulid::new();
         let mut tasks = Vec::new();
@@ -1654,7 +1781,7 @@ mod tests {
             let engine = engine.clone();
             let commit = format!("UPDATE holds SET booking_id = '{bid}' WHERE id = '{hid}'");
             tasks.push(tokio::spawn(async move {
-                handler.execute_command(&engine, sql::parse_sql(&commit).unwrap()).await.is_ok()
+                handler.run_statement(&engine, "test", &commit).await.is_ok()
             }));
         }
         for _ in 0..7 {
@@ -1665,7 +1792,7 @@ mod tests {
                 Ulid::new()
             );
             tasks.push(tokio::spawn(async move {
-                handler.execute_command(&engine, sql::parse_sql(&steal).unwrap()).await.is_ok()
+                handler.run_statement(&engine, "test", &steal).await.is_ok()
             }));
         }
 
@@ -1680,5 +1807,199 @@ mod tests {
         let bookings = engine.get_bookings(rid).await.unwrap();
         assert_eq!(bookings.len(), 1);
         assert_eq!(bookings[0].id, bid);
+    }
+
+    // ── metrics recording ────────────────────────────────────────
+
+    use crate::test_metrics::{block_on, with_metrics};
+
+    #[tokio::test]
+    async fn resolve_engine_returns_the_sanitized_tenant_label() {
+        // Raw aliases like "acme!" pass auth and reach tenant "acme"'s engine (sanitize
+        // collapses them), so the metric label must be the sanitized engine key: labeling
+        // with the raw name mints a fresh series per alias, unbounded by MAX_TENANTS.
+        let dir = std::env::temp_dir().join("deltat_test_wire_tenant_label");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tm = Arc::new(TenantManager::new(dir, 1000, 604_800_000));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handler = DeltaTHandler::with_subscriptions(tm, tx);
+        let mut client =
+            pgwire::api::DefaultClient::<String>::new("127.0.0.1:0".parse().unwrap(), false);
+        client
+            .metadata_mut()
+            .insert("database".to_string(), "acme!".to_string());
+        let (_engine, tenant) = handler.resolve_engine(&client).unwrap();
+        assert_eq!(tenant, "acme");
+    }
+
+    /// The exporter is off by default, and these are the only labelled calls on the query path,
+    /// so a disabled server must not pay for the labels it will never export.
+    #[test]
+    fn query_metrics_are_skipped_when_no_recorder_is_installed() {
+        let elapsed = std::time::Duration::from_millis(1);
+
+        let labels = [
+            ("command", "select_availability"),
+            ("status", "ok"),
+            ("kind", "none"),
+            ("tenant", "acme"),
+        ];
+
+        let (off, ()) = with_metrics(|| {
+            record_query_metrics("select_availability", "ok", "none", "acme", elapsed, false);
+        });
+        assert_eq!(
+            off.counter_total(crate::observability::QUERIES_TOTAL, &labels),
+            0,
+            "the counter must not record while disabled"
+        );
+        assert!(
+            off.histogram_values(crate::observability::QUERY_DURATION_SECONDS)
+                .is_empty(),
+            "the histogram must not record while disabled"
+        );
+
+        let (on, ()) = with_metrics(|| {
+            record_query_metrics("select_availability", "ok", "none", "acme", elapsed, true);
+        });
+        assert_eq!(
+            on.counter_total(crate::observability::QUERIES_TOTAL, &labels),
+            1,
+            "the counter records when enabled"
+        );
+        assert_eq!(
+            on.histogram_values(crate::observability::QUERY_DURATION_SECONDS)
+                .len(),
+            1,
+            "the histogram records when enabled"
+        );
+    }
+
+    #[test]
+    fn run_statement_labels_tenant_status_and_error_kind() {
+        // One counter answers "which tenant went hot, and were those conflicts or failures":
+        // command, status, tenant, and the engine error kind ("none" on success) on every query.
+        let (log, ()) = with_metrics(|| {
+            block_on(async {
+                let (handler, _rx, engine) = setup_handler_with_subs();
+                let rid = Ulid::new();
+                engine.create_resource(rid, None, None, 1, None).await.unwrap();
+                let ok_sql = format!("SELECT * FROM bookings WHERE resource_id = '{rid}'");
+                handler.run_statement(&engine, "acme", &ok_sql).await.unwrap();
+
+                let missing = Ulid::new();
+                let bad_sql = format!(
+                    r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{}', '{missing}', 1000, 2000)"#,
+                    Ulid::new()
+                );
+                assert!(handler.run_statement(&engine, "acme", &bad_sql).await.is_err());
+            })
+        });
+
+        let queries = crate::observability::QUERIES_TOTAL;
+        assert_eq!(
+            log.counter_total(
+                queries,
+                &[("command", "select_bookings"), ("status", "ok"), ("kind", "none"), ("tenant", "acme")],
+            ),
+            1
+        );
+        assert_eq!(
+            log.counter_total(
+                queries,
+                &[("command", "insert_booking"), ("status", "error"), ("kind", "not_found"), ("tenant", "acme")],
+            ),
+            1
+        );
+        assert!(log.histogram_recorded(
+            crate::observability::QUERY_DURATION_SECONDS,
+            &[("command", "select_bookings"), ("tenant", "acme")],
+        ));
+        assert_eq!(
+            log.counter_total(crate::observability::ENGINE_ERRORS_TOTAL, &[("kind", "not_found")]),
+            1
+        );
+    }
+
+    #[test]
+    fn run_statement_counts_rejected_statements() {
+        // Unparseable and oversized statements die before execution; they must show up in
+        // PARSE_ERRORS_TOTAL instead of vanishing from every metric.
+        let (log, ()) = with_metrics(|| {
+            block_on(async {
+                let (handler, _rx, engine) = setup_handler_with_subs();
+                assert!(handler.run_statement(&engine, "t", "THIS IS NOT SQL").await.is_err());
+                let oversized = format!("SELECT 1 -- {}", "x".repeat(MAX_QUERY_LEN));
+                assert!(handler.run_statement(&engine, "t", &oversized).await.is_err());
+            })
+        });
+        assert_eq!(log.counter_total(crate::observability::PARSE_ERRORS_TOTAL, &[]), 2);
+        // Neither rejection became a Command, so the query counter must not move.
+        assert_eq!(log.counter_total(crate::observability::QUERIES_TOTAL, &[]), 0);
+    }
+
+    #[test]
+    fn slow_queries_counted_only_at_or_over_an_enabled_threshold() {
+        // Matches log_min_duration_statement semantics: fires at or over the threshold, and a
+        // zero threshold disables it entirely.
+        let (log, ()) = with_metrics(|| {
+            record_slow_query("select_bookings", "acme", Duration::from_millis(150), 100);
+            record_slow_query("select_bookings", "acme", Duration::from_millis(50), 100);
+            record_slow_query("select_bookings", "acme", Duration::from_millis(150), 0);
+        });
+        assert_eq!(
+            log.counter_total(
+                crate::observability::SLOW_QUERIES_TOTAL,
+                &[("command", "select_bookings")],
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn engine_err_speaks_the_error_taxonomy() {
+        // A lost race must reach the client as SQLSTATE 40001 (serialization_failure), the code
+        // drivers already retry on, not a catch-all P0001 that forces string-matching. The same
+        // conversion is where the taxonomy counter fires, one increment per engine error.
+        let (log, err) =
+            with_metrics(|| engine_err(crate::engine::EngineError::Conflict(Ulid::nil())));
+        let PgWireError::UserError(info) = err else {
+            panic!("expected UserError");
+        };
+        assert_eq!(info.code, "40001");
+        assert_eq!(
+            log.counter_total(crate::observability::ENGINE_ERRORS_TOTAL, &[("kind", "conflict")]),
+            1
+        );
+    }
+
+    #[test]
+    fn forwarder_counts_lagged_notifications() {
+        // Lagged(n) carries how many events the ring dropped for this subscriber. Those drops are
+        // a client silently going stale, so they must land in NOTIFICATIONS_LAGGED_TOTAL.
+        let (log, ()) = with_metrics(|| {
+            block_on(async {
+                use tokio::sync::broadcast;
+                let (btx, brx) = broadcast::channel::<Event>(1);
+                let (mtx, mut mrx) = mpsc::unbounded_channel();
+                let mk = || Event::BookingConfirmed {
+                    id: Ulid::new(),
+                    resource_id: Ulid::new(),
+                    span: Span::new(1000, 2000),
+                    label: None,
+                };
+                btx.send(mk()).unwrap();
+                btx.send(mk()).unwrap();
+                btx.send(mk()).unwrap(); // 2 behind a cap-1 ring, as in forwarder_survives_broadcast_lag
+                tokio::spawn(forward_resource_events(brx, mtx, "resource_x".into()));
+                tokio::time::timeout(Duration::from_secs(1), mrx.recv())
+                    .await
+                    .expect("forwarder must not hang");
+            })
+        });
+        assert_eq!(
+            log.counter_total(crate::observability::NOTIFICATIONS_LAGGED_TOTAL, &[]),
+            2
+        );
     }
 }

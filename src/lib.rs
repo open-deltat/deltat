@@ -35,6 +35,8 @@ pub mod reaper;
 pub mod sql;
 #[doc(hidden)]
 pub mod tenant;
+#[cfg(test)]
+mod test_metrics;
 #[doc(hidden)]
 pub mod tls;
 #[doc(hidden)]
