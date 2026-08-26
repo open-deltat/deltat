@@ -30,6 +30,13 @@ fn create_event() -> Event {
 /// XOR one byte of the file in place. Applied to the first payload byte of the first record
 /// (offset 4, past the length prefix) it makes that record's CRC fail; with a valid record
 /// after it that is mid-log corruption, which `Wal::open` refuses, so `recover` fails.
+/// Corrupts a byte of the first record's payload. Offsets are measured from the end of the WAL
+/// header, so the file stays identifiable as a WAL and the damage lands where a real torn write
+/// would leave it.
+fn flip_record_byte(path: &Path, offset: u64) {
+    flip_byte(path, crate::wal::HEADER_BYTES as u64 + offset)
+}
+
 fn flip_byte(path: &Path, offset: u64) {
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
@@ -192,9 +199,9 @@ fn wal_poisoned_gauge_follows_poison_state() {
         wal.append(&create_event()).unwrap();
         wal.append(&create_event()).unwrap();
 
-        flip_byte(&path, 4);
+        flip_record_byte(&path, 4);
         recover_wal(&mut wal);
-        flip_byte(&path, 4);
+        flip_record_byte(&path, 4);
         recover_wal(&mut wal);
     });
 
@@ -208,7 +215,7 @@ fn wal_errors_counted_on_poisoned_append_and_flush() {
         let mut wal = Wal::open(&path).unwrap();
         wal.append(&create_event()).unwrap();
         wal.append(&create_event()).unwrap();
-        flip_byte(&path, 4);
+        flip_record_byte(&path, 4);
         recover_wal(&mut wal);
 
         // Poisoned: the group-commit path and the AppendAtomic path must each count their

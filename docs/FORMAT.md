@@ -219,8 +219,16 @@ push (the single `apply_event` funnel, the invariant that makes event-sourcing t
 record framing is independent of the wire framing:
 
 ```
+wal_file   := HEADER? wal_record*
+HEADER     := MAGIC("DELTATWL") FORMAT_VERSION(u16le)
 wal_record := LEN(u32) PAYLOAD[LEN] CRC32(u32)   // bad CRC / short tail → safe truncation on replay
 ```
+
+The payload is bincode, which is not self-describing: nothing in a record says which version of
+`Event` wrote it. The header exists so a format change is refused rather than misread. A binary
+that meets a `FORMAT_VERSION` above its own stops with an error naming the version; one below its
+own it can read. The header is absent in logs written before 0.3.0, which are read as a bare
+record stream and gain a header the first time they are compacted.
 
 `Event` variants (the durable vocabulary; **each gets a permanently-frozen discriminant**, §7):
 
