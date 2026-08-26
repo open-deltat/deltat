@@ -6,7 +6,7 @@
 # `latest` if you would rather track releases automatically.
 services:
   deltat:
-    image: ghcr.io/open-deltat/deltat:${DELTAT_VERSION:-0.2.0}
+    image: ghcr.io/open-deltat/deltat:${DELTAT_VERSION:-0.3.0}
     ports:
       - "5433:5433"
     volumes:

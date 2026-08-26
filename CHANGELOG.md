@@ -6,6 +6,11 @@ All notable changes to deltat are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-26
+
+The observability release, plus the two things that make a published container safe to upgrade
+into: a versioned storage format and an automated image pipeline.
+
 ### Added
 - The WAL carries a format version. Records are bincode and carry no schema of their own, so a
   future format change would previously have been read as garbage; a binary now refuses to open a
