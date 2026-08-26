@@ -5,6 +5,7 @@
 //! installs the log subscriber selected by `DELTAT_LOG_FORMAT` and `RUST_LOG`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::command::Command;
 
@@ -105,6 +106,18 @@ pub const CONNECTIONS_CLOSED_TOTAL: &str = "deltat_connections_closed_total";
 /// A silent drop here means a client's view of a resource is stale with no error anywhere.
 pub const NOTIFICATIONS_LAGGED_TOTAL: &str = "deltat_notifications_lagged_total";
 
+static ENABLED: AtomicBool = AtomicBool::new(cfg!(test));
+
+/// Whether a recorder is installed and per-query recording is worth doing.
+///
+/// The metrics macros build their key, including every label value, before they consult the
+/// recorder, so a labelled call on the query path allocates on every statement even when the
+/// exporter is switched off. Unlabelled counters compile to a static key and cost nothing, so
+/// only the labelled hot-path calls need this guard.
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 /// Install Prometheus metrics exporter on the given port. No-op if port is None.
 pub fn init(port: Option<u16>) {
     let Some(port) = port else { return };
@@ -113,8 +126,10 @@ pub fn init(port: Option<u16>) {
         .with_http_listener(addr)
         .install()
         .expect("failed to install Prometheus metrics exporter");
+    ENABLED.store(true, Ordering::Relaxed);
     tracing::info!("metrics endpoint: http://0.0.0.0:{port}/metrics");
 }
+
 
 // ── Tracing subscriber setup ────────────────────────────────────
 

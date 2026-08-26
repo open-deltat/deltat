@@ -161,10 +161,14 @@ impl DeltaTHandler {
             Err(WireError::Engine(e)) => ("error", e.kind()),
             Err(WireError::Pg(_)) => ("error", "other"),
         };
-        metrics::counter!(crate::observability::QUERIES_TOTAL, "command" => label, "status" => status, "kind" => kind, "tenant" => tenant.to_string())
-            .increment(1);
-        metrics::histogram!(crate::observability::QUERY_DURATION_SECONDS, "command" => label, "tenant" => tenant.to_string())
-            .record(elapsed.as_secs_f64());
+        record_query_metrics(
+            label,
+            status,
+            kind,
+            tenant,
+            elapsed,
+            crate::observability::enabled(),
+        );
         record_slow_query(label, tenant, elapsed, self.slow_query_threshold_ms);
         result.map_err(PgWireError::from)
     }
@@ -1123,6 +1127,29 @@ impl From<WireError> for PgWireError {
 /// The taxonomy boundary: every engine error crosses the wire exactly once, so this is where
 /// ENGINE_ERRORS_TOTAL fires and where the error's own SQLSTATE (retryable 40001 contention
 /// vs client mistakes vs server faults) replaces a catch-all code.
+/// Records the per-query counter and latency, or skips both when no recorder is installed.
+///
+/// These are the only labelled calls on the query path. The metrics macros build the label set
+/// before consulting the recorder, so leaving them unguarded allocates the tenant label twice per
+/// statement even with the exporter switched off. `enabled` is a parameter rather than a direct
+/// read so the skip is testable without mutating shared state under a parallel test runner.
+fn record_query_metrics(
+    label: &'static str,
+    status: &'static str,
+    kind: &'static str,
+    tenant: &str,
+    elapsed: std::time::Duration,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    metrics::counter!(crate::observability::QUERIES_TOTAL, "command" => label, "status" => status, "kind" => kind, "tenant" => tenant.to_string())
+        .increment(1);
+    metrics::histogram!(crate::observability::QUERY_DURATION_SECONDS, "command" => label, "tenant" => tenant.to_string())
+        .record(elapsed.as_secs_f64());
+}
+
 fn engine_err(e: crate::engine::EngineError) -> PgWireError {
     metrics::counter!(crate::observability::ENGINE_ERRORS_TOTAL, "kind" => e.kind()).increment(1);
     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -1803,6 +1830,49 @@ mod tests {
             .insert("database".to_string(), "acme!".to_string());
         let (_engine, tenant) = handler.resolve_engine(&client).unwrap();
         assert_eq!(tenant, "acme");
+    }
+
+    /// The exporter is off by default, and these are the only labelled calls on the query path,
+    /// so a disabled server must not pay for the labels it will never export.
+    #[test]
+    fn query_metrics_are_skipped_when_no_recorder_is_installed() {
+        let elapsed = std::time::Duration::from_millis(1);
+
+        let labels = [
+            ("command", "select_availability"),
+            ("status", "ok"),
+            ("kind", "none"),
+            ("tenant", "acme"),
+        ];
+
+        let (off, ()) = with_metrics(|| {
+            record_query_metrics("select_availability", "ok", "none", "acme", elapsed, false);
+        });
+        assert_eq!(
+            off.counter_total(crate::observability::QUERIES_TOTAL, &labels),
+            0,
+            "the counter must not record while disabled"
+        );
+        assert!(
+            off.histogram_values(crate::observability::QUERY_DURATION_SECONDS)
+                .is_empty(),
+            "the histogram must not record while disabled"
+        );
+
+        let (on, ()) = with_metrics(|| {
+            record_query_metrics("select_availability", "ok", "none", "acme", elapsed, true);
+        });
+        assert_eq!(
+            on.counter_total(crate::observability::QUERIES_TOTAL, &labels),
+            1,
+            "the counter records when enabled"
+        );
+        assert_eq!(
+            on.histogram_values(crate::observability::QUERY_DURATION_SECONDS)
+                .len(),
+            1,
+            "the histogram records when enabled"
+        );
     }
 
     #[test]
