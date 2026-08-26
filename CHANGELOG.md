@@ -7,6 +7,16 @@ All notable changes to deltat are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- The WAL carries a format version. Records are bincode and carry no schema of their own, so a
+  future format change would previously have been read as garbage; a binary now refuses to open a
+  log written by a newer deltat and says so. Logs written before this release have no header, are
+  still read exactly as they are, and gain one the first time they are compacted.
+- Official container images at `ghcr.io/open-deltat/deltat`, built for `linux/amd64` and
+  `linux/arm64` and published automatically when a `v*` tag is pushed. `docker-compose.yml` now
+  runs the published image against a named volume, so upgrading is `docker compose pull` and your
+  data stays put; `docker-compose.build.yml` is the overlay for building from a checkout instead.
+- `RELEASING.md` documents the release runbook, including what to do when the storage format
+  changes.
 - The `/metrics` endpoint (`DELTAT_METRICS_PORT`) now reports what the server is actually doing:
   per-command query rates and latencies labelled by tenant with error kinds split out, connection
   churn and close reasons, WAL flush and compaction timing, a per-tenant poisoned-WAL gauge, the

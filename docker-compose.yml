@@ -1,6 +1,12 @@
+# Run deltat from the published image. Data lives in the named volume below and survives
+# every upgrade: `docker compose pull && docker compose up -d` swaps the binary, not the WAL.
+#
+# The tag is pinned on purpose. A database should move versions when you decide to, not
+# whenever a container happens to restart. Override it with DELTAT_VERSION, or set it to
+# `latest` if you would rather track releases automatically.
 services:
   deltat:
-    build: .
+    image: ghcr.io/open-deltat/deltat:${DELTAT_VERSION:-0.2.0}
     ports:
       - "5433:5433"
     volumes:

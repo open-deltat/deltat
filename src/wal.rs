@@ -8,7 +8,7 @@
 //! stopping there would drop acknowledged records.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::model::Event;
@@ -20,6 +20,53 @@ const MAX_WAL_RECORD_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Bytes of framing around a payload: the u32 length prefix plus the u32 CRC suffix.
 const RECORD_FRAMING_BYTES: usize = 8;
+
+/// Marks a file as a deltat WAL. Records are bincode and carry no schema, so without this a
+/// future format change would be read as garbage rather than refused.
+const MAGIC: &[u8; 8] = b"DELTATWL";
+
+/// On-disk format version. Bump it when the record encoding or the meaning of `Event` changes
+/// in a way an older binary would misread.
+const FORMAT_VERSION: u16 = 1;
+
+/// Magic plus the version field. Records start here, so anything reaching for a record
+/// byte by offset has to start from it.
+pub(crate) const HEADER_BYTES: usize = MAGIC.len() + 2;
+
+/// Where a file's records begin, and whether it predates the header.
+///
+/// Files written before 0.3.0 begin with a record's length prefix instead of the magic. They
+/// stay readable exactly as they are: an upgrade must never orphan data that is already on
+/// disk. New files and every compaction write the header, so they migrate as they go.
+fn read_header(reader: &mut (impl Read + Seek), file_len: u64) -> io::Result<u64> {
+    if file_len < HEADER_BYTES as u64 {
+        return Ok(0);
+    }
+    let mut head = [0u8; HEADER_BYTES];
+    reader.read_exact(&mut head)?;
+    if &head[..MAGIC.len()] != MAGIC {
+        // A legacy file: those bytes were a record, so put them back before the caller reads.
+        reader.seek(SeekFrom::Start(0))?;
+        return Ok(0);
+    }
+    let version = u16::from_le_bytes([head[MAGIC.len()], head[MAGIC.len() + 1]]);
+    if version > FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "WAL is format version {version}, written by a newer deltat; this binary reads \
+                 up to {FORMAT_VERSION}. Refusing to open it rather than misread your data: \
+                 run the newer version, or move this file aside."
+            ),
+        ));
+    }
+    Ok(HEADER_BYTES as u64)
+}
+
+fn write_header(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(MAGIC)?;
+    writer.write_all(&FORMAT_VERSION.to_le_bytes())
+}
 
 fn mid_log_corruption(offset: u64, what: &str) -> io::Error {
     io::Error::new(
@@ -73,8 +120,14 @@ impl Wal {
             file.set_len(valid_len)?;
             file.sync_all()?;
         }
+        let mut writer = BufWriter::new(file);
+        if writer.get_ref().metadata()?.len() == 0 {
+            write_header(&mut writer)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer,
             path: path.to_path_buf(),
             appends_since_compact: 0,
             poisoned: false,
@@ -141,6 +194,7 @@ impl Wal {
         let tmp_path = path.with_extension("wal.tmp");
         let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
+        write_header(&mut writer)?;
         for event in events {
             encode_event(&mut writer, event)?;
         }
@@ -203,7 +257,8 @@ impl Wal {
         let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
         let mut events = Vec::new();
-        let mut valid_len: u64 = 0;
+        // The header is never truncated away: it is the floor of the valid prefix, not a record.
+        let mut valid_len: u64 = read_header(&mut reader, file_len)?;
 
         loop {
             let mut len_buf = [0u8; 4];
@@ -278,6 +333,117 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("deltat_test_wal_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    fn sample_event() -> Event {
+        Event::ResourceCreated {
+            id: Ulid::new(),
+            parent_id: None,
+            name: None,
+            capacity: 1,
+            buffer_after: None,
+        }
+    }
+
+    /// Writes records with no header, the way every WAL written before 0.3.0 looks on disk.
+    fn write_legacy_wal(path: &Path, events: &[Event]) {
+        let file = File::create(path).unwrap();
+        let mut writer = BufWriter::new(file);
+        for e in events {
+            encode_event(&mut writer, e).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    fn head_bytes(path: &Path, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        let mut f = File::open(path).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn a_new_wal_starts_with_a_versioned_header() {
+        let path = tmp_path("header_new.wal");
+        let _ = fs::remove_file(&path);
+
+        let event = sample_event();
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&event).unwrap();
+        }
+
+        let head = head_bytes(&path, HEADER_BYTES);
+        assert_eq!(&head[..MAGIC.len()], MAGIC, "the file must be self-identifying");
+        assert_eq!(
+            u16::from_le_bytes([head[8], head[9]]),
+            FORMAT_VERSION,
+            "the header must carry the format version"
+        );
+        assert_eq!(Wal::replay(&path).unwrap(), vec![event]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_headerless_wal_from_an_older_release_still_replays() {
+        let path = tmp_path("header_legacy.wal");
+        let _ = fs::remove_file(&path);
+
+        let events = vec![sample_event(), sample_event()];
+        write_legacy_wal(&path, &events);
+        assert_eq!(Wal::replay(&path).unwrap(), events, "existing data must survive the upgrade");
+
+        // Reopening must not truncate the headerless records or prepend a header mid-file.
+        let appended = sample_event();
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&appended).unwrap();
+        }
+        let mut expected = events;
+        expected.push(appended);
+        assert_eq!(Wal::replay(&path).unwrap(), expected);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_wal_written_by_a_newer_deltat_is_refused() {
+        let path = tmp_path("header_future.wal");
+        let _ = fs::remove_file(&path);
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(&(FORMAT_VERSION + 1).to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+
+        for err in [Wal::replay(&path).unwrap_err(), Wal::open(&path).map(|_| ()).unwrap_err()] {
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("newer") && msg.contains(&(FORMAT_VERSION + 1).to_string()),
+                "the error must name the format it cannot read, got {msg:?}"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compaction_writes_the_header() {
+        let path = tmp_path("header_compact.wal");
+        let _ = fs::remove_file(&path);
+
+        let events = vec![sample_event()];
+        write_legacy_wal(&path, &events);
+
+        let mut wal = Wal::open(&path).unwrap();
+        wal.compact(&events).unwrap();
+
+        assert_eq!(&head_bytes(&path, MAGIC.len()), MAGIC, "compaction migrates a legacy file");
+        assert_eq!(Wal::replay(&path).unwrap(), events);
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

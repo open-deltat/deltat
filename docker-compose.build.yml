@@ -1,0 +1,8 @@
+# Overlay for working on deltat itself: builds the image from this checkout instead of
+# pulling the published one.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
+services:
+  deltat:
+    build: .
+    image: deltat:local
