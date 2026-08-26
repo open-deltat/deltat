@@ -59,12 +59,20 @@ deltat is the reference implementation of [TAP](https://github.com/open-deltat/t
 ## Quick start
 
 ```bash
+docker run -p 5433:5433 -e DELTAT_PASSWORD=secret -v deltat-data:/data \
+  ghcr.io/open-deltat/deltat:0.2.0
+```
+
+Or install the crate, which needs a Rust toolchain:
+
+```bash
 cargo install deltat
 
 DELTAT_PASSWORD=secret deltat
 ```
 
-Or build from source: `cargo install --git https://github.com/open-deltat/deltat.git`
+There is a `docker-compose.yml` in the repo for a persistent single-node setup, and
+`cargo install --git https://github.com/open-deltat/deltat.git` builds an unreleased `main`.
 
 Without `DELTAT_PASSWORD`, deltat generates a random password and prints it once at startup.
 Anyone holding the password has full read/write access to every tenant (see `DELTAT_TENANT_PASSWORDS`
@@ -186,6 +194,29 @@ Real-time notifications via LISTEN/NOTIFY.
 LISTEN resource_01J...;
 UNLISTEN resource_01J...;
 ```
+
+---
+
+## Upgrading
+
+Your data is the WAL under `DELTAT_DATA_DIR` (`/data` in the image). Upgrading replaces the
+binary and leaves the log alone:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+The compose file pins a version rather than tracking `latest`, so a restart never moves you to
+a release you did not choose. Set `DELTAT_VERSION` to pick another one.
+
+The WAL carries a format version, and a binary refuses to open a log written by a newer deltat
+rather than misread it. Logs written before 0.3.0 have no header, are still read as they are,
+and pick one up the first time they are compacted. Downgrading is the case to be careful with:
+an older binary will not open a log a newer one has stamped, so keep a copy of the directory
+before stepping backwards.
+
+Before 1.0 the storage format can still change. Every such change lands in the changelog with
+what it means for existing data.
 
 ---
 
