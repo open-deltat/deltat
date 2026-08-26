@@ -1,7 +1,8 @@
-//! Prometheus metrics: the metric-name constants plus the exporter setup.
+//! Prometheus metrics plus the tracing subscriber setup.
 //!
 //! RED counters and latencies for requests, USE gauges for connections and tenants, and WAL
-//! flush timings. `init` starts the exporter endpoint when a port is configured.
+//! flush timings. `init` starts the exporter endpoint when a port is configured; `init_tracing`
+//! installs the log subscriber selected by `DELTAT_LOG_FORMAT` and `RUST_LOG`.
 
 use std::net::SocketAddr;
 
@@ -115,6 +116,42 @@ pub fn init(port: Option<u16>) {
     tracing::info!("metrics endpoint: http://0.0.0.0:{port}/metrics");
 }
 
+// ── Tracing subscriber setup ────────────────────────────────────
+
+/// Log output format, selected by `DELTAT_LOG_FORMAT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+/// Parse `DELTAT_LOG_FORMAT`. Anything but "json" means text, so a typo degrades to the
+/// human-readable default instead of killing startup.
+pub fn parse_log_format(raw: Option<&str>) -> LogFormat {
+    match raw {
+        Some(v) if v.eq_ignore_ascii_case("json") => LogFormat::Json,
+        _ => LogFormat::Text,
+    }
+}
+
+/// Build the level filter from `RUST_LOG`, defaulting to info when unset or unparseable.
+pub fn log_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    rust_log
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// Install the global tracing subscriber from `DELTAT_LOG_FORMAT` and `RUST_LOG`.
+pub fn init_tracing() {
+    let format = parse_log_format(std::env::var("DELTAT_LOG_FORMAT").ok().as_deref());
+    let filter = log_env_filter(std::env::var("RUST_LOG").ok().as_deref());
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    match format {
+        LogFormat::Json => builder.json().init(),
+        LogFormat::Text => builder.init(),
+    }
+}
+
 /// Map a Command variant to a short label for metrics.
 pub fn command_label(cmd: &Command) -> &'static str {
     match cmd {
@@ -144,5 +181,48 @@ pub fn command_label(cmd: &Command) -> &'static str {
         Command::Listen { .. } => "listen",
         Command::Unlisten { .. } => "unlisten",
         Command::UnlistenAll => "unlisten_all",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_format_defaults_to_text() {
+        assert_eq!(parse_log_format(None), LogFormat::Text);
+    }
+
+    #[test]
+    fn log_format_selects_json() {
+        assert_eq!(parse_log_format(Some("json")), LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_ignores_ascii_case() {
+        assert_eq!(parse_log_format(Some("JSON")), LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_falls_back_to_text_on_unknown_value() {
+        assert_eq!(parse_log_format(Some("yaml")), LogFormat::Text);
+    }
+
+    #[test]
+    fn env_filter_defaults_to_info() {
+        assert_eq!(log_env_filter(None).to_string(), "info");
+    }
+
+    #[test]
+    fn env_filter_honors_rust_log() {
+        assert_eq!(
+            log_env_filter(Some("deltat=debug")).to_string(),
+            "deltat=debug"
+        );
+    }
+
+    #[test]
+    fn env_filter_falls_back_to_info_on_unparseable_rust_log() {
+        assert_eq!(log_env_filter(Some("deltat=notalevel")).to_string(), "info");
     }
 }

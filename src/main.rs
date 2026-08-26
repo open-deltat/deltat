@@ -10,7 +10,25 @@ use deltat::wire;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    deltat::observability::init_tracing();
+
+    // A panic in a spawned connection task dies on stderr outside the log stream, invisible to a
+    // JSON log collector. Route it through tracing first, then run the default hook so backtrace
+    // printing and abort/unwind behavior stay exactly as before.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        let location = info
+            .location()
+            .map_or_else(|| "unknown".to_string(), |l| l.to_string());
+        tracing::error!(panic.message = message, panic.location = %location, "panic");
+        default_panic_hook(info);
+    }));
 
     let metrics_port: Option<u16> = std::env::var("DELTAT_METRICS_PORT")
         .ok()
@@ -148,9 +166,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 tokio::spawn(async move {
                     let _permit = permit; // held until connection closes
-                    if let Err(e) = wire::process_connection_with_auth(socket, tm, auth, tls, max_conn_age_ms, max_idle_ms).await {
-                        tracing::error!("connection error from {peer}: {e}");
-                    }
+                    let started = std::time::Instant::now();
+                    // Err surfaces only from the startup/TLS phase; post-auth failures and the
+                    // idle/max-age guards close inside the wire loop and return Ok, so those
+                    // count as "normal" here. Startup failures log at warn with the peer since
+                    // a debug-level auth failure would hide credential stuffing.
+                    let reason = match wire::process_connection_with_auth(socket, tm, auth, tls, max_conn_age_ms, max_idle_ms).await {
+                        Ok(()) => "normal",
+                        Err(e) => {
+                            tracing::warn!("connection failed from {peer}: {e}");
+                            "error"
+                        }
+                    };
+                    metrics::histogram!(deltat::observability::CONNECTION_DURATION_SECONDS)
+                        .record(started.elapsed().as_secs_f64());
+                    metrics::counter!(deltat::observability::CONNECTIONS_CLOSED_TOTAL, "reason" => reason)
+                        .increment(1);
                     metrics::gauge!(deltat::observability::CONNECTIONS_ACTIVE).decrement(1.0);
                 });
             }
