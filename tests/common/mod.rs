@@ -21,7 +21,13 @@ pub async fn start_test_server() -> (SocketAddr, Arc<TenantManager>) {
 
     let dir = std::env::temp_dir().join(format!("deltat_int_test_{}", Ulid::new()));
     std::fs::create_dir_all(&dir).unwrap();
-    let tm = Arc::new(TenantManager::new(dir, 1000, 604_800_000));
+    // Retention is effectively infinite so the collector never runs against these tests. They
+    // write spans near the epoch, decades past any realistic cutoff, and the per-tenant GC task
+    // is spawned on first use with an interval whose first tick fires immediately. If that tick
+    // lands after a test's INSERT rather than before it, the booking is collected mid-test and
+    // the assertions see a resource that is free when it should be busy. The cutoff subtracts
+    // saturating, so i64::MAX reaches back past every timestamp instead of overflowing.
+    let tm = Arc::new(TenantManager::new(dir, 1000, i64::MAX));
 
     let tm2 = tm.clone();
     tokio::spawn(async move {
