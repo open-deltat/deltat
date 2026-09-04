@@ -103,7 +103,7 @@ PROTO-03 is introduced only at the two-way trigger**, where it doubles as the FE
   cursors, webhook timers, echo markers, and the UID↔Ulid map; the process boundary enforces
   SEC-06/07 instead of per-app discipline.
 - *Hold-free, read-only beachhead*: Phase 0/1 use no Holds, so the steppable-clock hazard
-  (HW-01/GAP-11) and the unbuilt atomic `CommitHold` (AVAIL-07) never gate the first ship.
+  (HW-01/GAP-11) and the not-yet-single-event `CommitHold` (AVAIL-07, see its corrected status in `AUTH-ARCHITECTURE.md`) never gate the first ship.
 
 > **Verified HEAD fact that shapes Phase "two-way":** `wire::execute_command_inner` returns
 > `PgWireResult<Vec<Response>>`: the dispatch runner is *welded to pgwire even though `Command` is
