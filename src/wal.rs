@@ -27,27 +27,42 @@ const MAGIC: &[u8; 8] = b"DELTATWL";
 
 /// On-disk format version. Bump it when the record encoding or the meaning of `Event` changes
 /// in a way an older binary would misread.
+///
+/// Two classes of change, and only one of them needs this bumped:
+/// - **Safe**: adding a new `Event` *variant* at the end. bincode indexes variants in declaration
+///   order, so existing records keep their discriminants and a newer binary reads an older log
+///   unchanged. It still needs a bump the moment such a record can be *written*, because an older
+///   binary cannot decode a variant it does not have.
+/// - **Breaking**: adding, removing or reordering a field inside an existing variant, or changing
+///   what a field's value means (the pending ms to microsecond widening is this class). Records
+///   before and after the change are indistinguishable by length or CRC, so nothing but this
+///   version catches the difference.
 const FORMAT_VERSION: u16 = 1;
+
+/// Files written before 0.3.0 begin with a record instead of a header. They are format 0 by
+/// definition: their records are identical to version 1's, only the self-identifying header is
+/// missing.
+const LEGACY_FORMAT_VERSION: u16 = 0;
 
 /// Magic plus the version field. Records start here, so anything reaching for a record
 /// byte by offset has to start from it.
 pub(crate) const HEADER_BYTES: usize = MAGIC.len() + 2;
 
-/// Where a file's records begin, and whether it predates the header.
+/// Where a file's records begin, and which format wrote them.
 ///
-/// Files written before 0.3.0 begin with a record's length prefix instead of the magic. They
-/// stay readable exactly as they are: an upgrade must never orphan data that is already on
-/// disk. New files and every compaction write the header, so they migrate as they go.
-fn read_header(reader: &mut (impl Read + Seek), file_len: u64) -> io::Result<u64> {
+/// Files written before 0.3.0 begin with a record's length prefix instead of the magic. They stay
+/// readable exactly as they are: an upgrade must never orphan data that is already on disk. The
+/// version is returned rather than discarded so `scan` can branch on it and `open` can migrate.
+fn read_header(reader: &mut (impl Read + Seek), file_len: u64) -> io::Result<(u64, u16)> {
     if file_len < HEADER_BYTES as u64 {
-        return Ok(0);
+        return Ok((0, LEGACY_FORMAT_VERSION));
     }
     let mut head = [0u8; HEADER_BYTES];
     reader.read_exact(&mut head)?;
     if &head[..MAGIC.len()] != MAGIC {
         // A legacy file: those bytes were a record, so put them back before the caller reads.
         reader.seek(SeekFrom::Start(0))?;
-        return Ok(0);
+        return Ok((0, LEGACY_FORMAT_VERSION));
     }
     let version = u16::from_le_bytes([head[MAGIC.len()], head[MAGIC.len() + 1]]);
     if version > FORMAT_VERSION {
@@ -60,7 +75,7 @@ fn read_header(reader: &mut (impl Read + Seek), file_len: u64) -> io::Result<u64
             ),
         ));
     }
-    Ok(HEADER_BYTES as u64)
+    Ok((HEADER_BYTES as u64, version))
 }
 
 fn write_header(writer: &mut impl Write) -> io::Result<()> {
@@ -111,7 +126,23 @@ impl Wal {
     /// append would land AFTER the bad bytes and vanish on the next replay, which stops there.
     /// Errors on mid-log corruption, exactly like `replay`.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let (_, valid_len) = Self::scan(path)?;
+        let (events, scanned_len, version) = Self::scan(path)?;
+
+        // Migrate an older-format file BEFORE it can take a single new record. Appending
+        // current-format records behind an older header would leave a mixed file, and an older
+        // binary reading that stops at the first record it cannot decode: mid-log it errors, but at
+        // the tail `open` truncates the record away and fsyncs, destroying an acknowledged write.
+        // Rewriting the whole file means a mixed one never exists. The rewrite goes through the
+        // same temp-then-rename path as compaction, so a crash mid-upgrade leaves either the intact
+        // old file or the intact new one.
+        let valid_len = if version < FORMAT_VERSION && scanned_len > 0 {
+            Self::write_compact_file(path, &events)?;
+            Self::swap_temp_into_place(path)?;
+            fs::metadata(path)?.len()
+        } else {
+            scanned_len
+        };
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -206,13 +237,7 @@ impl Wal {
     /// Atomic swap: rename temp file over the WAL and reopen.
     /// This is fast. Call while holding the WAL lock.
     pub fn swap_compact_file(&mut self) -> io::Result<()> {
-        let tmp_path = self.path.with_extension("wal.tmp");
-        fs::rename(&tmp_path, &self.path)?;
-        // POSIX makes the rename durable only once the directory itself is synced; without this a
-        // power loss can resurrect the pre-compaction inode, losing every record acked to the new
-        // file since the swap while replaying stale state.
-        let dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
-        File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
+        Self::swap_temp_into_place(&self.path)?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -246,19 +271,36 @@ impl Wal {
         Ok(Self::scan(path)?.0)
     }
 
-    /// Walk the log, returning the events of the valid prefix and its byte length (the boundary
-    /// `open` truncates to). Shared by `replay` and `open` so both agree on where valid data ends.
-    fn scan(path: &Path) -> io::Result<(Vec<Event>, u64)> {
+    /// Rename the staged temp file over the WAL and make the rename itself durable.
+    ///
+    /// POSIX makes a rename durable only once the containing directory is synced; without that a
+    /// power loss can resurrect the pre-rename inode, losing every record acked to the new file.
+    /// Shared by compaction and by the format upgrade, which need identical guarantees.
+    fn swap_temp_into_place(path: &Path) -> io::Result<()> {
+        fs::rename(path.with_extension("wal.tmp"), path)?;
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+        File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
+    }
+
+    /// Walk the log, returning the events of the valid prefix, its byte length (the boundary `open`
+    /// truncates to), and the format version that wrote it. Shared by `replay` and `open` so both
+    /// agree on where valid data ends and what wrote it.
+    fn scan(path: &Path) -> io::Result<(Vec<Event>, u64, u16)> {
         let file = match File::open(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+            // A file that does not exist yet is about to be created at the current version, so
+            // reporting anything older would ask `open` to migrate an empty log.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), 0, FORMAT_VERSION));
+            }
             Err(e) => return Err(e),
         };
         let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
         let mut events = Vec::new();
         // The header is never truncated away: it is the floor of the valid prefix, not a record.
-        let mut valid_len: u64 = read_header(&mut reader, file_len)?;
+        let (header_len, version) = read_header(&mut reader, file_len)?;
+        let mut valid_len: u64 = header_len;
 
         loop {
             let mut len_buf = [0u8; 4];
@@ -320,7 +362,7 @@ impl Wal {
             valid_len = record_end;
         }
 
-        Ok((events, valid_len))
+        Ok((events, valid_len, version))
     }
 }
 
@@ -444,6 +486,115 @@ mod tests {
         assert_eq!(Wal::replay(&path).unwrap(), events);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn opening_an_older_format_wal_upgrades_the_whole_file() {
+        // The hazard this closes: appending current-format records behind an older header leaves a
+        // MIXED file. An older binary reads it happily up to the first record it cannot decode, and
+        // if that record is the last one, `open` truncates it away and fsyncs the loss. Upgrading
+        // the entire file before it takes a single new record means a mixed file never exists.
+        let path = tmp_path("upgrade_on_open.wal");
+        let _ = fs::remove_file(&path);
+
+        let events = vec![sample_event(), sample_event()];
+        write_legacy_wal(&path, &events);
+
+        let _wal = Wal::open(&path).unwrap();
+
+        let head = head_bytes(&path, HEADER_BYTES);
+        assert_eq!(&head[..MAGIC.len()], MAGIC, "an opened legacy file must carry the magic");
+        assert_eq!(
+            u16::from_le_bytes([head[8], head[9]]),
+            FORMAT_VERSION,
+            "and must be stamped with the current format version"
+        );
+        assert_eq!(Wal::replay(&path).unwrap(), events, "every record must survive the upgrade");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrading_keeps_every_committed_record_when_the_old_tail_was_torn() {
+        // A crash left a partial record on the legacy file. The upgrade must carry the committed
+        // records across and drop only the tear, never the other way round.
+        let path = tmp_path("upgrade_torn_tail.wal");
+        let _ = fs::remove_file(&path);
+
+        let events = vec![sample_event(), sample_event()];
+        write_legacy_wal(&path, &events);
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[7u8; 6]).unwrap();
+        }
+
+        let appended = sample_event();
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&appended).unwrap();
+        }
+
+        let mut expected = events;
+        expected.push(appended);
+        assert_eq!(Wal::replay(&path).unwrap(), expected);
+        assert_eq!(&head_bytes(&path, MAGIC.len()), MAGIC);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrading_leaves_no_temp_file_behind() {
+        let path = tmp_path("upgrade_no_tmp.wal");
+        let _ = fs::remove_file(&path);
+
+        write_legacy_wal(&path, &[sample_event()]);
+        let _wal = Wal::open(&path).unwrap();
+
+        assert!(!path.with_extension("wal.tmp").exists(), "the upgrade must rename, not leave a temp");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn opening_a_current_format_wal_does_not_rewrite_it() {
+        // The upgrade is a one-time cost on an old file, not something every open pays. Reopening a
+        // current-format WAL must leave its bytes exactly as they were.
+        let path = tmp_path("no_needless_rewrite.wal");
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&sample_event()).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+
+        let _wal = Wal::open(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before, "an already-current WAL must be left alone");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_reports_the_format_version_it_read() {
+        // `read_header` used to parse the version and throw it away, so `scan` could not branch on
+        // it and no migration could ever be written. Reading it back is the hook everything else
+        // hangs off.
+        let legacy = tmp_path("version_legacy.wal");
+        let current = tmp_path("version_current.wal");
+        let _ = fs::remove_file(&legacy);
+        let _ = fs::remove_file(&current);
+
+        write_legacy_wal(&legacy, &[sample_event()]);
+        assert_eq!(Wal::scan(&legacy).unwrap().2, LEGACY_FORMAT_VERSION);
+
+        {
+            let mut wal = Wal::open(&current).unwrap();
+            wal.append(&sample_event()).unwrap();
+        }
+        assert_eq!(Wal::scan(&current).unwrap().2, FORMAT_VERSION);
+
+        let _ = fs::remove_file(&legacy);
+        let _ = fs::remove_file(&current);
     }
 
     #[test]

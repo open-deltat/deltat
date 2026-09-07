@@ -299,8 +299,16 @@ When v1.0 freezes, this corpus *is* the spec; this document is its prose compani
 
 - NDJSON vs postcard hot-path default: decide by one batch-booking benchmark (do not freeze two encoders).
 - Confirm the per-resource monotonic sequence number is derivable now (§6) so federation stays a seam.
-- Confirm no external consumer has byte-persisted v1 data before the ms→µs widening (the one breaking
-  change; the audit found no released wire clients).
+- **ms→µs widening (the one breaking change). Its stated precondition no longer holds.** The note
+  here used to read "the audit found no released wire clients"; that was true when it was written and
+  is not true now. `@open-deltat/client` is published on npm, speaks milliseconds on the wire, and is
+  a dependency of both shipped apps. The divergence is also wider than the WAL: §5.1 mandates `Instant`
+  (i64 µs) for the *command* surface too, while the implementation is milliseconds end to end
+  (`model.rs`, `pub type Ms = i64`) with no conversion anywhere. deltat is therefore self-consistent
+  and does *not* silently divide its own instants by 1000; what breaks is any third party who
+  implements this spec and reads our log or our wire. Closing the gap is a decision, not a migration:
+  either move wire, SDK and WAL to µs behind a client major version, or amend this spec to
+  milliseconds. Do not batch it into a WAL format bump as if it were kernel-local.
 - Decide the `ttl` clamp bounds (`MIN`/`MAX`/`DEFAULT` hold lifetime; v1 ships a 1-hour max via `DELTAT_MAX_HOLD_TTL_MS`) and whether `Affected.expires_at`
   is the right channel for returning assigned expiry, or a dedicated `HoldPlaced` response variant.
 - Ratify the hold-capability model (V2-DESIGN §9 Q1): does `CommitHold` authorize on possession of
