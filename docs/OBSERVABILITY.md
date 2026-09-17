@@ -77,6 +77,7 @@ by the tenant cap, not by raw database-name aliases.
 | Metric | Type | Labels | Answers |
 |---|---|---|---|
 | `deltat_holds_placed_total` | counter | none | Holds accepted by the engine |
+| `deltat_counter_offers_total` | counter | `kind`, `result` | Refusals that carried alternatives. `result` is `offered`, `none` (nothing free) or `unscheduled` (the resource publishes no hours). Watch it against `deltat_engine_errors_total` at the same `kind`: that ratio is how often a refusal gave the caller something to act on, and a collapsing ratio means refusals quietly went back to being dead ends |
 | `deltat_holds_committed_total` | counter | none | Holds converted into bookings via `commit_hold` |
 | `deltat_holds_released_total` | counter | none | Holds released explicitly by a client |
 | `deltat_holds_expired_total` | counter | none | Holds reaped after expiry. Placed minus committed minus released minus expired is the abandonment rate: how often a client takes a slot out of circulation and never comes back |

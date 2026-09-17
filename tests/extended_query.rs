@@ -231,3 +231,75 @@ async fn an_unsupported_predicate_fails_loudly_over_the_wire() {
         .await;
     assert!(result.is_err(), "an unhonourable predicate must not return rows");
 }
+
+/// A refused booking must reach an ordinary Postgres client with its alternatives in the standard
+/// DETAIL field, and must not name the allocation that won.
+///
+/// Driven through tokio-postgres rather than the SDK on purpose: DETAIL is a protocol field, and
+/// the claim being tested is that a plain Postgres client can read the counter-offer without
+/// knowing anything about deltat.
+#[tokio::test]
+async fn a_refusal_carries_its_alternatives_in_the_detail_field() {
+    let (addr, _tm) = start_test_server().await;
+    let client = connect(addr, "default").await;
+
+    let rid = Ulid::new();
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .await
+        .unwrap();
+    // Open 0..10000, with 1000..2000 taken. A second request for 1000..2000 must be refused and
+    // offered something out of the remaining open time.
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{}', '{rid}', 0, 10000, false)"#,
+            Ulid::new()
+        ))
+        .await
+        .unwrap();
+    let winner = Ulid::new();
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{winner}', '{rid}', 1000, 2000)"#
+        ))
+        .await
+        .unwrap();
+
+    let err = client
+        .batch_execute(&format!(
+            r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{}', '{rid}', 1000, 2000)"#,
+            Ulid::new()
+        ))
+        .await
+        .expect_err("the span is already allocated");
+
+    let db = err.as_db_error().expect("a database error with fields");
+    assert_eq!(db.code().code(), "40001", "a lost race is serialization_failure");
+
+    // The winner's id must not cross the wire. It used to, which let a caller enumerate
+    // allocations on a resource it cannot read and then cancel them.
+    assert!(
+        !db.message().contains(&winner.to_string()),
+        "the winning allocation's id leaked: {}",
+        db.message()
+    );
+
+    let detail = db.detail().expect("a refusal with alternatives must carry DETAIL");
+    let v: serde_json::Value = serde_json::from_str(detail).expect("DETAIL must be JSON");
+    assert_eq!(v["reserved"], false, "nothing is ever set aside by an offer");
+    assert_eq!(v["deltat"], 1);
+    let alts = v["alternatives"].as_array().expect("alternatives array");
+    assert!(!alts.is_empty(), "there was free time either side of the taken span");
+
+    // The contract that matters: what was offered is actually bookable.
+    for alt in alts {
+        let (start, end) = (alt["start"].as_i64().unwrap(), alt["end"].as_i64().unwrap());
+        client
+            .batch_execute(&format!(
+                r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{}', '{rid}', {start}, {end})"#,
+                Ulid::new()
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("offered span [{start}, {end}) was refused: {e}"));
+    }
+}

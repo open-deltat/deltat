@@ -18,7 +18,24 @@ use super::conflict::{
     check_batch_capacity, check_no_conflict, check_no_conflict_excluding, check_rules_admit,
     validate_buffer, validate_capacity, validate_span, validate_timestamp,
 };
+use super::offer::{self, Refused};
 use super::{Engine, EngineError, WalCommand};
+
+/// The rule-collection window for a write that may need to offer alternatives.
+///
+/// Identical to the candidate span when not offering, so the non-offering path collects exactly
+/// what it collects today. Always a superset of `span`, so a candidate longer than the horizon is
+/// still fully covered.
+fn offer_window(span: &Span, offer_limit: usize) -> Span {
+    if offer_limit == 0 {
+        return *span;
+    }
+    let end = span
+        .end
+        .max(span.start.saturating_add(COUNTER_OFFER_WINDOW_MS))
+        .min(MAX_VALID_TIMESTAMP_MS);
+    Span::try_new(span.start, end).unwrap_or(*span)
+}
 
 impl Engine {
     pub async fn create_resource(
@@ -148,6 +165,42 @@ impl Engine {
     /// Retries are the normal behaviour of the agent clients this is built for, so this is a
     /// live path and not a theoretical one. Call it under the resource write guard so two
     /// concurrent retries on the same resource serialise against each other.
+    /// Build the refusal, computing alternatives under the guard that just refused.
+    ///
+    /// Taking `&ResourceState` (which the guard derefs to) rather than the guard itself is what
+    /// keeps this synchronous and lock-free: no ancestor is walked, nothing is awaited, and the
+    /// acquisition count on a refused statement is identical to today's. Computing against the
+    /// same guard and the same `now` that produced the refusal also means the offer cannot hand
+    /// back the very span it just refused.
+    #[allow(clippy::too_many_arguments)]
+    fn refuse(
+        &self,
+        error: EngineError,
+        rs: &ResourceState,
+        span: &Span,
+        inherited_nb: &[Span],
+        inherited_blocking: &[Span],
+        ancestor_has_schedule: bool,
+        now: Ms,
+        window_end: Ms,
+        offer_limit: usize,
+    ) -> Refused {
+        if offer_limit == 0 || !error.is_offerable() {
+            return Refused { error, offer: None };
+        }
+        let ctx = offer::RuleCtx {
+            inherited_non_blocking: inherited_nb,
+            inherited_blocking,
+            ancestor_has_schedule,
+        };
+        let offer = offer::rank(rs, span, &ctx, now, window_end, offer_limit);
+        crate::observability::record_counter_offer(error.kind(), &offer);
+        Refused {
+            error,
+            offer: Some(Box::new(offer)),
+        }
+    }
+
     fn reject_reused_id(&self, id: Ulid) -> Result<(), EngineError> {
         match self.store.get_resource_for_entity(&id) {
             Some(_) => Err(EngineError::AlreadyExists(id)),
@@ -235,6 +288,23 @@ impl Engine {
         span: Span,
         expires_at: Ms,
     ) -> Result<(), EngineError> {
+        self.place_hold_offering(id, resource_id, span, expires_at, 0)
+            .await
+            .map_err(EngineError::from)
+    }
+
+    /// `place_hold`, but a refusal carries up to `offer_limit` spans the caller could take instead.
+    ///
+    /// `offer_limit == 0` is exactly today's behaviour, which is what `place_hold` delegates with,
+    /// so the offer path is additive and the kill switch is a number rather than a code path.
+    pub async fn place_hold_offering(
+        &self,
+        id: Ulid,
+        resource_id: Ulid,
+        span: Span,
+        expires_at: Ms,
+        offer_limit: usize,
+    ) -> Result<(), Refused> {
         validate_span(&span)?;
         validate_timestamp(expires_at)?;
         // AVAIL-08: the server clock is the expiry authority. The client's expires_at is a
@@ -249,16 +319,38 @@ impl Engine {
         // ancestor locks is the ABBA half of a deadlock, C1); own rules are then read under
         // the guard inside check_rules_admit.
         let parent_id = self.store.get_parent(&resource_id);
-        let (inherited_nb, inherited_blocking, ancestor_has_schedule) =
-            self.collect_inherited_rules(resource_id, parent_id, &span).await?;
+        // Widened when offering, so a refusal can enumerate alternatives from rule context that is
+        // already being collected here anyway. Admission is unaffected: check_rules_admit ends in
+        // subtract_intervals(&[*span], &open), so it depends only on `open` intersected with the
+        // candidate, and extra rule coverage outside the candidate cannot change the verdict.
+        // Always a superset of `span`, so a candidate longer than the horizon still works.
+        let rule_window = offer_window(&span, offer_limit);
+        let (inherited_nb, inherited_blocking, ancestor_has_schedule) = self
+            .collect_inherited_rules(resource_id, parent_id, &rule_window)
+            .await?;
         let mut guard = rs.write().await;
         self.reject_reused_id(id)?;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
-            return Err(EngineError::LimitExceeded("too many intervals on resource"));
+            return Err(EngineError::LimitExceeded("too many intervals on resource").into());
         }
 
-        check_rules_admit(&guard, &span, &inherited_nb, &inherited_blocking, ancestor_has_schedule)?;
-        check_no_conflict(&guard, &span, self.now_ms())?;
+        let now = self.now_ms();
+        if let Err(error) =
+            check_rules_admit(&guard, &span, &inherited_nb, &inherited_blocking, ancestor_has_schedule)
+                .and_then(|()| check_no_conflict(&guard, &span, now))
+        {
+            return Err(self.refuse(
+                error,
+                &guard,
+                &span,
+                &inherited_nb,
+                &inherited_blocking,
+                ancestor_has_schedule,
+                now,
+                rule_window.end,
+                offer_limit,
+            ));
+        }
 
         // Lower the reaper's earliest-expiry watermark so it will scan once this hold can expire.
         // A removal (release/commit) may leave the bound stale-low, which only costs a redundant
@@ -308,9 +400,31 @@ impl Engine {
         booking_id: Ulid,
         label: Option<String>,
     ) -> Result<(), EngineError> {
+        self.commit_hold_offering(hold_id, booking_id, label, 0)
+            .await
+            .map_err(EngineError::from)
+    }
+
+    /// `commit_hold`, but a refusal may carry alternatives.
+    ///
+    /// Offers here are deliberately narrower than on the other two paths. This body holds a single
+    /// guard from `resolve_entity_write` and no inherited rule context was collected, because
+    /// collecting it under that guard is the ABBA half of C1, and dropping the guard to collect
+    /// then relocking would reopen the release-then-rebook TOCTOU the single-lock design exists to
+    /// close. So an offer is made only when this resource's own schedule is the whole story: it
+    /// defines non-blocking rules and has no parent, therefore no inherited blocking rule can
+    /// exist to be missed. Every bookable delt.at publishes has that shape. Otherwise it stays
+    /// silent, which is honest, rather than offering spans a retry would refuse.
+    pub async fn commit_hold_offering(
+        &self,
+        hold_id: Ulid,
+        booking_id: Ulid,
+        label: Option<String>,
+        offer_limit: usize,
+    ) -> Result<(), Refused> {
         if let Some(ref l) = label
             && l.len() > MAX_LABEL_LEN {
-                return Err(EngineError::LimitExceeded("label too long"));
+                return Err(EngineError::LimitExceeded("label too long").into());
             }
         let (resource_id, mut guard) = self.resolve_entity_write(&hold_id).await?;
 
@@ -325,7 +439,16 @@ impl Engine {
         // commit.
         self.reject_reused_id(booking_id)?;
 
-        check_no_conflict_excluding(&guard, &span, self.now_ms(), Some(hold_id))?;
+        let now = self.now_ms();
+        if let Err(error) = check_no_conflict_excluding(&guard, &span, now, Some(hold_id)) {
+            // See the doc comment: own schedule only, no parent, or no offer at all.
+            let can_offer = guard.parent_id.is_none() && guard.has_non_blocking_rule();
+            let limit = if can_offer { offer_limit } else { 0 };
+            let window_end = offer_window(&span, limit).end;
+            return Err(self.refuse(
+                error, &guard, &span, &[], &[], false, now, window_end, limit,
+            ));
+        }
 
         // Release + confirm share one fsync (WalCommand::AppendAtomic): an fsync error or a crash
         // before the flush leaves neither durable. They are still two WAL records, so a torn write
@@ -356,26 +479,58 @@ impl Engine {
         span: Span,
         label: Option<String>,
     ) -> Result<(), EngineError> {
+        self.confirm_booking_offering(id, resource_id, span, label, 0)
+            .await
+            .map_err(EngineError::from)
+    }
+
+    /// `confirm_booking`, but a refusal carries up to `offer_limit` spans the caller could take
+    /// instead. See `place_hold_offering`.
+    pub async fn confirm_booking_offering(
+        &self,
+        id: Ulid,
+        resource_id: Ulid,
+        span: Span,
+        label: Option<String>,
+        offer_limit: usize,
+    ) -> Result<(), Refused> {
         validate_span(&span)?;
         if let Some(ref l) = label
             && l.len() > MAX_LABEL_LEN {
-                return Err(EngineError::LimitExceeded("label too long"));
+                return Err(EngineError::LimitExceeded("label too long").into());
             }
         let rs = self
             .get_resource(&resource_id)
             .ok_or(EngineError::NotFound(resource_id))?;
         // T-03 schedule context, collected BEFORE the write guard (C1); see place_hold.
         let parent_id = self.store.get_parent(&resource_id);
-        let (inherited_nb, inherited_blocking, ancestor_has_schedule) =
-            self.collect_inherited_rules(resource_id, parent_id, &span).await?;
+        let rule_window = offer_window(&span, offer_limit);
+        let (inherited_nb, inherited_blocking, ancestor_has_schedule) = self
+            .collect_inherited_rules(resource_id, parent_id, &rule_window)
+            .await?;
         let mut guard = rs.write().await;
         self.reject_reused_id(id)?;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
-            return Err(EngineError::LimitExceeded("too many intervals on resource"));
+            return Err(EngineError::LimitExceeded("too many intervals on resource").into());
         }
 
-        check_rules_admit(&guard, &span, &inherited_nb, &inherited_blocking, ancestor_has_schedule)?;
-        check_no_conflict(&guard, &span, self.now_ms())?;
+        let now = self.now_ms();
+        if let Err(error) =
+            check_rules_admit(&guard, &span, &inherited_nb, &inherited_blocking, ancestor_has_schedule)
+                .and_then(|()| check_no_conflict(&guard, &span, now))
+        {
+            return Err(self.refuse(
+                error,
+                &guard,
+                &span,
+                &inherited_nb,
+                &inherited_blocking,
+                ancestor_has_schedule,
+                now,
+                rule_window.end,
+                offer_limit,
+            ));
+        }
 
         let event = Event::BookingConfirmed { id, resource_id, span, label };
         self.persist_and_apply(resource_id, &mut guard, &event).await?;

@@ -6,6 +6,42 @@ All notable changes to deltat are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **A refusal now says when, not just no.** When a hold or booking is refused because the span is
+  taken, the resource is at capacity, or the time is outside open hours, the same error carries up
+  to three spans of the same duration that were free at that instant, in the standard PostgreSQL
+  `DETAIL` field as JSON, with a sentence in `HINT`. `psql` prints it as an ordinary `DETAIL:` line
+  and every driver already surfaces the field, so this is not a protocol extension. An agent that
+  loses a race can counter-offer in the same turn instead of spending a round trip asking what it
+  should have asked for, which on a live phone call is the difference between a pause and silence.
+
+  **Nothing is reserved.** An offered span is free for anyone else too, and the payload says
+  `"reserved": false` rather than leaving a reader to infer it. Taking one means placing a hold like
+  any other caller. Handing out a commitment nobody asked for would be worse than the refusal it
+  replaces.
+
+  Offers are computed under the write guard that produced the refusal, at the same instant, so an
+  offer can never be the span that was just refused, and every offered span is one the write path
+  accepts (asserted by feeding each one straight back in). A run is offered only if it fits the
+  request plus the resource's `buffer_after`, because a booking's effective footprint includes its
+  turnaround tail. `DELTAT_COUNTER_OFFER=0` disables the feature; a refusal with nothing to say
+  emits no `DETAIL` at all, so its absence is a legal state rather than a signal.
+
+  Not covered: batch inserts carry no offers, because N alternatives on a capacity-1 resource all
+  collapse onto the same free run and substituting two of them is a guaranteed fresh conflict. The
+  honest shape there is a re-plan, which is a different feature.
+
+### Security
+- **A conflict no longer names the allocation that won.** `conflict with allocation: <ulid>` became
+  `span is already allocated`. The previous message handed a losing caller the identifier of an
+  allocation it has no other way to see, so cheap failing `INSERT`s enumerated every allocation on a
+  resource the caller cannot read, and `cancel_booking` takes an id and nothing else, so what could
+  be enumerated could be cancelled. Audit 2026-08-26, ship-blocker 2, and half of the chain in
+  ship-blocker 4. Scoping cancellation to a principal is the other half and is not in this release.
+- `ClosedBySchedule` and `NotCoveredByParent` stop rendering `{:?}` over a `Vec<Span>` into the
+  error message, which leaked internal struct formatting to any client. They report counts; the
+  spans themselves belong in `DETAIL` where a client can parse them.
+
 ### Fixed
 - **`WHERE` clauses on `bookings` and `holds` reads are honoured instead of silently dropped.**
   `SELECT * FROM bookings WHERE resource_id = 'X' AND start >= 1000 AND "end" <= 2000` used to

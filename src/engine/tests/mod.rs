@@ -6,6 +6,7 @@ mod admission;
 mod basics;
 mod capacity_buffer;
 mod conflicts;
+mod counter_offer;
 mod gc;
 mod hardening;
 mod hierarchy;
