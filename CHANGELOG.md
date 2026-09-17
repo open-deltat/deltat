@@ -6,6 +6,22 @@ All notable changes to deltat are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **Reusing an entity id no longer strands an interval.** `INSERT INTO holds`, `INSERT INTO
+  bookings` and `INSERT INTO rules` now reject an id that is already in use, anywhere in the
+  tenant, with SQLSTATE `23505`. Previously nothing caught a reuse: the conflict check skips
+  expired holds and never runs at all when the new span does not overlap, and the interval store
+  did not deduplicate. A client retrying with the same id, which is ordinary behaviour after a
+  timeout, could therefore create a second interval carrying that id. Removing one copy unmapped
+  the id, leaving the other unreachable by release, commit, cancel or the reaper: it kept
+  occupying a slot against the per-resource interval cap and came back on every replay. If you
+  were relying on a re-`INSERT` silently succeeding, mint a fresh id instead.
+
+### Changed
+- The WAL format version is read back and an older log is migrated in full on open, rather than
+  the version being parsed and discarded (#33). A mixed-version log, which an older binary would
+  have truncated at the tail and thereby dropped an acknowledged booking, can no longer exist.
+
 ## [0.3.0] - 2026-08-26
 
 The observability release, plus the two things that make a published container safe to upgrade

@@ -898,3 +898,73 @@ async fn formerly_unreapable_hold_expires_once_the_cap_passes() {
     let due = engine.collect_expired_holds(engine.now_ms());
     assert_eq!(due, vec![(hid, rid)]);
 }
+
+// ── Duplicate entity ids (a retrying agent must not be able to strand an interval) ──
+
+/// An agent that retries `place_hold` with the same id after the hold expired, but before the
+/// reaper has collected it, used to insert a SECOND interval carrying that id:
+/// `check_no_conflict` skips expired holds, and `insert_interval` does not dedupe. Releasing
+/// one copy then unmaps `entity_to_resource`, stranding the other where nothing can reach it:
+/// the reaper rediscovers it on every scan and `expire_hold` cannot resolve it, so it occupies
+/// a slot against `MAX_INTERVALS_PER_RESOURCE` forever and replays from the WAL on restart.
+///
+/// Retries are the norm for the agent clients this is built for, so the id must be rejected.
+#[tokio::test]
+async fn place_hold_rejects_a_reused_id_after_expiry() {
+    let path = test_wal_path("dup_hold_id_after_expiry.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let clock = Arc::new(TestClock::new(1_000));
+    let engine = Engine::with_clock(path, notify, clock.clone()).unwrap();
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(0, 10 * H), false).await.unwrap();
+
+    let hid = Ulid::new();
+    let span = Span::new(H, 2 * H);
+    engine.place_hold(hid, rid, span, 2_000).await.unwrap();
+
+    // Past expiry, inside the reaper's window: the hold is expired but still present.
+    clock.advance(5_000);
+
+    let retry = engine.place_hold(hid, rid, span, engine.now_ms() + 60_000).await;
+    assert!(
+        matches!(retry, Err(EngineError::AlreadyExists(id)) if id == hid),
+        "re-placing a live-or-expired hold id must be rejected, got {retry:?}"
+    );
+
+    // The invariant the rejection protects: exactly one interval carries this id.
+    let rs = engine.get_resource(&rid).unwrap();
+    let guard = rs.read().await;
+    let copies = guard.intervals.iter().filter(|i| i.id == hid).count();
+    assert_eq!(copies, 1, "duplicate interval for hold id {hid}");
+}
+
+/// The same hole reached without expiry: a non-overlapping span means `check_no_conflict`
+/// never sees the original, so nothing else would have caught the reused id.
+#[tokio::test]
+async fn place_hold_rejects_a_reused_id_on_a_disjoint_span() {
+    let path = test_wal_path("dup_hold_id_disjoint.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    let base = now_ms();
+    engine.add_rule(Ulid::new(), rid, Span::new(base, base + 10 * H), false).await.unwrap();
+
+    let hid = Ulid::new();
+    engine.place_hold(hid, rid, Span::new(base + H, base + 2 * H), base + 60_000).await.unwrap();
+
+    let retry = engine
+        .place_hold(hid, rid, Span::new(base + 5 * H, base + 6 * H), base + 60_000)
+        .await;
+    assert!(
+        matches!(retry, Err(EngineError::AlreadyExists(id)) if id == hid),
+        "a reused hold id on a disjoint span must be rejected, got {retry:?}"
+    );
+
+    let rs = engine.get_resource(&rid).unwrap();
+    let guard = rs.read().await;
+    assert_eq!(guard.intervals.iter().filter(|i| i.id == hid).count(), 1);
+}
