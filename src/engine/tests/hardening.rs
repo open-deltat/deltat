@@ -968,3 +968,124 @@ async fn place_hold_rejects_a_reused_id_on_a_disjoint_span() {
     let guard = rs.read().await;
     assert_eq!(guard.intervals.iter().filter(|i| i.id == hid).count(), 1);
 }
+
+/// `commit_hold` mints the booking id from caller input and never checked it. The guard added with
+/// `reject_reused_id` was wired into `add_rule`, `place_hold` and `confirm_booking` but not here, so
+/// the stranding mechanism stayed reachable through the wire's
+/// `UPDATE holds SET booking_id = $1 WHERE id = $2`, which is the SDK's own commit path.
+#[tokio::test]
+async fn commit_hold_rejects_a_booking_id_already_in_use() {
+    let path = test_wal_path("dup_commit_booking_id.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    let base = now_ms();
+    engine.add_rule(Ulid::new(), rid, Span::new(base, base + 10 * H), false).await.unwrap();
+
+    // An id that is already live as a booking.
+    let taken = Ulid::new();
+    engine
+        .confirm_booking(taken, rid, Span::new(base + H, base + 2 * H), None)
+        .await
+        .unwrap();
+
+    // A hold on a disjoint span, so no conflict check would trip on the reuse.
+    let hid = Ulid::new();
+    engine
+        .place_hold(hid, rid, Span::new(base + 5 * H, base + 6 * H), base + 60_000)
+        .await
+        .unwrap();
+
+    let committed = engine.commit_hold(hid, taken, None).await;
+    assert!(
+        matches!(committed, Err(EngineError::AlreadyExists(id)) if id == taken),
+        "committing onto an id already in use must be rejected, got {committed:?}"
+    );
+
+    // The invariant the rejection protects, and the reason it matters: a second interval carrying
+    // `taken` would be unreachable by cancel, because removing either unmaps the id for both.
+    let rs = engine.get_resource(&rid).unwrap();
+    let guard = rs.read().await;
+    assert_eq!(
+        guard.intervals.iter().filter(|i| i.id == taken).count(),
+        1,
+        "duplicate interval for booking id {taken}"
+    );
+    // The hold must survive a rejected commit, or a retry with a fresh booking id has nothing left
+    // to commit and the caller has silently lost its reservation.
+    assert_eq!(
+        guard.intervals.iter().filter(|i| i.id == hid).count(),
+        1,
+        "the hold must still be live after a rejected commit"
+    );
+}
+
+/// `batch_confirm_bookings` is all-or-nothing, so a reused id has to be caught before anything is
+/// applied. Two cases reach it: an id already live on the resource, and two members of the same
+/// batch carrying one id, which no pre-existing state can catch.
+#[tokio::test]
+async fn batch_confirm_rejects_reused_ids_from_state_and_from_within_the_batch() {
+    let path = test_wal_path("dup_batch_booking_id.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    let base = now_ms();
+    engine.add_rule(Ulid::new(), rid, Span::new(base, base + 20 * H), false).await.unwrap();
+
+    let taken = Ulid::new();
+    engine
+        .confirm_booking(taken, rid, Span::new(base + H, base + 2 * H), None)
+        .await
+        .unwrap();
+
+    // Case 1: a member reuses an id already live on the resource.
+    let fresh = Ulid::new();
+    let from_state = engine
+        .batch_confirm_bookings(vec![
+            (fresh, rid, Span::new(base + 5 * H, base + 6 * H), None),
+            (taken, rid, Span::new(base + 7 * H, base + 8 * H), None),
+        ])
+        .await;
+    assert!(
+        matches!(from_state, Err(EngineError::AlreadyExists(id)) if id == taken),
+        "a batch member reusing a live id must be rejected, got {from_state:?}"
+    );
+
+    // All-or-nothing: the innocent member must not have landed either.
+    {
+        let rs = engine.get_resource(&rid).unwrap();
+        let guard = rs.read().await;
+        assert_eq!(
+            guard.intervals.iter().filter(|i| i.id == fresh).count(),
+            0,
+            "a rejected batch must not leave an earlier member applied"
+        );
+        assert_eq!(guard.intervals.iter().filter(|i| i.id == taken).count(), 1);
+    }
+
+    // Case 2: the duplicate exists only within the batch, so no amount of state inspection per
+    // member catches it; the batch has to check itself.
+    let twice = Ulid::new();
+    let intra = engine
+        .batch_confirm_bookings(vec![
+            (twice, rid, Span::new(base + 11 * H, base + 12 * H), None),
+            (twice, rid, Span::new(base + 13 * H, base + 14 * H), None),
+        ])
+        .await;
+    assert!(
+        matches!(intra, Err(EngineError::AlreadyExists(id)) if id == twice),
+        "two batch members sharing one id must be rejected, got {intra:?}"
+    );
+
+    let rs = engine.get_resource(&rid).unwrap();
+    let guard = rs.read().await;
+    assert_eq!(
+        guard.intervals.iter().filter(|i| i.id == twice).count(),
+        0,
+        "neither member of a self-colliding batch may be applied"
+    );
+}

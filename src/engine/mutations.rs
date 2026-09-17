@@ -4,7 +4,7 @@
 //! then applies to memory, so an fsync failure cannot leave a durable-versus-visible split.
 //! Batch bookings and hold commits run under one lock so they are all-or-nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, RwLock};
@@ -318,6 +318,13 @@ impl Engine {
         // hold to commit. The booking takes exactly the held span.
         let span = find_interval_of_kind(&guard, &hold_id, is_hold)?.span;
 
+        // The booking id is caller input here exactly as it is in `confirm_booking`, so the same
+        // reuse hole applies: without this, committing onto an id already in use inserts a second
+        // interval carrying it, and removing either unmaps the id for both. Rejected before the WAL
+        // append, so the hold survives and a retry with a fresh booking id still has something to
+        // commit.
+        self.reject_reused_id(booking_id)?;
+
         check_no_conflict_excluding(&guard, &span, self.now_ms(), Some(hold_id))?;
 
         // Release + confirm share one fsync (WalCommand::AppendAtomic): an fsync error or a crash
@@ -430,6 +437,19 @@ impl Engine {
             }
             rs_map.insert(*rid, guards.len());
             guards.push(guard);
+        }
+
+        // Reuse rejection, under the guards so concurrent retries serialise, and before anything is
+        // applied so the batch stays all-or-nothing. Two distinct cases: an id already live
+        // anywhere in the tenant, which `reject_reused_id` catches, and two members of this batch
+        // sharing one id, which no amount of state inspection can catch because neither exists yet.
+        // Both produce the same stranded-interval outcome described on `reject_reused_id`.
+        let mut batch_ids = HashSet::with_capacity(bookings.len());
+        for (id, _, _, _) in &bookings {
+            self.reject_reused_id(*id)?;
+            if !batch_ids.insert(*id) {
+                return Err(EngineError::AlreadyExists(*id));
+            }
         }
 
         // Phase 1: Validate all bookings against current state + intra-batch.

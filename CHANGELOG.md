@@ -35,6 +35,14 @@ All notable changes to deltat are documented here. The format follows
   the id, leaving the other unreachable by release, commit, cancel or the reaper: it kept
   occupying a slot against the per-resource interval cap and came back on every replay. If you
   were relying on a re-`INSERT` silently succeeding, mint a fresh id instead.
+- **The same rejection now covers `commit_hold` and multi-row `INSERT INTO bookings`,** which the
+  first pass missed. The guard was wired into three of the five write paths, so the identical
+  stranding was still reachable through `UPDATE holds SET booking_id = $1 WHERE id = $2` (the SDK's
+  own commit path, and the one an agent uses most) and through a batch insert. A batch is also
+  checked against itself: two rows sharing one id are rejected, which no amount of inspecting
+  existing state can catch because neither row exists yet. Rejection happens before the WAL append,
+  so a refused commit leaves the hold live and a retry with a fresh booking id still has something
+  to commit.
 
 ### Changed
 - **Breaking, in the honest direction:** a read whose `WHERE` clause previously "worked" by having
