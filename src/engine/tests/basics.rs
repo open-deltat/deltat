@@ -318,10 +318,54 @@ async fn get_bookings_multi_groups_dedups_and_skips_unknown() {
 
     // Duplicate `a` must NOT re-emit a's booking; the unknown id resolves to nothing.
     let unknown = Ulid::new();
-    let rows = engine.get_bookings_multi(&[a, b, a, unknown]).await.unwrap();
+    let rows = engine.get_bookings_multi(&[a, b, a, unknown], &[]).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows.iter().filter(|r| r.resource_id == a).count(), 1);
     assert_eq!(rows.iter().filter(|r| r.resource_id == b).count(), 1);
+}
+
+/// The multi-resource reads take the same filter slice as the single-resource ones and must apply
+/// it per resource. Filtering only the first resource, or only after regrouping, would leak rows
+/// the caller excluded; these assert the filter survives the fan-out and the dedup.
+#[tokio::test]
+async fn multi_reads_apply_span_filters_to_every_resource() {
+    use crate::command::{SpanColumn, SpanFilter, SpanOp};
+
+    let path = test_wal_path("multi_span_filters.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+
+    let a = Ulid::new();
+    let b = Ulid::new();
+    for rid in [a, b] {
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), rid, Span::new(0, 24 * H), false).await.unwrap();
+        engine.confirm_booking(Ulid::new(), rid, Span::new(9 * H, 10 * H), None).await.unwrap();
+        engine.confirm_booking(Ulid::new(), rid, Span::new(14 * H, 15 * H), None).await.unwrap();
+    }
+
+    let morning = [SpanFilter { column: SpanColumn::Start, op: SpanOp::Lt, value: 12 * H }];
+
+    // Both resources contribute, and each drops its afternoon booking. A filter applied to only
+    // one resource would yield 3 rows; one dropped entirely would yield 4.
+    let rows = engine.get_bookings_multi(&[a, b], &morning).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.start == 9 * H));
+    assert_eq!(rows.iter().filter(|r| r.resource_id == a).count(), 1);
+    assert_eq!(rows.iter().filter(|r| r.resource_id == b).count(), 1);
+
+    // Dedup and filtering compose: the repeated id still contributes exactly one row.
+    let deduped = engine.get_bookings_multi(&[a, b, a], &morning).await.unwrap();
+    assert_eq!(deduped.len(), 2);
+
+    let far_future = now_ms() + 3_600_000;
+    for rid in [a, b] {
+        engine.place_hold(Ulid::new(), rid, Span::new(11 * H, 12 * H), far_future).await.unwrap();
+        engine.place_hold(Ulid::new(), rid, Span::new(16 * H, 17 * H), far_future).await.unwrap();
+    }
+    let held = engine.get_holds_multi(&[a, b], &morning).await.unwrap();
+    assert_eq!(held.len(), 2);
+    assert!(held.iter().all(|h| h.start == 11 * H));
 }
 
 #[tokio::test]
@@ -475,8 +519,8 @@ async fn engine_commit_hold_converts_hold_to_booking() {
     engine.commit_hold(hid, bid, Some("seat-14F".into())).await.unwrap();
 
     // The hold is gone; exactly one booking covers the held span.
-    assert!(engine.get_holds(rid).await.unwrap().is_empty());
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert!(engine.get_holds(rid, &[]).await.unwrap().is_empty());
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings.len(), 1);
     assert_eq!(bookings[0].id, bid);
     assert_eq!((bookings[0].start, bookings[0].end), (1000, 2000));
@@ -511,8 +555,8 @@ async fn engine_commit_hold_excludes_its_own_hold() {
     // ...but committing the hold books that exact span, because the hold is excluded from its own
     // conflict check. No release-then-rebook gap.
     engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
-    assert!(engine.get_holds(rid).await.unwrap().is_empty());
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 1);
+    assert!(engine.get_holds(rid, &[]).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -569,8 +613,8 @@ async fn engine_commit_hold_rejects_when_span_booked_after_expiry() {
     let err = engine.commit_hold(hid, Ulid::new(), None).await.unwrap_err();
     assert!(matches!(err, EngineError::Conflict(_)));
     // And nothing partially applied: still exactly one booking, and the lapsed hold is untouched.
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
-    assert_eq!(engine.get_holds(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 1);
+    assert_eq!(engine.get_holds(rid, &[]).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -592,8 +636,8 @@ async fn engine_commit_hold_persists_across_replay() {
     // Reopen from the WAL after a clean shutdown: the hold is gone and the booking survives. Both
     // halves of the commit are durable.
     let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
-    assert!(engine.get_holds(rid).await.unwrap().is_empty());
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert!(engine.get_holds(rid, &[]).await.unwrap().is_empty());
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings.len(), 1);
     assert_eq!(bookings[0].id, bid);
 }
@@ -627,8 +671,8 @@ async fn engine_commit_hold_torn_write_never_overbooks() {
     drop(file);
 
     let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
-    let holds = engine.get_holds(rid).await.unwrap();
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     // The booking was lost, but the unsafe outcome (a lingering hold AND a booking) never occurs:
     // the span is simply free again.
     assert!(bookings.is_empty(), "a torn commit must not leave a booking");
@@ -655,8 +699,8 @@ async fn engine_commit_hold_excludes_own_hold_on_capacity_n() {
 
     // Convert A's slot in place: booking A + hold B = 2 ≤ capacity.
     engine.commit_hold(a, Ulid::new(), None).await.unwrap();
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
-    assert_eq!(engine.get_holds(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 1);
+    assert_eq!(engine.get_holds(rid, &[]).await.unwrap().len(), 1);
 
     // A third overlapping allocation now exceeds capacity. Confirms the resource was genuinely full.
     let err = engine
@@ -682,10 +726,10 @@ async fn engine_commit_hold_with_buffer_books_the_held_span() {
         .unwrap();
     engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
 
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings.len(), 1);
     assert_eq!((bookings[0].start, bookings[0].end), (100, 200));
-    assert!(engine.get_holds(rid).await.unwrap().is_empty());
+    assert!(engine.get_holds(rid, &[]).await.unwrap().is_empty());
 }
 
 #[tokio::test]

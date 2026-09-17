@@ -118,7 +118,7 @@ async fn get_bookings_for_resource() {
     engine.confirm_booking(b1, rid, Span::new(9 * H, 10 * H), Some("Alice".into())).await.unwrap();
     engine.confirm_booking(b2, rid, Span::new(14 * H, 15 * H), None).await.unwrap();
 
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings.len(), 2);
 
     let ba = bookings.iter().find(|b| b.id == b1).unwrap();
@@ -142,7 +142,7 @@ async fn get_bookings_excludes_cancelled() {
     engine.confirm_booking(bid, rid, Span::new(9 * H, 10 * H), None).await.unwrap();
     engine.cancel_booking(bid).await.unwrap();
 
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert!(bookings.is_empty());
 }
 
@@ -159,7 +159,7 @@ async fn get_holds_for_resource() {
     let hid = Ulid::new();
     engine.place_hold(hid, rid, Span::new(9 * H, 10 * H), far_future).await.unwrap();
 
-    let holds = engine.get_holds(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
     assert_eq!(holds.len(), 1);
     assert_eq!(holds[0].id, hid);
     assert_eq!(holds[0].expires_at, far_future);
@@ -314,7 +314,7 @@ async fn booking_label_preserved() {
     let bid = Ulid::new();
     engine.confirm_booking(bid, rid, Span::new(9 * H, 10 * H), Some("VIP Guest".into())).await.unwrap();
 
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings[0].label, Some("VIP Guest".into()));
 }
 
@@ -332,7 +332,7 @@ async fn booking_label_persists_via_wal() {
     }
 
     let engine2 = Engine::new(path, notify).unwrap();
-    let bookings = engine2.get_bookings(rid).await.unwrap();
+    let bookings = engine2.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings.len(), 1);
     assert_eq!(bookings[0].label, Some("Replay Test".into()));
 }

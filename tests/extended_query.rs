@@ -173,3 +173,61 @@ async fn prepared_availability_query_matches_simple_protocol() {
         assert_eq!(row.get::<_, String>("resource_id"), rid_s);
     }
 }
+
+// ── The "any Postgres client" promise ──────────────────────────────────────
+//
+// README.md tells people to connect any Postgres client. The parser used to drop ANDed range
+// predicates on bookings/holds reads, so the most obvious query a client can write returned every
+// row with a success code. Nothing caught it because the unit tests only covered the shapes our own
+// SDK emits, and the SDK windows client-side precisely because the kernel ignored the predicate.
+// These drive a real client over the wire, which is where the promise actually lives.
+
+#[tokio::test]
+async fn a_range_predicate_over_the_wire_actually_filters() {
+    let (addr, _tm) = start_test_server().await;
+    let client = connect(addr, "default").await;
+    let rid = create_bookable_resource(&client).await;
+
+    // Every placeholder is declared VARCHAR on this wire (values are substituted as text), so the
+    // numeric bounds bind as strings exactly like the tests above.
+    for (start, end) in [("1000", "1200"), ("1200", "1400"), ("1400", "1600")] {
+        let bid = Ulid::new().to_string();
+        let rid_s = rid.to_string();
+        let params: [&(dyn ToSql + Sync); 5] = [&bid, &rid_s, &start, &end, &"held"];
+        client.execute(INSERT_BOOKING, &params).await.unwrap();
+    }
+
+    let all = data_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+    assert_eq!(all.len(), 3, "sanity: three bookings exist");
+
+    // Containment: only the middle booking sits entirely inside [1200, 1400].
+    let contained = data_rows(
+        &client,
+        &format!(r#"SELECT * FROM bookings WHERE resource_id = '{rid}' AND start >= 1200 AND "end" <= 1400"#),
+    )
+    .await;
+    assert_eq!(contained.len(), 1, "a range predicate must filter, not be ignored");
+
+    // A bound that excludes everything must return nothing, not everything.
+    let none = data_rows(
+        &client,
+        &format!("SELECT * FROM bookings WHERE resource_id = '{rid}' AND start >= 9999"),
+    )
+    .await;
+    assert!(none.is_empty(), "an unsatisfiable bound must return no rows");
+}
+
+#[tokio::test]
+async fn an_unsupported_predicate_fails_loudly_over_the_wire() {
+    let (addr, _tm) = start_test_server().await;
+    let client = connect(addr, "default").await;
+    let rid = create_bookable_resource(&client).await;
+
+    // Wrong data with a success code is worse than a failed query, so this must be an error.
+    let result = client
+        .simple_query(&format!(
+            "SELECT * FROM bookings WHERE resource_id = '{rid}' AND label = 'Alex'"
+        ))
+        .await;
+    assert!(result.is_err(), "an unhonourable predicate must not return rows");
+}

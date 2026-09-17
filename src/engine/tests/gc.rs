@@ -19,7 +19,7 @@ async fn gc_removes_past_bookings() {
     let collected = engine.gc_past_intervals(10000, 5000);
     assert_eq!(collected, 1);
 
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert!(bookings.is_empty());
 }
 
@@ -39,7 +39,7 @@ async fn gc_keeps_future_bookings() {
     let collected = engine.gc_past_intervals(10000, 5000);
     assert_eq!(collected, 0);
 
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings.len(), 1);
 }
 
@@ -117,7 +117,7 @@ async fn gc_removes_expired_past_holds() {
     let collected = engine.gc_past_intervals(10000, 5000);
     assert_eq!(collected, 1);
 
-    let holds = engine.get_holds(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
     assert!(holds.is_empty());
 }
 
@@ -138,7 +138,7 @@ async fn gc_keeps_active_holds() {
     let collected = engine.gc_past_intervals(10000, 5000);
     assert_eq!(collected, 0);
 
-    let holds = engine.get_holds(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
     assert_eq!(holds.len(), 1);
 }
 
@@ -189,7 +189,7 @@ async fn gc_compact_roundtrip() {
     let notify2 = Arc::new(crate::notify::NotifyHub::new());
     let engine2 = Engine::new(path, notify2).unwrap();
 
-    let bookings = engine2.get_bookings(rid).await.unwrap();
+    let bookings = engine2.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings.len(), 1);
     assert_eq!(bookings[0].label, Some("new".into()));
     assert!(engine2.get_resource_for_entity(&old_bid).is_none());
@@ -236,9 +236,9 @@ async fn gc_mixed_intervals_selective() {
     let collected = engine.gc_past_intervals(10000, 5000);
     assert_eq!(collected, 2); // old booking + old expired hold
 
-    let bookings = engine.get_bookings(rid).await.unwrap();
+    let bookings = engine.get_bookings(rid, &[]).await.unwrap();
     assert_eq!(bookings.len(), 2);
-    let holds = engine.get_holds(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
     assert!(holds.is_empty());
     let rules = engine.get_rules(rid).await.unwrap();
     assert_eq!(rules.len(), 2); // original non-blocking + blocking rule

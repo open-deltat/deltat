@@ -9,7 +9,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use ulid::Ulid;
 
-use crate::command::Command;
+use crate::command::{Command, SpanColumn, SpanFilter, SpanOp};
 use crate::limits::{MAX_BATCH_SIZE, MAX_IN_CLAUSE_IDS};
 use crate::model::*;
 
@@ -204,19 +204,19 @@ fn parse_select(query: &ast::Query) -> Result<Command, SqlError> {
             Ok(Command::SelectRules { resource_id })
         }
         "bookings" => {
-            let ids = extract_resource_ids_filter(&select.selection)?;
+            let (ids, filters) = extract_resource_ids_filter(&select.selection)?;
             if let [resource_id] = ids[..] {
-                Ok(Command::SelectBookings { resource_id })
+                Ok(Command::SelectBookings { resource_id, filters })
             } else {
-                Ok(Command::SelectBookingsMulti { resource_ids: ids })
+                Ok(Command::SelectBookingsMulti { resource_ids: ids, filters })
             }
         }
         "holds" => {
-            let ids = extract_resource_ids_filter(&select.selection)?;
+            let (ids, filters) = extract_resource_ids_filter(&select.selection)?;
             if let [resource_id] = ids[..] {
-                Ok(Command::SelectHolds { resource_id })
+                Ok(Command::SelectHolds { resource_id, filters })
             } else {
-                Ok(Command::SelectHoldsMulti { resource_ids: ids })
+                Ok(Command::SelectHoldsMulti { resource_ids: ids, filters })
             }
         }
         _ => Err(SqlError::UnknownTable(table)),
@@ -427,57 +427,121 @@ fn assignment_column_name(a: &ast::Assignment) -> Result<String, SqlError> {
     }
 }
 
+/// The `rules` read takes exactly one filter: `resource_id`. Every other conjunct is rejected
+/// rather than skipped past, for the same reason as the bookings/holds path above: an `.or_else`
+/// walk that returns as soon as it finds the id would answer `WHERE resource_id = X AND start >= A`
+/// with every rule on the resource, under a success code.
 fn extract_resource_id_filter(selection: &Option<Expr>) -> Result<Ulid, SqlError> {
     let sel = selection.as_ref().ok_or(SqlError::MissingFilter("resource_id"))?;
-    match sel {
-        Expr::BinaryOp {
-            left,
-            op: ast::BinaryOperator::Eq,
-            right,
-        } => {
-            if expr_column_name(left).as_deref() == Some("resource_id") {
-                parse_ulid_expr(right)
-            } else {
-                Err(SqlError::MissingFilter("resource_id"))
-            }
+    let mut found: Option<Ulid> = None;
+    collect_single_resource_id(sel, &mut found)?;
+    found.ok_or(SqlError::MissingFilter("resource_id"))
+}
+
+fn collect_single_resource_id(expr: &Expr, found: &mut Option<Ulid>) -> Result<(), SqlError> {
+    match expr {
+        Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            collect_single_resource_id(left, found)?;
+            collect_single_resource_id(right, found)?;
+            Ok(())
         }
-        // Handle AND expressions: find resource_id = X within ANDs
-        Expr::BinaryOp {
-            left,
-            op: ast::BinaryOperator::And,
-            right,
-        } => {
-            extract_resource_id_filter(&Some(*left.clone()))
-                .or_else(|_| extract_resource_id_filter(&Some(*right.clone())))
+        Expr::Nested(inner) => collect_single_resource_id(inner, found),
+        Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right }
+            if expr_column_name(left).as_deref() == Some("resource_id") =>
+        {
+            *found = Some(parse_ulid_expr(right)?);
+            Ok(())
         }
-        _ => Err(SqlError::MissingFilter("resource_id")),
+        other => Err(SqlError::Unsupported(format!(
+            "filter in WHERE clause: {other}"
+        ))),
     }
 }
 
-/// Collect resource ids from `WHERE resource_id = X` or `WHERE resource_id IN (...)`, ignoring
-/// any ANDed range predicates. One id parses to a single-resource Select; many to a Multi. The
-/// `IN` length is bounded here (mirrors the availability path) so an oversized list is rejected
-/// at parse time rather than fanned out in the engine.
-fn extract_resource_ids_filter(selection: &Option<Expr>) -> Result<Vec<Ulid>, SqlError> {
+/// Collect resource ids and span predicates from a bookings/holds `WHERE` clause.
+///
+/// Every conjunct must be understood. A predicate this parser cannot honour is an error, never a
+/// silent no-op: returning rows that ignore half the `WHERE` clause is wrong data delivered with a
+/// success code, which is strictly worse than a failed query. (This function used to drop ANDed
+/// range predicates on the floor, so `WHERE resource_id = X AND start >= A` quietly returned every
+/// booking on the resource.)
+///
+/// One id parses to a single-resource Select; many to a Multi. The `IN` length is bounded here
+/// (mirrors the availability path) so an oversized list is rejected at parse time rather than
+/// fanned out in the engine.
+fn extract_resource_ids_filter(
+    selection: &Option<Expr>,
+) -> Result<(Vec<Ulid>, Vec<SpanFilter>), SqlError> {
     let mut ids = Vec::new();
+    let mut filters = Vec::new();
     if let Some(sel) = selection {
-        collect_resource_ids(sel, &mut ids)?;
+        collect_resource_ids(sel, &mut ids, &mut filters)?;
     }
     if ids.is_empty() {
         return Err(SqlError::MissingFilter("resource_id"));
     }
-    Ok(ids)
+    Ok((ids, filters))
 }
 
-fn collect_resource_ids(expr: &Expr, ids: &mut Vec<Ulid>) -> Result<(), SqlError> {
+/// Map a SQL comparison on `start`/`"end"` to a [`SpanFilter`], or `None` if this is not a span
+/// comparison at all. Callers treat `None` as "not understood" and reject.
+fn span_filter_from(left: &Expr, op: &ast::BinaryOperator, right: &Expr) -> Option<SpanFilter> {
+    let column = match expr_column_name(left)?.as_str() {
+        "start" => SpanColumn::Start,
+        "end" => SpanColumn::End,
+        _ => return None,
+    };
+    let span_op = match op {
+        ast::BinaryOperator::Lt => SpanOp::Lt,
+        ast::BinaryOperator::LtEq => SpanOp::Lte,
+        ast::BinaryOperator::Gt => SpanOp::Gt,
+        ast::BinaryOperator::GtEq => SpanOp::Gte,
+        ast::BinaryOperator::Eq => SpanOp::Eq,
+        _ => return None,
+    };
+    Some(SpanFilter { column, op: span_op, value: parse_i64_expr(right).ok()? })
+}
+
+fn collect_resource_ids(
+    expr: &Expr,
+    ids: &mut Vec<Ulid>,
+    filters: &mut Vec<SpanFilter>,
+) -> Result<(), SqlError> {
     match expr {
         Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
-            collect_resource_ids(left, ids)?;
-            collect_resource_ids(right, ids)?;
+            collect_resource_ids(left, ids, filters)?;
+            collect_resource_ids(right, ids, filters)?;
         }
+        Expr::Nested(inner) => collect_resource_ids(inner, ids, filters)?,
         Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
             if expr_column_name(left).as_deref() == Some("resource_id") {
                 ids.push(parse_ulid_expr(right)?);
+            } else if let Some(f) = span_filter_from(left, &ast::BinaryOperator::Eq, right) {
+                filters.push(f);
+            } else {
+                return Err(SqlError::Unsupported(format!(
+                    "filter on {}",
+                    expr_column_name(left).unwrap_or_else(|| "expression".into())
+                )));
+            }
+        }
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                ast::BinaryOperator::Lt
+                    | ast::BinaryOperator::LtEq
+                    | ast::BinaryOperator::Gt
+                    | ast::BinaryOperator::GtEq
+            ) =>
+        {
+            match span_filter_from(left, op, right) {
+                Some(f) => filters.push(f),
+                None => {
+                    return Err(SqlError::Unsupported(format!(
+                        "filter on {}",
+                        expr_column_name(left).unwrap_or_else(|| "expression".into())
+                    )))
+                }
             }
         }
         Expr::InList { expr: col_expr, list, negated }
@@ -494,7 +558,13 @@ fn collect_resource_ids(expr: &Expr, ids: &mut Vec<Ulid>) -> Result<(), SqlError
                 ids.push(parse_ulid_expr(item)?);
             }
         }
-        _ => {}
+        // Deliberately NOT a silent catch-all. An unrecognised conjunct means the engine would
+        // answer a different question than the one asked, so it fails loudly instead.
+        other => {
+            return Err(SqlError::Unsupported(format!(
+                "filter in WHERE clause: {other}"
+            )))
+        }
     }
     Ok(())
 }
@@ -1634,7 +1704,7 @@ mod tests {
         let sql = "SELECT * FROM bookings WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
         let cmd = parse_sql(sql).unwrap();
         match cmd {
-            Command::SelectBookings { resource_id } => {
+            Command::SelectBookings { resource_id, .. } => {
                 assert_eq!(resource_id.to_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
             }
             _ => panic!("expected SelectBookings, got {cmd:?}"),
@@ -1646,11 +1716,112 @@ mod tests {
         let sql = "SELECT * FROM holds WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
         let cmd = parse_sql(sql).unwrap();
         match cmd {
-            Command::SelectHolds { resource_id } => {
+            Command::SelectHolds { resource_id, .. } => {
                 assert_eq!(resource_id.to_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
             }
             _ => panic!("expected SelectHolds, got {cmd:?}"),
         }
+    }
+
+    // ── Span predicates on bookings/holds reads ────────────────────────────
+    //
+    // These exist because the parser used to drop ANDed range predicates silently: the SQL below
+    // returned EVERY booking on the resource with a success code, and no test caught it because
+    // every test emitted only the shapes the TypeScript SDK emits, and the SDK deliberately never
+    // emits a range (it windows client-side). The README promises "any Postgres client", so the
+    // contract to test is what a naive client writes, not what our own SDK happens to write.
+
+    #[test]
+    fn bookings_range_predicates_are_honoured_not_dropped() {
+        let sql = "SELECT * FROM bookings WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND start >= 1000 AND \"end\" <= 2000";
+        match parse_sql(sql).unwrap() {
+            Command::SelectBookings { filters, .. } => {
+                assert_eq!(
+                    filters,
+                    vec![
+                        SpanFilter { column: SpanColumn::Start, op: SpanOp::Gte, value: 1000 },
+                        SpanFilter { column: SpanColumn::End, op: SpanOp::Lte, value: 2000 },
+                    ]
+                );
+            }
+            other => panic!("expected SelectBookings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn holds_range_predicates_are_honoured_not_dropped() {
+        let sql = "SELECT * FROM holds WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND start > 500 AND \"end\" < 900";
+        match parse_sql(sql).unwrap() {
+            Command::SelectHolds { filters, .. } => {
+                assert_eq!(
+                    filters,
+                    vec![
+                        SpanFilter { column: SpanColumn::Start, op: SpanOp::Gt, value: 500 },
+                        SpanFilter { column: SpanColumn::End, op: SpanOp::Lt, value: 900 },
+                    ]
+                );
+            }
+            other => panic!("expected SelectHolds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_predicates_survive_an_in_list() {
+        let sql = "SELECT * FROM bookings WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01BRZ3NDEKTSV4RRFFQ69G5FAV') AND start >= 42";
+        match parse_sql(sql).unwrap() {
+            Command::SelectBookingsMulti { resource_ids, filters } => {
+                assert_eq!(resource_ids.len(), 2);
+                assert_eq!(filters, vec![SpanFilter { column: SpanColumn::Start, op: SpanOp::Gte, value: 42 }]);
+            }
+            other => panic!("expected SelectBookingsMulti, got {other:?}"),
+        }
+    }
+
+    /// The general guard, and the point of the whole change: a predicate the engine cannot honour
+    /// is an error, never a silent no-op. Wrong rows returned with a success code is the worst
+    /// failure mode a database has.
+    #[test]
+    fn an_unsupported_predicate_is_rejected_rather_than_ignored() {
+        for sql in [
+            "SELECT * FROM bookings WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND label = 'Alex'",
+            "SELECT * FROM holds WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND expires_at > 5",
+            "SELECT * FROM bookings WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND start LIKE '1%'",
+        ] {
+            let result = parse_sql(sql);
+            assert!(
+                matches!(result, Err(SqlError::Unsupported(_))),
+                "expected the parser to refuse {sql:?}, got {result:?}"
+            );
+        }
+    }
+
+    /// `rules` had the identical silent-drop bug: the old walk returned as soon as it found the id
+    /// and discarded the rest, so `AND start >= 99999` returned every rule on the resource.
+    #[test]
+    fn rules_reject_a_predicate_they_cannot_honour() {
+        let ok = "SELECT * FROM rules WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        assert!(matches!(parse_sql(ok), Ok(Command::SelectRules { .. })));
+
+        let dropped = "SELECT * FROM rules WHERE resource_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV' AND start >= 99999";
+        assert!(
+            matches!(parse_sql(dropped), Err(SqlError::Unsupported(_))),
+            "a rules filter the engine cannot apply must be refused, not ignored"
+        );
+    }
+
+    #[test]
+    fn span_filter_matching_is_literal_not_an_overlap_window() {
+        // `start >= 1000 AND "end" <= 2000` is containment, which is what SQL says. Reading it as
+        // an overlap window would answer a different question than the caller asked.
+        let contained = [
+            SpanFilter { column: SpanColumn::Start, op: SpanOp::Gte, value: 1000 },
+            SpanFilter { column: SpanColumn::End, op: SpanOp::Lte, value: 2000 },
+        ];
+        assert!(crate::command::span_filters_match(&contained, 1200, 1800));
+        assert!(!crate::command::span_filters_match(&contained, 900, 1800), "starts before the window");
+        assert!(!crate::command::span_filters_match(&contained, 1200, 2100), "ends after the window");
+        // No filters means no filtering.
+        assert!(crate::command::span_filters_match(&[], i64::MIN, i64::MAX));
     }
 
     #[test]
@@ -1659,7 +1830,7 @@ mod tests {
         let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAV";
         let sql = format!("SELECT * FROM bookings WHERE resource_id IN ('{id1}', '{id2}')");
         match parse_sql(&sql).unwrap() {
-            Command::SelectBookingsMulti { resource_ids } => {
+            Command::SelectBookingsMulti { resource_ids, .. } => {
                 assert_eq!(resource_ids.len(), 2);
                 assert_eq!(resource_ids[0].to_string(), id1);
                 assert_eq!(resource_ids[1].to_string(), id2);
@@ -1674,7 +1845,7 @@ mod tests {
         let id2 = "01BRZ3NDEKTSV4RRFFQ69G5FAV";
         let sql = format!("SELECT * FROM holds WHERE resource_id IN ('{id1}', '{id2}')");
         match parse_sql(&sql).unwrap() {
-            Command::SelectHoldsMulti { resource_ids } => {
+            Command::SelectHoldsMulti { resource_ids, .. } => {
                 assert_eq!(resource_ids.len(), 2);
             }
             cmd => panic!("expected SelectHoldsMulti, got {cmd:?}"),
@@ -1687,7 +1858,7 @@ mod tests {
         let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let sql = format!("SELECT * FROM bookings WHERE resource_id IN ('{id1}')");
         match parse_sql(&sql).unwrap() {
-            Command::SelectBookings { resource_id } => assert_eq!(resource_id.to_string(), id1),
+            Command::SelectBookings { resource_id, .. } => assert_eq!(resource_id.to_string(), id1),
             cmd => panic!("expected SelectBookings, got {cmd:?}"),
         }
     }
