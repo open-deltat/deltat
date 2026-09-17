@@ -136,6 +136,25 @@ impl Engine {
         Ok(())
     }
 
+    /// An entity id is claimed exactly once, across every resource.
+    ///
+    /// Nothing downstream catches a reuse. `check_no_conflict` skips expired holds and never
+    /// runs at all for a disjoint span, `add_rule` has no conflict check, and
+    /// `insert_interval` does not dedupe. A client retrying with the same id therefore used to
+    /// insert a SECOND interval carrying it; removing one copy unmaps `entity_to_resource` and
+    /// strands the other beyond the reach of release, commit, cancel and the reaper, where it
+    /// holds a slot against `MAX_INTERVALS_PER_RESOURCE` and replays from the WAL forever.
+    ///
+    /// Retries are the normal behaviour of the agent clients this is built for, so this is a
+    /// live path and not a theoretical one. Call it under the resource write guard so two
+    /// concurrent retries on the same resource serialise against each other.
+    fn reject_reused_id(&self, id: Ulid) -> Result<(), EngineError> {
+        match self.store.get_resource_for_entity(&id) {
+            Some(_) => Err(EngineError::AlreadyExists(id)),
+            None => Ok(()),
+        }
+    }
+
     pub async fn add_rule(
         &self,
         id: Ulid,
@@ -156,6 +175,7 @@ impl Engine {
             }
 
         let mut guard = rs.write().await;
+        self.reject_reused_id(id)?;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
@@ -232,6 +252,7 @@ impl Engine {
         let (inherited_nb, inherited_blocking, ancestor_has_schedule) =
             self.collect_inherited_rules(resource_id, parent_id, &span).await?;
         let mut guard = rs.write().await;
+        self.reject_reused_id(id)?;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
@@ -341,6 +362,7 @@ impl Engine {
         let (inherited_nb, inherited_blocking, ancestor_has_schedule) =
             self.collect_inherited_rules(resource_id, parent_id, &span).await?;
         let mut guard = rs.write().await;
+        self.reject_reused_id(id)?;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
