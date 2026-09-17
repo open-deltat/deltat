@@ -13,6 +13,14 @@ pub const MAX_VALID_TIMESTAMP_MS: i64 = 32_503_680_000_000; // year 3000
 /// clamps the client-requested `expires_at` to `now + this`; `DELTAT_MAX_HOLD_TTL_MS` overrides
 /// it at startup.
 pub const DEFAULT_MAX_HOLD_TTL_MS: i64 = 3_600_000; // 1 hour
+/// How far past a refused span alternatives are drawn from, and how many are carried.
+///
+/// Small on purpose: this rides inside an error message, and three is what a person on a phone
+/// call can hold in their head while someone reads them out. The binding constraint in practice is
+/// the caller's own rule horizon rather than this window, since a client that writes opening hours
+/// 60 days out has nothing to offer past day 60 regardless.
+pub const COUNTER_OFFER_WINDOW_MS: i64 = 7 * 86_400_000; // 7 days
+pub const COUNTER_OFFER_MAX: usize = 3;
 pub const MAX_BATCH_SIZE: usize = 1_000;
 #[cfg(not(test))]
 pub const MAX_IN_CLAUSE_IDS: usize = 1_000;

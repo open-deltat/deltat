@@ -32,7 +32,7 @@ use ulid::Ulid;
 
 use crate::auth::{DeltaTAuthSource, DeltaTStartupHandler};
 use crate::engine::Engine;
-use crate::limits::{MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
+use crate::limits::{COUNTER_OFFER_MAX, MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
 use crate::model::*;
 use crate::command::Command;
 use crate::sql;
@@ -51,6 +51,13 @@ pub struct DeltaTHandler {
     query_parser: Arc<DeltaTQueryParser>,
     subscribe_tx: Option<mpsc::UnboundedSender<SubscriptionCommand>>,
     slow_query_threshold_ms: u64,
+    /// How many alternative spans a refusal may carry. `0` disables the feature entirely, which is
+    /// the kill switch: an error then looks exactly as it did before this existed.
+    ///
+    /// Server-side by deliberate choice, never a GUC or a startup parameter. A connection pooler
+    /// strips startup keys and discards session `SET`, and because an empty offer legitimately
+    /// emits no DETAIL, a client could not tell "disabled" from "nothing to offer".
+    counter_offer_limit: usize,
 }
 
 impl DeltaTHandler {
@@ -61,6 +68,7 @@ impl DeltaTHandler {
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: None,
             slow_query_threshold_ms: 0,
+            counter_offer_limit: Self::configured_counter_offer_limit(),
         }
     }
 
@@ -73,12 +81,37 @@ impl DeltaTHandler {
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: Some(subscribe_tx),
             slow_query_threshold_ms: 0,
+            counter_offer_limit: Self::configured_counter_offer_limit(),
         }
     }
 
     pub fn with_slow_query_threshold(mut self, threshold_ms: u64) -> Self {
         self.slow_query_threshold_ms = threshold_ms;
         self
+    }
+
+    /// Clamped rather than validated: an operator asking for 50 alternatives wants "more", and
+    /// silently capping is friendlier than refusing to start over a cosmetic number.
+    pub fn with_counter_offer_limit(mut self, limit: usize) -> Self {
+        self.counter_offer_limit = limit.min(COUNTER_OFFER_MAX);
+        self
+    }
+
+    /// How many alternatives a refusal may carry, from `DELTAT_COUNTER_OFFER`.
+    ///
+    /// Read lazily and cached rather than threaded through the connection setup, so a handler
+    /// built anywhere (including in tests) gets the configured value instead of whatever the
+    /// nearest call site remembered to pass. Unset means the default; `0` disables the feature;
+    /// unparseable means the default, because a typo should not silently turn off a feature.
+    fn configured_counter_offer_limit() -> usize {
+        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            std::env::var("DELTAT_COUNTER_OFFER")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(COUNTER_OFFER_MAX)
+                .min(COUNTER_OFFER_MAX)
+        })
     }
 
     /// The tenant is the pgwire database name; each tenant gets its own engine and WAL.
@@ -158,7 +191,7 @@ impl DeltaTHandler {
         // bounded: the EngineError kinds plus "none" (success) and "other" (non-engine errors).
         let (status, kind) = match &result {
             Ok(_) => ("ok", "none"),
-            Err(WireError::Engine(e)) => ("error", e.kind()),
+            Err(WireError::Engine { cause, .. }) => ("error", cause.kind()),
             Err(WireError::Pg(_)) => ("error", "other"),
         };
         record_query_metrics(
@@ -239,8 +272,9 @@ impl DeltaTHandler {
             } => {
                 let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
-                    .place_hold(id, resource_id, span, expires_at)
-                    .await?;
+                    .place_hold_offering(id, resource_id, span, expires_at, self.counter_offer_limit)
+                    .await
+                    .map_err(|r| refused(r, resource_id))?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
             }
             Command::DeleteHold { id } => {
@@ -248,9 +282,17 @@ impl DeltaTHandler {
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
             }
             Command::CommitHold { hold_id, booking_id, label } => {
+                // No resource_id in hand here: the statement addresses a hold, and resolving the
+                // resource would be a second lookup purely to decorate an error. The DETAIL body
+                // omits the field rather than carrying a guess.
                 engine
-                    .commit_hold(hold_id, booking_id, label)
-                    .await?;
+                    .commit_hold_offering(hold_id, booking_id, label, self.counter_offer_limit)
+                    .await
+                    .map_err(|r| WireError::Engine {
+                        cause: r.error,
+                        offer: r.offer,
+                        resource_id: None,
+                    })?;
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
             Command::InsertBooking {
@@ -262,8 +304,9 @@ impl DeltaTHandler {
             } => {
                 let span = Span::try_new(start, end).map_err(span_err)?;
                 engine
-                    .confirm_booking(id, resource_id, span, label)
-                    .await?;
+                    .confirm_booking_offering(id, resource_id, span, label, self.counter_offer_limit)
+                    .await
+                    .map_err(|r| refused(r, resource_id))?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
             }
             Command::BatchInsertBookings { bookings } => {
@@ -1099,13 +1142,22 @@ fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
 /// kind for the metric labels; everything already wire-shaped (parse, span, protocol) passes
 /// through untouched.
 enum WireError {
-    Engine(crate::engine::EngineError),
+    Engine {
+        cause: crate::engine::EngineError,
+        /// Present only on a refusal the engine could answer "then when?" for.
+        offer: Option<crate::engine::CounterOffer>,
+        resource_id: Option<Ulid>,
+    },
     Pg(PgWireError),
 }
 
 impl From<crate::engine::EngineError> for WireError {
-    fn from(e: crate::engine::EngineError) -> Self {
-        WireError::Engine(e)
+    fn from(cause: crate::engine::EngineError) -> Self {
+        WireError::Engine {
+            cause,
+            offer: None,
+            resource_id: None,
+        }
     }
 }
 
@@ -1118,7 +1170,11 @@ impl From<PgWireError> for WireError {
 impl From<WireError> for PgWireError {
     fn from(e: WireError) -> Self {
         match e {
-            WireError::Engine(e) => engine_err(e),
+            WireError::Engine {
+                cause,
+                offer,
+                resource_id,
+            } => engine_err(cause, offer, resource_id),
             WireError::Pg(e) => e,
         }
     }
@@ -1150,13 +1206,98 @@ fn record_query_metrics(
         .record(elapsed.as_secs_f64());
 }
 
-fn engine_err(e: crate::engine::EngineError) -> PgWireError {
+/// The machine-readable half of a refusal, carried in the standard PostgreSQL DETAIL field.
+///
+/// DETAIL rather than a protocol extension: `psql` prints it as an ordinary `DETAIL:` line and
+/// every driver already surfaces it (postgres.js maps wire field `D` to `err.detail`), so this
+/// stays inside the promise that any Postgres client can connect.
+#[derive(serde::Serialize)]
+struct SpanJson {
+    start: crate::model::Ms,
+    end: crate::model::Ms,
+}
+
+#[derive(serde::Serialize)]
+struct RefusalDetail<'a> {
+    /// Payload contract version. A client that does not recognise it must ignore the body.
+    deltat: u8,
+    kind: &'a str,
+    sqlstate: &'a str,
+    /// Whether retrying the SAME span could succeed. False for a schedule refusal, which carries
+    /// alternatives precisely because the original span will never work.
+    retry_same_span: bool,
+    /// Always false, and stated rather than implied. A reader that skipped straight to
+    /// `alternatives` must not be able to conclude something was set aside for them.
+    reserved: bool,
+    as_of: crate::model::Ms,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_id: Option<String>,
+    requested: SpanJson,
+    /// `"unscheduled"` means the resource publishes no opening hours, so there were no windows to
+    /// enumerate. It does not mean the calendar is full.
+    schedule: &'a str,
+    alternatives: Vec<SpanJson>,
+}
+
+/// Carry a `Refused` across the wire boundary with the resource it concerned.
+fn refused(r: crate::engine::Refused, resource_id: Ulid) -> WireError {
+    WireError::Engine {
+        cause: r.error,
+        offer: r.offer,
+        resource_id: Some(resource_id),
+    }
+}
+
+fn engine_err(
+    e: crate::engine::EngineError,
+    offer: Option<crate::engine::CounterOffer>,
+    resource_id: Option<Ulid>,
+) -> PgWireError {
     metrics::counter!(crate::observability::ENGINE_ERRORS_TOTAL, "kind" => e.kind()).increment(1);
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".into(),
-        e.sqlstate().into(),
-        e.to_string(),
-    )))
+    let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate().into(), e.to_string());
+
+    // Nothing to say means nothing on the wire. A refusal on a scheduled resource with no free
+    // span emits no DETAIL at all, so absence is already a legal state that every client and every
+    // kernel version has to tolerate. That is what makes the kill switch and version skew safe.
+    if let Some(offer) = offer.filter(|o| o.has_content()) {
+        let detail = RefusalDetail {
+            deltat: 1,
+            kind: e.kind(),
+            sqlstate: e.sqlstate(),
+            retry_same_span: e.is_retryable(),
+            reserved: false,
+            as_of: offer.as_of,
+            resource_id: resource_id.map(|r| r.to_string()),
+            requested: SpanJson {
+                start: offer.requested.start,
+                end: offer.requested.end,
+            },
+            schedule: if offer.unscheduled { "unscheduled" } else { "known" },
+            alternatives: offer
+                .alternatives
+                .iter()
+                .map(|s| SpanJson { start: s.start, end: s.end })
+                .collect(),
+        };
+        // serde_json, never format!: a NUL byte from an untrusted label would truncate the
+        // C-string field on the wire and misparse every field after it.
+        if let Ok(json) = serde_json::to_string(&detail) {
+            let n = offer.alternatives.len();
+            info.hint = Some(if n == 0 {
+                "This calendar publishes no opening hours, so there are no windows to list. \
+                 It still accepts bookings; pick a time and place a hold."
+                    .to_string()
+            } else {
+                format!(
+                    "{n} alternative span(s) in DETAIL (deltat v1). None is reserved; \
+                     place a hold to keep one."
+                )
+            });
+            info.detail = Some(json);
+        }
+    }
+
+    PgWireError::UserError(Box::new(info))
 }
 
 /// Logs the command label, never the statement text: query text can carry customer
@@ -1961,8 +2102,9 @@ mod tests {
         // A lost race must reach the client as SQLSTATE 40001 (serialization_failure), the code
         // drivers already retry on, not a catch-all P0001 that forces string-matching. The same
         // conversion is where the taxonomy counter fires, one increment per engine error.
-        let (log, err) =
-            with_metrics(|| engine_err(crate::engine::EngineError::Conflict(Ulid::nil())));
+        let (log, err) = with_metrics(|| {
+            engine_err(crate::engine::EngineError::Conflict(Ulid::nil()), None, None)
+        });
         let PgWireError::UserError(info) = err else {
             panic!("expected UserError");
         };
@@ -1971,6 +2113,127 @@ mod tests {
             log.counter_total(crate::observability::ENGINE_ERRORS_TOTAL, &[("kind", "conflict")]),
             1
         );
+    }
+
+    /// A refusal with nothing to offer must look exactly as it did before counter-offers existed.
+    /// Absence of DETAIL has to stay a legal wire state, because that is what lets the kill switch
+    /// and an older kernel be indistinguishable from "nothing was free".
+    #[test]
+    fn a_refusal_without_an_offer_carries_no_detail_or_hint() {
+        let err = engine_err(crate::engine::EngineError::Conflict(Ulid::nil()), None, None);
+        let PgWireError::UserError(info) = err else {
+            panic!("expected UserError");
+        };
+        assert_eq!(info.detail, None);
+        assert_eq!(info.hint, None);
+    }
+
+    /// The conflict message must not name the allocation that won.
+    ///
+    /// It used to. That handed a losing caller the id of an allocation it has no other way to see,
+    /// and `cancel_booking` takes an id and nothing else, so cheap failing INSERTs enumerated what
+    /// could then be cancelled. Audit 2026-08-26, ship-blocker 2.
+    #[test]
+    fn a_conflict_never_names_the_winning_allocation() {
+        let winner = Ulid::new();
+        let err = engine_err(crate::engine::EngineError::Conflict(winner), None, None);
+        let PgWireError::UserError(info) = err else {
+            panic!("expected UserError");
+        };
+        assert!(
+            !info.message.contains(&winner.to_string()),
+            "the winner's id leaked into the wire message: {}",
+            info.message
+        );
+    }
+
+    /// The DETAIL body must parse as JSON and must say, in the payload itself, that nothing was
+    /// set aside. A model that reads only `alternatives` must not be able to conclude otherwise.
+    #[test]
+    fn an_offer_reaches_the_wire_as_json_that_says_reserved_false() {
+        let offer = crate::engine::CounterOffer {
+            requested: Span::new(1_000, 2_000),
+            as_of: 500,
+            alternatives: vec![Span::new(3_000, 4_000), Span::new(5_000, 6_000)],
+            unscheduled: false,
+        };
+        let rid = Ulid::new();
+        let err = engine_err(
+            crate::engine::EngineError::Conflict(Ulid::new()),
+            Some(offer),
+            Some(rid),
+        );
+        let PgWireError::UserError(info) = err else {
+            panic!("expected UserError");
+        };
+        let detail = info.detail.expect("an offer must produce DETAIL");
+        let v: serde_json::Value = serde_json::from_str(&detail).expect("DETAIL must be JSON");
+
+        assert_eq!(v["deltat"], 1);
+        assert_eq!(v["reserved"], false);
+        assert_eq!(v["retry_same_span"], true, "a conflict is a lost race");
+        assert_eq!(v["schedule"], "known");
+        assert_eq!(v["alternatives"].as_array().unwrap().len(), 2);
+        assert_eq!(v["alternatives"][0]["start"], 3_000);
+        assert_eq!(v["resource_id"], rid.to_string());
+        let hint = info.hint.expect("an offer must produce a HINT");
+        assert!(hint.contains("None is reserved"), "hint was: {hint}");
+        assert!(hint.contains("place a hold"), "hint was: {hint}");
+    }
+
+    /// A schedule refusal carries alternatives but must NOT claim the same span is worth retrying.
+    /// Alternatives and retryability are different questions, and conflating them would have a
+    /// client hammer a span that will never open.
+    #[test]
+    fn a_schedule_refusal_offers_alternatives_but_denies_retrying_the_same_span() {
+        let offer = crate::engine::CounterOffer {
+            requested: Span::new(1_000, 2_000),
+            as_of: 500,
+            alternatives: vec![Span::new(9_000, 10_000)],
+            unscheduled: false,
+        };
+        let err = engine_err(
+            crate::engine::EngineError::ClosedBySchedule {
+                span: Span::new(1_000, 2_000),
+                closed: vec![Span::new(1_000, 2_000)],
+            },
+            Some(offer),
+            None,
+        );
+        let PgWireError::UserError(info) = err else {
+            panic!("expected UserError");
+        };
+        assert_eq!(info.code, "23514");
+        let v: serde_json::Value =
+            serde_json::from_str(&info.detail.expect("DETAIL")).expect("JSON");
+        assert_eq!(v["retry_same_span"], false);
+        assert_eq!(v["alternatives"].as_array().unwrap().len(), 1);
+        // resource_id is omitted rather than null when the statement did not address a resource.
+        assert!(v.get("resource_id").is_none());
+    }
+
+    /// An unscheduled resource must report that distinctly. An empty list would read as "full",
+    /// and this resource accepts anything that does not collide.
+    #[test]
+    fn an_unscheduled_resource_says_so_rather_than_offering_an_empty_list() {
+        let offer = crate::engine::CounterOffer {
+            requested: Span::new(1_000, 2_000),
+            as_of: 500,
+            alternatives: vec![],
+            unscheduled: true,
+        };
+        let err = engine_err(
+            crate::engine::EngineError::Conflict(Ulid::nil()),
+            Some(offer),
+            None,
+        );
+        let PgWireError::UserError(info) = err else {
+            panic!("expected UserError");
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&info.detail.expect("DETAIL")).expect("JSON");
+        assert_eq!(v["schedule"], "unscheduled");
+        assert!(info.hint.unwrap().contains("no opening hours"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod availability;
 mod conflict;
 mod error;
 mod mutations;
+mod offer;
 mod queries;
 mod store;
 #[cfg(test)]
@@ -18,6 +19,7 @@ mod verify;
 
 pub use availability::{availability, compute_saturated_spans, merge_overlapping, subtract_intervals};
 pub use error::EngineError;
+pub use offer::{CounterOffer, Refused};
 pub use store::InMemoryStore;
 
 use std::io;

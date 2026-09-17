@@ -31,22 +31,36 @@ impl std::fmt::Display for EngineError {
         match self {
             EngineError::NotFound(id) => write!(f, "not found: {id}"),
             EngineError::AlreadyExists(id) => write!(f, "already exists: {id}"),
-            EngineError::Conflict(id) => write!(f, "conflict with allocation: {id}"),
+            // The winner's id is deliberately NOT rendered. It used to be, which handed a losing
+            // caller the identifier of an allocation it has no other way to see: cheap failing
+            // INSERTs then enumerate every allocation on a resource you cannot read, and
+            // `cancel_booking` takes an id and nothing else, so what you can enumerate you can
+            // cancel. The id stays in the variant because the engine and its tests use it; it just
+            // stops crossing the wire. What the caller actually needed is in DETAIL instead.
+            EngineError::Conflict(_) => write!(f, "span is already allocated"),
             EngineError::NotCoveredByParent {
                 rule_span,
                 uncovered,
             } => {
+                // Counts, not `{:?}` over a Vec<Span>. A psql user used to read
+                // `uncovered: [Span { start: 1800200000000, end: 2000003600000 }]`, which is a
+                // debug dump wearing an error message. The spans themselves belong in DETAIL where
+                // a client can parse them.
                 write!(
                     f,
-                    "rule [{}, {}) not covered by parent availability; uncovered: {:?}",
-                    rule_span.start, rule_span.end, uncovered
+                    "rule [{}, {}) not covered by parent availability; {} uncovered window(s)",
+                    rule_span.start,
+                    rule_span.end,
+                    uncovered.len()
                 )
             }
             EngineError::ClosedBySchedule { span, closed } => {
                 write!(
                     f,
-                    "span [{}, {}) is outside open windows or blocked; closed: {:?}",
-                    span.start, span.end, closed
+                    "span [{}, {}) is outside open windows or blocked; {} closed window(s)",
+                    span.start,
+                    span.end,
+                    closed.len()
                 )
             }
             EngineError::CycleDetected(id) => write!(f, "cycle detected at resource: {id}"),
@@ -96,6 +110,20 @@ impl EngineError {
             EngineError::LimitExceeded(_) => "54000",
             EngineError::WalError(_) => "58030",
         }
+    }
+
+    /// Whether this refusal means "not this span", the case where alternatives help.
+    ///
+    /// Deliberately independent of `is_retryable`. `ClosedBySchedule` must never be retried as a
+    /// lost race, and it is exactly where a counter-offer is most useful: the caller asked outside
+    /// opening hours and the useful reply is when the doors are open.
+    pub fn is_offerable(&self) -> bool {
+        matches!(
+            self,
+            EngineError::Conflict(_)
+                | EngineError::CapacityExceeded(_)
+                | EngineError::ClosedBySchedule { .. }
+        )
     }
 
     /// True when the caller may retry the same statement and reasonably expect a different

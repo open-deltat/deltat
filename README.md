@@ -240,6 +240,7 @@ All times are **Unix milliseconds**. Intervals are half-open `[start, end)`, so 
 | `DELTAT_METRICS_PORT` | unset | Prometheus `/metrics` port; metrics are off when unset (see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)) |
 | `DELTAT_LOG_FORMAT` | `text` | Log output format. `json` (case-insensitive) emits newline-delimited JSON for log collectors; anything else means human-readable text |
 | `DELTAT_SLOW_QUERY_MS` | `0` | Statements taking at least this many ms are logged at `warn` and counted. `0` disables the slow-query log |
+| `DELTAT_COUNTER_OFFER` | `3` | How many alternative spans a refused hold or booking carries in its `DETAIL` field. `0` disables counter-offers |
 | `RUST_LOG` | `info` | Log level filter in [tracing `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html), e.g. `deltat=debug`. Unset or unparseable falls back to `info` |
 | `DELTAT_TLS_CERT` | unset | PEM certificate path; TLS is off unless both cert and key are set |
 | `DELTAT_TLS_KEY` | unset | PEM private key path; TLS is off unless both cert and key are set |

@@ -70,6 +70,13 @@ pub const SLOW_QUERIES_TOTAL: &str = "deltat_slow_queries_total";
 // ── Booking-domain counters ─────────────────────────────────────
 
 /// Counter: holds accepted by the engine.
+/// Counter-offers attached to refusals, labelled by the refusal kind and the outcome
+/// (`offered` / `none` / `unscheduled`).
+///
+/// Watch this against `ENGINE_ERRORS_TOTAL` at the same kind: the ratio is how often a refusal
+/// carried something the caller could act on. A collapsing ratio means refusals quietly went back
+/// to being dead ends, which no existing metric would show.
+pub const COUNTER_OFFERS_TOTAL: &str = "deltat_counter_offers_total";
 pub const HOLDS_PLACED_TOTAL: &str = "deltat_holds_placed_total";
 
 /// Counter: holds converted into bookings via commit_hold.
@@ -116,6 +123,22 @@ static ENABLED: AtomicBool = AtomicBool::new(cfg!(test));
 /// only the labelled hot-path calls need this guard.
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// Record the outcome of a counter-offer. Labelled, so it sits behind `enabled()` per the rule
+/// above; this is the refusal path rather than the hot path, but the rule is the rule.
+pub fn record_counter_offer(kind: &'static str, offer: &crate::engine::CounterOffer) {
+    if !enabled() {
+        return;
+    }
+    let result = if offer.unscheduled {
+        "unscheduled"
+    } else if offer.alternatives.is_empty() {
+        "none"
+    } else {
+        "offered"
+    };
+    metrics::counter!(COUNTER_OFFERS_TOTAL, "kind" => kind, "result" => result).increment(1);
 }
 
 /// Install Prometheus metrics exporter on the given port. No-op if port is None.
