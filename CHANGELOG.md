@@ -24,7 +24,7 @@ All notable changes to deltat are documented here. The format follows
 
   **Not yet covered:** `availability` still ignores conjuncts it does not recognise, and no read
   honours `ORDER BY`, `LIMIT`, or a projection list. Those are the same class and are tracked
-  separately rather than claimed fixed here.
+  separately in #37 rather than claimed fixed here.
 
 - **Reusing an entity id no longer strands an interval.** `INSERT INTO holds`, `INSERT INTO
   bookings` and `INSERT INTO rules` now reject an id that is already in use, anywhere in the
