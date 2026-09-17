@@ -410,8 +410,8 @@ impl DeltaTHandler {
                     e.encode_field(&r.blocking)
                 }))
             }
-            Command::SelectBookings { resource_id } => {
-                let bookings = engine.get_bookings(resource_id).await?;
+            Command::SelectBookings { resource_id, filters } => {
+                let bookings = engine.get_bookings(resource_id, &filters).await?;
                 Ok(encode_rows(Arc::new(bookings_schema()), bookings, |e, b| {
                     e.encode_field(&b.id.to_string())?;
                     e.encode_field(&b.resource_id.to_string())?;
@@ -420,8 +420,8 @@ impl DeltaTHandler {
                     e.encode_field(&b.label)
                 }))
             }
-            Command::SelectHolds { resource_id } => {
-                let holds = engine.get_holds(resource_id).await?;
+            Command::SelectHolds { resource_id, filters } => {
+                let holds = engine.get_holds(resource_id, &filters).await?;
                 Ok(encode_rows(Arc::new(holds_schema()), holds, |e, h| {
                     e.encode_field(&h.id.to_string())?;
                     e.encode_field(&h.resource_id.to_string())?;
@@ -430,8 +430,8 @@ impl DeltaTHandler {
                     e.encode_field(&h.expires_at)
                 }))
             }
-            Command::SelectBookingsMulti { resource_ids } => {
-                let bookings = engine.get_bookings_multi(&resource_ids).await?;
+            Command::SelectBookingsMulti { resource_ids, filters } => {
+                let bookings = engine.get_bookings_multi(&resource_ids, &filters).await?;
                 Ok(encode_rows(Arc::new(bookings_schema()), bookings, |e, b| {
                     e.encode_field(&b.id.to_string())?;
                     e.encode_field(&b.resource_id.to_string())?;
@@ -440,8 +440,8 @@ impl DeltaTHandler {
                     e.encode_field(&b.label)
                 }))
             }
-            Command::SelectHoldsMulti { resource_ids } => {
-                let holds = engine.get_holds_multi(&resource_ids).await?;
+            Command::SelectHoldsMulti { resource_ids, filters } => {
+                let holds = engine.get_holds_multi(&resource_ids, &filters).await?;
                 Ok(encode_rows(Arc::new(holds_schema()), holds, |e, h| {
                     e.encode_field(&h.id.to_string())?;
                     e.encode_field(&h.resource_id.to_string())?;
@@ -1735,8 +1735,8 @@ mod tests {
             other => panic!("expected Execution, got {other:?}"),
         }
 
-        assert!(engine.get_holds(rid).await.unwrap().is_empty());
-        let bookings = engine.get_bookings(rid).await.unwrap();
+        assert!(engine.get_holds(rid, &[]).await.unwrap().is_empty());
+        let bookings = engine.get_bookings(rid, &[]).await.unwrap();
         assert_eq!(bookings.len(), 1);
         assert_eq!(bookings[0].id, bid);
         assert_eq!(bookings[0].start, 1000);
@@ -1803,8 +1803,8 @@ mod tests {
         assert!(results[0], "the holder's commit must win its own span");
         assert!(results[1..].iter().all(|ok| !ok), "no competing booking may squeeze in");
 
-        assert!(engine.get_holds(rid).await.unwrap().is_empty());
-        let bookings = engine.get_bookings(rid).await.unwrap();
+        assert!(engine.get_holds(rid, &[]).await.unwrap().is_empty());
+        let bookings = engine.get_bookings(rid, &[]).await.unwrap();
         assert_eq!(bookings.len(), 1);
         assert_eq!(bookings[0].id, bid);
     }

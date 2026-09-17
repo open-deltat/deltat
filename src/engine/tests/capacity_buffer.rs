@@ -131,7 +131,7 @@ async fn batch_capacity_books_n_units_same_span_atomically() {
         .collect();
     engine.batch_confirm_bookings(batch).await.unwrap();
 
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 4);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -154,7 +154,7 @@ async fn batch_capacity_rejects_over_capacity_atomically() {
     ));
 
     // Atomic: the failed batch left nothing behind.
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 0);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -177,12 +177,12 @@ async fn batch_capacity_accounts_for_committed_load() {
         engine.batch_confirm_bookings(over).await,
         Err(EngineError::CapacityExceeded(4))
     ));
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 1);
 
     // 1 committed + 3 same-span batch members = 4 == capacity 4 → ok.
     let ok: Vec<_> = (0..3).map(|_| (Ulid::new(), rid, Span::new(1000, 2000), None)).collect();
     engine.batch_confirm_bookings(ok).await.unwrap();
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 4);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -203,7 +203,7 @@ async fn batch_capacity_u32_max_does_not_overflow() {
         .collect();
     engine.batch_confirm_bookings(batch).await.unwrap();
 
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 2);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 2);
 }
 
 #[tokio::test]

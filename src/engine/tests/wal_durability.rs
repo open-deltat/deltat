@@ -38,7 +38,7 @@ async fn compact_wal_preserves_state() {
     // Snapshot pre-compact state
     let resources_before = engine.list_resources().await;
     let rules_before = engine.get_rules(child).await.unwrap();
-    let bookings_before = engine.get_bookings(child).await.unwrap();
+    let bookings_before = engine.get_bookings(child, &[]).await.unwrap();
     let avail_before = engine.compute_availability(child, 0, 24 * H, None).await.unwrap();
 
     // Get WAL size before compaction
@@ -59,7 +59,7 @@ async fn compact_wal_preserves_state() {
     assert_eq!(rules_before.len(), rules_after.len());
     assert_eq!(rules_after[0].id, perm_rule);
 
-    let bookings_after = engine.get_bookings(child).await.unwrap();
+    let bookings_after = engine.get_bookings(child, &[]).await.unwrap();
     assert_eq!(bookings_before.len(), bookings_after.len());
     assert_eq!(bookings_after[0].label, Some("Team Meeting".into()));
 
@@ -115,7 +115,7 @@ async fn compact_wal_survives_restart() {
     let rules = engine2.get_rules(child).await.unwrap();
     assert_eq!(rules.len(), 2); // non-blocking + post-compact blocking
 
-    let bookings = engine2.get_bookings(child).await.unwrap();
+    let bookings = engine2.get_bookings(child, &[]).await.unwrap();
     assert_eq!(bookings.len(), 1);
     assert_eq!(bookings[0].id, booking_id);
     assert_eq!(bookings[0].label, Some("Alice".into()));

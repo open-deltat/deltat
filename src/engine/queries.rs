@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use ulid::Ulid;
 
+use crate::command::{span_filters_match, SpanFilter};
 use crate::limits::*;
 use crate::model::*;
 
@@ -279,7 +280,11 @@ impl Engine {
             .collect())
     }
 
-    pub async fn get_bookings(&self, resource_id: Ulid) -> Result<Vec<BookingInfo>, EngineError> {
+    pub async fn get_bookings(
+        &self,
+        resource_id: Ulid,
+        filters: &[SpanFilter],
+    ) -> Result<Vec<BookingInfo>, EngineError> {
         let rs = match self.get_resource(&resource_id) {
             Some(rs) => rs,
             None => return Ok(vec![]),
@@ -288,6 +293,7 @@ impl Engine {
         Ok(guard
             .intervals
             .iter()
+            .filter(|i| span_filters_match(filters, i.span.start, i.span.end))
             .filter_map(|i| match &i.kind {
                 IntervalKind::Booking { label } => Some(BookingInfo {
                     id: i.id,
@@ -301,7 +307,11 @@ impl Engine {
             .collect())
     }
 
-    pub async fn get_holds(&self, resource_id: Ulid) -> Result<Vec<HoldInfo>, EngineError> {
+    pub async fn get_holds(
+        &self,
+        resource_id: Ulid,
+        filters: &[SpanFilter],
+    ) -> Result<Vec<HoldInfo>, EngineError> {
         let rs = match self.get_resource(&resource_id) {
             Some(rs) => rs,
             None => return Ok(vec![]),
@@ -310,6 +320,7 @@ impl Engine {
         Ok(guard
             .intervals
             .iter()
+            .filter(|i| span_filters_match(filters, i.span.start, i.span.end))
             .filter_map(|i| match &i.kind {
                 IntervalKind::Hold { expires_at } => Some(HoldInfo {
                     id: i.id,
@@ -331,6 +342,7 @@ impl Engine {
     pub async fn get_bookings_multi(
         &self,
         resource_ids: &[Ulid],
+        filters: &[SpanFilter],
     ) -> Result<Vec<BookingInfo>, EngineError> {
         if resource_ids.len() > MAX_IN_CLAUSE_IDS {
             return Err(EngineError::LimitExceeded("too many resource IDs"));
@@ -339,7 +351,7 @@ impl Engine {
         let mut out = Vec::new();
         for &rid in resource_ids {
             if seen.insert(rid) {
-                out.extend(self.get_bookings(rid).await?);
+                out.extend(self.get_bookings(rid, filters).await?);
             }
         }
         Ok(out)
@@ -348,6 +360,7 @@ impl Engine {
     pub async fn get_holds_multi(
         &self,
         resource_ids: &[Ulid],
+        filters: &[SpanFilter],
     ) -> Result<Vec<HoldInfo>, EngineError> {
         if resource_ids.len() > MAX_IN_CLAUSE_IDS {
             return Err(EngineError::LimitExceeded("too many resource IDs"));
@@ -356,7 +369,7 @@ impl Engine {
         let mut out = Vec::new();
         for &rid in resource_ids {
             if seen.insert(rid) {
-                out.extend(self.get_holds(rid).await?);
+                out.extend(self.get_holds(rid, filters).await?);
             }
         }
         Ok(out)

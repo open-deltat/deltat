@@ -11,6 +11,59 @@ use ulid::Ulid;
 
 use crate::model::*;
 
+/// Which span column a [`SpanFilter`] compares against.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SpanColumn {
+    Start,
+    End,
+}
+
+/// The comparison a [`SpanFilter`] applies.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SpanOp {
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    Eq,
+}
+
+/// One `WHERE` comparison against a span column on a bookings/holds read.
+///
+/// Kept as the literal predicate the caller wrote rather than normalised into a window, because
+/// `start >= A AND "end" <= B` (containment) and `start < B AND "end" > A` (overlap) are different
+/// questions and SQL already distinguishes them. Re-interpreting one as the other would be a
+/// quieter version of the bug this type exists to fix: the engine silently answering a question
+/// nobody asked.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct SpanFilter {
+    pub column: SpanColumn,
+    pub op: SpanOp,
+    pub value: Ms,
+}
+
+impl SpanFilter {
+    /// Whether an interval with this `[start, end)` satisfies the predicate.
+    pub fn matches(&self, start: Ms, end: Ms) -> bool {
+        let lhs = match self.column {
+            SpanColumn::Start => start,
+            SpanColumn::End => end,
+        };
+        match self.op {
+            SpanOp::Lt => lhs < self.value,
+            SpanOp::Lte => lhs <= self.value,
+            SpanOp::Gt => lhs > self.value,
+            SpanOp::Gte => lhs >= self.value,
+            SpanOp::Eq => lhs == self.value,
+        }
+    }
+}
+
+/// Whether an interval satisfies every predicate (an empty list matches everything).
+pub fn span_filters_match(filters: &[SpanFilter], start: Ms, end: Ms) -> bool {
+    filters.iter().all(|f| f.matches(start, end))
+}
+
 /// A parsed, transport-neutral request to the engine.
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -94,9 +147,11 @@ pub enum Command {
     },
     SelectBookings {
         resource_id: Ulid,
+        filters: Vec<SpanFilter>,
     },
     SelectHolds {
         resource_id: Ulid,
+        filters: Vec<SpanFilter>,
     },
     SelectAvailability {
         resource_id: Ulid,
@@ -121,9 +176,11 @@ pub enum Command {
     },
     SelectBookingsMulti {
         resource_ids: Vec<Ulid>,
+        filters: Vec<SpanFilter>,
     },
     SelectHoldsMulti {
         resource_ids: Vec<Ulid>,
+        filters: Vec<SpanFilter>,
     },
     Listen {
         channel: String,

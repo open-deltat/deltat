@@ -7,6 +7,25 @@ All notable changes to deltat are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **`WHERE` clauses on `bookings` and `holds` reads are honoured instead of silently dropped.**
+  `SELECT * FROM bookings WHERE resource_id = 'X' AND start >= 1000 AND "end" <= 2000` used to
+  return *every* booking on the resource, with a success code and no warning: the parser collected
+  the `resource_id` and ignored the rest of the clause. Span predicates (`start` and `"end"` with
+  `<`, `<=`, `>`, `>=`, `=`) now filter as written, with the literal meaning SQL gives them, so
+  `start >= A AND "end" <= B` is containment rather than a re-interpreted overlap window.
+  Anyone connecting a plain Postgres client, which the README invites, was affected; the
+  TypeScript SDK was not, because it windowed client-side precisely to work around this.
+- **On `bookings`, `holds` and `rules`, a predicate the parser cannot honour is now an error rather
+  than a no-op.** Filtering on a column the engine does not index (`label`, `expires_at`) or with
+  an operator it cannot apply returns `unsupported` instead of quietly answering a different
+  question. Wrong rows under a success code is the worst failure mode a database has, and the
+  silent catch-alls on those three reads are gone. `rules` had the same bug as `bookings`:
+  `WHERE resource_id = 'X' AND start >= 99999` returned every rule on the resource.
+
+  **Not yet covered:** `availability` still ignores conjuncts it does not recognise, and no read
+  honours `ORDER BY`, `LIMIT`, or a projection list. Those are the same class and are tracked
+  separately rather than claimed fixed here.
+
 - **Reusing an entity id no longer strands an interval.** `INSERT INTO holds`, `INSERT INTO
   bookings` and `INSERT INTO rules` now reject an id that is already in use, anywhere in the
   tenant, with SQLSTATE `23505`. Previously nothing caught a reuse: the conflict check skips
@@ -18,6 +37,9 @@ All notable changes to deltat are documented here. The format follows
   were relying on a re-`INSERT` silently succeeding, mint a fresh id instead.
 
 ### Changed
+- **Breaking, in the honest direction:** a read whose `WHERE` clause previously "worked" by having
+  part of itself discarded now fails with `unsupported`. Any caller relying on that silence was
+  already receiving rows that did not match what it asked for.
 - The WAL format version is read back and an older log is migrated in full on open, rather than
   the version being parsed and discarded (#33). A mixed-version log, which an older binary would
   have truncated at the tail and thereby dropped an acknowledged booking, can no longer exist.

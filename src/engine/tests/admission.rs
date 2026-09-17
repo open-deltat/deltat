@@ -154,7 +154,7 @@ async fn batch_with_one_member_on_closed_time_rejects_atomically() {
         matches!(result, Err(EngineError::ClosedBySchedule { .. })),
         "a closed-time member must fail the batch, got {result:?}"
     );
-    assert!(engine.get_bookings(rid).await.unwrap().is_empty(), "batch must be atomic");
+    assert!(engine.get_bookings(rid, &[]).await.unwrap().is_empty(), "batch must be atomic");
 }
 
 #[tokio::test]
@@ -191,5 +191,5 @@ async fn commit_hold_survives_a_blocking_rule_added_after_placement() {
     engine.add_rule(Ulid::new(), rid, Span::new(10 * H, 11 * H), true).await.unwrap();
 
     engine.commit_hold(hold_id, Ulid::new(), None).await.unwrap();
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 1);
 }

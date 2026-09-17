@@ -564,8 +564,8 @@ async fn entity_write_ops_reject_kind_mismatch() {
     ));
 
     // The real entities are all still there (nothing was clobbered).
-    assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
-    assert_eq!(engine.get_holds(rid).await.unwrap().len(), 1);
+    assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 1);
+    assert_eq!(engine.get_holds(rid, &[]).await.unwrap().len(), 1);
     assert_eq!(engine.get_rules(rid).await.unwrap().len(), 2);
 }
 
@@ -628,7 +628,7 @@ async fn buffer_conflict_is_order_independent() {
         engine.confirm_booking(Ulid::new(), rid, a, None).await.unwrap();
         let second = engine.confirm_booking(Ulid::new(), rid, b, None).await;
         assert!(second.is_err(), "A-then-B: B must be rejected");
-        assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+        assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 1);
     }
 
     // Single, B then A, the previously-inconsistent order that admitted an overbooking.
@@ -640,7 +640,7 @@ async fn buffer_conflict_is_order_independent() {
         engine.confirm_booking(Ulid::new(), rid, b, None).await.unwrap();
         let second = engine.confirm_booking(Ulid::new(), rid, a, None).await;
         assert!(second.is_err(), "B-then-A: A must be rejected too (symmetric buffer)");
-        assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 1);
+        assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 1);
     }
 
     // Batch, the pair submitted atomically must be rejected as a whole.
@@ -656,7 +656,7 @@ async fn buffer_conflict_is_order_independent() {
             ])
             .await;
         assert!(batch.is_err(), "batch: the conflicting pair must be rejected");
-        assert_eq!(engine.get_bookings(rid).await.unwrap().len(), 0);
+        assert_eq!(engine.get_bookings(rid, &[]).await.unwrap().len(), 0);
     }
 }
 
@@ -708,14 +708,14 @@ async fn batch_bookings_atomic_append_survives_replay() {
             ])
             .await
             .unwrap();
-        assert_eq!(engine.get_bookings(r1).await.unwrap().len(), 2);
-        assert_eq!(engine.get_bookings(r2).await.unwrap().len(), 1);
+        assert_eq!(engine.get_bookings(r1, &[]).await.unwrap().len(), 2);
+        assert_eq!(engine.get_bookings(r2, &[]).await.unwrap().len(), 1);
     }
     // Reopen: every booking from the single atomic append is durable.
     let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
-    let r1_books = engine.get_bookings(r1).await.unwrap();
+    let r1_books = engine.get_bookings(r1, &[]).await.unwrap();
     assert_eq!(r1_books.len(), 2);
-    assert_eq!(engine.get_bookings(r2).await.unwrap().len(), 1);
+    assert_eq!(engine.get_bookings(r2, &[]).await.unwrap().len(), 1);
     assert_eq!(engine.get_resource_for_entity(&b3), Some(r2));
 }
 
@@ -787,7 +787,7 @@ async fn place_hold_clamps_far_future_expiry_to_default_cap() {
         .await
         .unwrap();
 
-    let holds = engine.get_holds(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
     assert_eq!(holds.len(), 1);
     assert!(
         holds[0].expires_at <= now_ms() + 3_600_000,
@@ -813,7 +813,7 @@ async fn place_hold_clamp_uses_injected_clock_and_configured_cap() {
         .await
         .unwrap();
 
-    let holds = engine.get_holds(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
     assert_eq!(holds[0].expires_at, 1_060_000);
 }
 
@@ -830,7 +830,7 @@ async fn place_hold_within_cap_keeps_requested_expiry() {
 
     engine.place_hold(Ulid::new(), rid, Span::new(1000, 2000), 1_030_000).await.unwrap();
 
-    let holds = engine.get_holds(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
     assert_eq!(holds[0].expires_at, 1_030_000);
 }
 
@@ -866,14 +866,14 @@ async fn clamped_hold_expiry_survives_replay_verbatim() {
             .place_hold(Ulid::new(), rid, Span::new(1000, 2000), 999_999_999_999)
             .await
             .unwrap();
-        assert_eq!(engine.get_holds(rid).await.unwrap()[0].expires_at, 1_060_000);
+        assert_eq!(engine.get_holds(rid, &[]).await.unwrap()[0].expires_at, 1_060_000);
     }
 
     let clock = Arc::new(TestClock::new(5_000_000));
     let engine = Engine::with_clock(path, Arc::new(NotifyHub::new()), clock)
         .unwrap()
         .with_max_hold_ttl(1);
-    let holds = engine.get_holds(rid).await.unwrap();
+    let holds = engine.get_holds(rid, &[]).await.unwrap();
     assert_eq!(holds.len(), 1);
     assert_eq!(holds[0].expires_at, 1_060_000);
 }
