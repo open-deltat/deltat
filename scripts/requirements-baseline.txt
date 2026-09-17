@@ -1,0 +1,3 @@
+dupes=22
+dangling=10
+unproven=79
