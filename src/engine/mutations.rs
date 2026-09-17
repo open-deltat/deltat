@@ -197,7 +197,7 @@ impl Engine {
         crate::observability::record_counter_offer(error.kind(), &offer);
         Refused {
             error,
-            offer: Some(offer),
+            offer: Some(Box::new(offer)),
         }
     }
 

@@ -59,10 +59,14 @@ impl CounterOffer {
 ///
 /// Lossy into `EngineError` on purpose: every existing caller keeps the error it has today and the
 /// offer is additive.
+///
+/// The offer is boxed because this rides in the `Err` arm of every write path. An unboxed
+/// `CounterOffer` would widen the `Result` for the success case too, which is the overwhelmingly
+/// common one, and `clippy::result_large_err` is right to object.
 #[derive(Debug)]
 pub struct Refused {
     pub error: EngineError,
-    pub offer: Option<CounterOffer>,
+    pub offer: Option<Box<CounterOffer>>,
 }
 
 impl From<Refused> for EngineError {

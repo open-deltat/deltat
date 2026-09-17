@@ -1144,8 +1144,9 @@ fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
 enum WireError {
     Engine {
         cause: crate::engine::EngineError,
-        /// Present only on a refusal the engine could answer "then when?" for.
-        offer: Option<crate::engine::CounterOffer>,
+        /// Present only on a refusal the engine could answer "then when?" for. Boxed because this
+        /// rides in an `Err` arm on every command path (`clippy::result_large_err`).
+        offer: Option<Box<crate::engine::CounterOffer>>,
         resource_id: Option<Ulid>,
     },
     Pg(PgWireError),
@@ -1250,7 +1251,7 @@ fn refused(r: crate::engine::Refused, resource_id: Ulid) -> WireError {
 
 fn engine_err(
     e: crate::engine::EngineError,
-    offer: Option<crate::engine::CounterOffer>,
+    offer: Option<Box<crate::engine::CounterOffer>>,
     resource_id: Option<Ulid>,
 ) -> PgWireError {
     metrics::counter!(crate::observability::ENGINE_ERRORS_TOTAL, "kind" => e.kind()).increment(1);
@@ -2160,7 +2161,7 @@ mod tests {
         let rid = Ulid::new();
         let err = engine_err(
             crate::engine::EngineError::Conflict(Ulid::new()),
-            Some(offer),
+            Some(Box::new(offer)),
             Some(rid),
         );
         let PgWireError::UserError(info) = err else {
@@ -2197,7 +2198,7 @@ mod tests {
                 span: Span::new(1_000, 2_000),
                 closed: vec![Span::new(1_000, 2_000)],
             },
-            Some(offer),
+            Some(Box::new(offer)),
             None,
         );
         let PgWireError::UserError(info) = err else {
@@ -2224,7 +2225,7 @@ mod tests {
         };
         let err = engine_err(
             crate::engine::EngineError::Conflict(Ulid::nil()),
-            Some(offer),
+            Some(Box::new(offer)),
             None,
         );
         let PgWireError::UserError(info) = err else {
