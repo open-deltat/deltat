@@ -84,6 +84,38 @@ All notable changes to deltat are documented here. The format follows
   un-broken once it depends on them. Nothing in this repo or the SDK sends any of these, and GUI
   data browsers cannot connect regardless, since there is no `pg_catalog` to introspect.
 
+- **The availability shape classifier and the filter extractor now share one traversal.** They were
+  three hand-written walks that had to agree, each carrying a comment promising it mirrored the
+  others exactly. The `Expr::Nested` fix above taught one of them to descend parentheses and left
+  the other two behind, so `resource_id IN (a,b) AND (min_available = 2)` discarded the threshold
+  and answered per-resource, and `(resource_id IN (a,b)) AND min_available = 2` reported
+  `missing filter: resource_id` with the filter plainly present. One flattening step now defines
+  what a conjunct is; the classifier and the extractor only differ in how they read each leaf.
+
+- **`availability` refuses a resource or threshold it cannot answer.** `min_available` with a single
+  `resource_id =` was parsed and dropped, because the single-resource read has nowhere to put it, so
+  "when are two of these free" answered "when is it free". Two resource selectors
+  (`resource_id = 'a' AND resource_id = 'b'`, or `=` alongside `IN`) left one silently winning.
+  `min_available = 0`, and any value above the number of resources listed, were accepted and then
+  returned nothing forever, which on a booking read is indistinguishable from "nothing is free".
+
+- **`INSERT` refuses a column the table does not have.** `INSERT INTO resources (id, capacty)
+  VALUES ('X', 5)` created a **capacity-1** resource and reported success, so a room meant to take
+  five concurrent bookings took one and nothing said so until the sixth caller was refused.
+  `bookings` already had this guard; `resources`, `rules` and `holds` did not. There is now one
+  implementation taking the known column set as an argument, rather than four places expected to
+  remember.
+
+- **Writes refuse `RETURNING`, `ON CONFLICT`, and the clauses they silently discarded**
+  (`UPDATE ... FROM`, `DELETE ... USING / ORDER BY / LIMIT`, multi-table `DELETE`). `RETURNING id`
+  asked for the row just written and received a bare command tag. `ON CONFLICT` is worse than
+  ignored: a reused entity id has been an outright error since `8cf7bccb`, so the one statement
+  written specifically to tolerate duplicates is the one that fails on them.
+
+- **A schema qualifier that is not `public` is refused.** `otherschema.bookings` was answered from
+  `public`. deltat has one namespace per tenant and the tenant is the connection's database name,
+  so collapsing schemas silently means a caller reads something other than what it named.
+
 ### Security
 - **`UPDATE` refuses a column the table does not have, instead of reporting a write that never
   happened.** `UPDATE resources SET capcity = 5 WHERE id = 'X'` (a typo) replied `UPDATE 1`, changed

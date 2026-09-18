@@ -50,14 +50,51 @@ pub fn parse_sql(sql: &str) -> Result<Command, SqlError> {
         Statement::Insert(insert) => parse_insert(insert),
         Statement::Delete(delete) => parse_delete(delete),
         Statement::Query(query) => parse_select(query),
-        Statement::Update { table, assignments, selection, .. } => parse_update(table, assignments, selection),
+        Statement::Update { table, assignments, selection, returning, from, or, .. } => {
+            reject_unsupported_write_clauses(returning.as_ref(), false)?;
+            if from.is_some() {
+                return Err(SqlError::Unsupported("FROM in an UPDATE".into()));
+            }
+            if or.is_some() {
+                return Err(SqlError::Unsupported("an OR clause in an UPDATE".into()));
+            }
+            parse_update(table, assignments, selection)
+        }
         other => Err(SqlError::Unsupported(format!("{other}"))),
     }
+}
+
+/// A write returns a command tag and no rows, so a clause asking for rows has to be refused.
+///
+/// `RETURNING id` was parsed and discarded: the caller asked for the row it just wrote and received
+/// `INSERT 0 1`. `ON CONFLICT` is worse than a no-op, because since `8cf7bccb` a reused id is an
+/// error, so the one statement written specifically to tolerate duplicates is the one that fails on
+/// them.
+fn reject_unsupported_write_clauses(
+    returning: Option<&Vec<ast::SelectItem>>,
+    on_conflict: bool,
+) -> Result<(), SqlError> {
+    if returning.is_some() {
+        return Err(SqlError::Unsupported(
+            "RETURNING; a deltat write replies with a command tag and no rows, so read the row back \
+             with a SELECT"
+                .into(),
+        ));
+    }
+    if on_conflict {
+        return Err(SqlError::Unsupported(
+            "ON CONFLICT; a reused entity id is rejected outright, so there is no conflict to \
+             resolve. Mint a fresh id instead"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
     let table = insert_table_name(insert)?;
     let columns = extract_column_names(insert);
+    reject_unsupported_write_clauses(insert.returning.as_ref(), insert.on.is_some())?;
 
     match table.as_str() {
         "resources" => {
@@ -130,6 +167,21 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
 
 fn parse_delete(delete: &ast::Delete) -> Result<Command, SqlError> {
     let table = delete_table_name(delete)?;
+    reject_unsupported_write_clauses(delete.returning.as_ref(), false)?;
+    // Each of these was parsed and thrown away. `DELETE ... ORDER BY start LIMIT 1` reads as
+    // "remove the earliest one" and removed whatever the WHERE matched instead.
+    if delete.using.is_some() {
+        return Err(SqlError::Unsupported("USING in a DELETE".into()));
+    }
+    if !delete.order_by.is_empty() {
+        return Err(SqlError::Unsupported("ORDER BY in a DELETE".into()));
+    }
+    if delete.limit.is_some() {
+        return Err(SqlError::Unsupported("LIMIT in a DELETE".into()));
+    }
+    if delete.tables.len() > 1 {
+        return Err(SqlError::Unsupported("a multi-table DELETE".into()));
+    }
     let id = extract_where_id(&delete.selection)?;
 
     match table.as_str() {
@@ -222,6 +274,43 @@ fn parse_select(query: &ast::Query) -> Result<Command, SqlError> {
             let start = filters.start.ok_or(SqlError::MissingFilter("start"))?;
             let end = filters.end.ok_or(SqlError::MissingFilter("end"))?;
 
+            // One resource selector, not two. `resource_id = 'a' AND resource_id IN ('b')` used to
+            // answer about `b` alone and say nothing about the `=`.
+            if filters.resource_id.is_some() && !filters.resource_ids.is_empty() {
+                return Err(SqlError::Unsupported(
+                    "both resource_id = and resource_id IN (...); use one or the other".into(),
+                ));
+            }
+
+            if let Some(n) = filters.min_available {
+                // `min_available` is only meaningful across a set. With a single resource it was
+                // parsed and then dropped on the floor, because SelectAvailability has nowhere to
+                // put it, so "when are 2 of this resource free" answered "when is it free".
+                if filters.resource_ids.is_empty() {
+                    return Err(SqlError::Unsupported(
+                        "min_available requires resource_id IN (...); it asks how many of a SET are \
+                         free at once"
+                            .into(),
+                    ));
+                }
+                // The engine returns an empty result forever for both of these, which on a booking
+                // read is indistinguishable from "nothing is free".
+                if n == 0 {
+                    return Err(SqlError::Unsupported(
+                        "min_available = 0; every span trivially satisfies it, so the read has no \
+                         meaning"
+                            .into(),
+                    ));
+                }
+                if n > filters.resource_ids.len() {
+                    return Err(SqlError::Unsupported(format!(
+                        "min_available = {n} exceeds the {} resource(s) listed, so no span can ever \
+                         satisfy it",
+                        filters.resource_ids.len()
+                    )));
+                }
+            }
+
             // Branch on the same structural classifier the Describe path uses, so the announced
             // schema always matches the rows produced. Merged => intersection across the set
             // (getCombined); PerResourceMulti => per-resource rows tagged with resource_id
@@ -304,18 +393,29 @@ struct AvailabilityFilters {
 /// caller silently received slots too short to book, and `start >= 1500 AND start >= 1000` resolved
 /// last-write-wins to 1000, returning a WIDER window than asked for.
 fn extract_availability_filters(expr: &Expr, f: &mut AvailabilityFilters) -> Result<(), SqlError> {
-    match expr {
-        // Parentheses are ordinary SQL. This arm used to be missing, so `WHERE (a AND b)` fell to
-        // the catch-all and every conjunct inside it vanished.
-        Expr::Nested(inner) => extract_availability_filters(inner, f),
+    // The same flattening the shape classifier uses, so the two cannot disagree about which
+    // conjuncts exist. Only the interpretation of each leaf differs.
+    for leaf in conjuncts_of(Some(expr)) {
+        extract_one_availability_filter(leaf, f)?;
+    }
+    Ok(())
+}
 
+fn extract_one_availability_filter(expr: &Expr, f: &mut AvailabilityFilters) -> Result<(), SqlError> {
+    match expr {
         Expr::BinaryOp { left, op, right } => match op {
-            ast::BinaryOperator::And => {
-                extract_availability_filters(left, f)?;
-                extract_availability_filters(right, f)
-            }
             ast::BinaryOperator::Eq => match expr_column_name(left).as_deref() {
                 Some("resource_id") => {
+                    // Two `resource_id =` conjuncts used to leave the last one standing. Under AND
+                    // they are a contradiction, and silently answering about one of the two is the
+                    // worst available reading.
+                    if f.resource_id.is_some() {
+                        return Err(SqlError::Unsupported(
+                            "resource_id given twice; an availability read addresses one resource, \
+                             or a set via resource_id IN (...)"
+                                .into(),
+                        ));
+                    }
                     f.resource_id = Some(parse_ulid_expr(right)?);
                     Ok(())
                 }
@@ -414,44 +514,57 @@ pub enum AvailabilityShape {
     Merged,
 }
 
+/// Flatten a WHERE clause into its individual conjuncts, descending `AND` and parentheses.
+///
+/// The single definition of "what counts as a conjunct here", shared by the shape classifier and
+/// the filter extractor. They used to be three hand-written walks that had to agree, each carrying
+/// a comment promising it mirrored the others "exactly". PR #40 taught one of them to descend
+/// `Expr::Nested` and left the other two behind, which is what such a promise is worth.
+///
+/// Values are deliberately not parsed here. Describe runs against SQL that still carries unbound
+/// `$N` placeholders, so the shape has to be decidable from structure alone.
+fn flatten_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Nested(inner) => flatten_conjuncts(inner, out),
+        Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            flatten_conjuncts(left, out);
+            flatten_conjuncts(right, out);
+        }
+        leaf => out.push(leaf),
+    }
+}
+
+fn conjuncts_of(selection: Option<&Expr>) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    if let Some(expr) = selection {
+        flatten_conjuncts(expr, &mut out);
+    }
+    out
+}
+
+fn is_resource_id_in_list(e: &Expr) -> bool {
+    matches!(e, Expr::InList { expr, negated: false, .. }
+        if expr_column_name(expr).as_deref() == Some("resource_id"))
+}
+
+fn is_min_available_eq(e: &Expr) -> bool {
+    matches!(e, Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, .. }
+        if expr_column_name(left).as_deref() == Some("min_available"))
+}
+
 pub fn availability_shape(selection: Option<&Expr>) -> AvailabilityShape {
-    let has_resource_in_list = selection.is_some_and(selection_has_resource_id_in_list);
-    let has_min_available_eq = selection.is_some_and(selection_has_min_available_eq);
-    match (has_resource_in_list, has_min_available_eq) {
+    let leaves = conjuncts_of(selection);
+    match (
+        leaves.iter().any(|e| is_resource_id_in_list(e)),
+        leaves.iter().any(|e| is_min_available_eq(e)),
+    ) {
         (true, true) => AvailabilityShape::Merged,
         (true, false) => AvailabilityShape::PerResourceMulti,
         _ => AvailabilityShape::Single,
     }
 }
 
-/// Mirror `extract_availability_filters`' resource-id matching exactly: a non-negated
-/// `resource_id IN (...)`, reachable only through `AND` (never `Nested`/`OR`).
-fn selection_has_resource_id_in_list(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
-            selection_has_resource_id_in_list(left) || selection_has_resource_id_in_list(right)
-        }
-        Expr::InList { expr, negated: false, .. } => {
-            expr_column_name(expr).as_deref() == Some("resource_id")
-        }
-        _ => false,
-    }
-}
 
-/// Mirror `extract_availability_filters`' merged-marker matching exactly: `min_available = ...`
-/// with the column on the left (`Eq` only, not `>`, `>=`, or a reversed `N = min_available`),
-/// reachable only through `AND`.
-fn selection_has_min_available_eq(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
-            selection_has_min_available_eq(left) || selection_has_min_available_eq(right)
-        }
-        Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, .. } => {
-            expr_column_name(left).as_deref() == Some("min_available")
-        }
-        _ => false,
-    }
-}
 
 fn parse_update(
     table: &ast::TableWithJoins,
@@ -710,11 +823,23 @@ fn extract_parent_id_filter(selection: &Expr) -> Result<Option<Ulid>, SqlError> 
 
 // ── Helpers ───────────────────────────────────────────────────
 
+/// The table name, refusing a qualifier that names anywhere but `public`.
+///
+/// This used to take the last part unconditionally, so `otherschema.bookings` was answered from
+/// `public` and the caller was never told its schema does not exist. deltat has one namespace per
+/// tenant, and the tenant is the connection's database name, so collapsing schemas silently means a
+/// caller reads something other than what it named.
 fn object_name_last(name: &ast::ObjectName) -> Option<String> {
-    name.0.last().and_then(|part| match part {
-        ObjectNamePart::Identifier(ident) => Some(ident.value.to_lowercase()),
+    let ident = |part: &ObjectNamePart| match part {
+        ObjectNamePart::Identifier(i) => Some(i.value.to_lowercase()),
         _ => None,
-    })
+    };
+    let last = name.0.last().and_then(ident)?;
+    match name.0.len() {
+        0 | 1 => Some(last),
+        2 if name.0.first().and_then(ident).as_deref() == Some("public") => Some(last),
+        _ => None,
+    }
 }
 
 fn insert_table_name(insert: &ast::Insert) -> Result<String, SqlError> {
@@ -772,6 +897,11 @@ fn parse_resource_row(values: &[Expr], columns: &[String]) -> Result<ResourceRow
     if !columns.is_empty() && values.len() != columns.len() {
         return Err(SqlError::WrongArity("resources", columns.len(), values.len()));
     }
+    reject_unknown_insert_columns(
+        "resources",
+        columns,
+        &["id", "parent_id", "name", "capacity", "buffer_after"],
+    )?;
     let col_idx = |name: &str| -> Option<usize> {
         if columns.is_empty() { None } else { columns.iter().position(|c| c == name) }
     };
@@ -833,10 +963,35 @@ fn check_column_arity(table: &'static str, columns: &[String], values: &[Expr]) 
     Ok(())
 }
 
+/// Reject a declared INSERT column this table does not have.
+///
+/// One implementation for all four tables, because the previous arrangement had this logic inline
+/// in `parse_booking_row` and nowhere else, so `INSERT INTO resources (id, capacty) VALUES ('X', 5)`
+/// created a capacity-1 resource and reported success. In a collision-detection database that is a
+/// booking-capacity error: a room meant to take five concurrent bookings takes one, and nothing says
+/// so until the sixth caller is refused.
+///
+/// A guard that exists on one call site and not its siblings is the recurring shape of these bugs,
+/// so this takes the known set as an argument rather than trusting each caller to remember.
+fn reject_unknown_insert_columns(
+    table: &'static str,
+    columns: &[String],
+    known: &[&str],
+) -> Result<(), SqlError> {
+    match columns.iter().find(|c| !known.contains(&c.as_str())) {
+        Some(unknown) => Err(SqlError::Parse(format!(
+            "unknown {table} column: {unknown}; columns are {}",
+            known.join(", ")
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Parse one `rules` VALUES row into (id, resource_id, start, end, blocking), honoring a declared
 /// column list. Positional order (the fallback) is (id, resource_id, start, end, blocking).
 fn parse_rule_row(values: &[Expr], columns: &[String]) -> Result<(Ulid, Ulid, Ms, Ms, bool), SqlError> {
     check_column_arity("rules", columns, values)?;
+    reject_unknown_insert_columns("rules", columns, &["id", "resource_id", "start", "end", "blocking"])?;
     let get = |name: &str, pos: usize| {
         col_value(columns, values, name, pos).ok_or(SqlError::WrongArity("rules", 5, values.len()))
     };
@@ -853,6 +1008,7 @@ fn parse_rule_row(values: &[Expr], columns: &[String]) -> Result<(Ulid, Ulid, Ms
 /// column list. Positional order (the fallback) is (id, resource_id, start, end, expires_at).
 fn parse_hold_row(values: &[Expr], columns: &[String]) -> Result<(Ulid, Ulid, Ms, Ms, Ms), SqlError> {
     check_column_arity("holds", columns, values)?;
+    reject_unknown_insert_columns("holds", columns, &["id", "resource_id", "start", "end", "expires_at"])?;
     let get = |name: &str, pos: usize| {
         col_value(columns, values, name, pos).ok_or(SqlError::WrongArity("holds", 5, values.len()))
     };
@@ -874,11 +1030,7 @@ fn parse_booking_row(
     columns: &[String],
 ) -> Result<(Ulid, Ulid, Ms, Ms, Option<String>), SqlError> {
     check_column_arity("bookings", columns, values)?;
-    if let Some(unknown) = columns.iter().find(|c| {
-        !matches!(c.as_str(), "id" | "resource_id" | "start" | "end" | "label")
-    }) {
-        return Err(SqlError::Parse(format!("unknown bookings column: {unknown}")));
-    }
+    reject_unknown_insert_columns("bookings", columns, &["id", "resource_id", "start", "end", "label"])?;
     // Positional rows share the WrongArity message with the siblings; with a column list present
     // the arity already matches, so a missing field is named instead of counted.
     if columns.is_empty() && values.len() < 4 {
@@ -1917,6 +2069,128 @@ mod tests {
                 "expected the parser to refuse {sql:?}, got {result:?}"
             );
         }
+    }
+
+    /// The shape classifier and the filter extractor share one traversal, so a clause that is
+    /// parenthesised in either position routes the same way.
+    ///
+    /// They were three hand-mirrored walks. #40 taught only the extractor to descend
+    /// `Expr::Nested`, so `IN (a,b) AND (min_available = 2)` dropped the threshold and answered
+    /// per-resource, and `(resource_id IN (a,b)) AND min_available = 2` reported
+    /// `missing filter: resource_id` with the filter plainly present.
+    #[test]
+    fn parentheses_route_the_same_way_wherever_they_sit() {
+        let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let b = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        for clause in [
+            format!("resource_id IN ('{a}','{b}') AND (min_available = 2)"),
+            format!("(resource_id IN ('{a}','{b}')) AND min_available = 2"),
+            format!("(resource_id IN ('{a}','{b}') AND min_available = 2)"),
+            format!("resource_id IN ('{a}','{b}') AND min_available = 2"),
+        ] {
+            let sql =
+                format!("SELECT * FROM availability WHERE {clause} AND start >= 0 AND \"end\" <= 100");
+            match parse_sql(&sql) {
+                Ok(Command::SelectMultiAvailability { min_available, resource_ids, .. }) => {
+                    assert_eq!(min_available, 2, "threshold lost for: {clause}");
+                    assert_eq!(resource_ids.len(), 2, "resource set lost for: {clause}");
+                }
+                other => panic!("expected the merged read for `{clause}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every one of these was accepted with part of the statement discarded.
+    #[test]
+    fn availability_refuses_a_resource_or_threshold_it_cannot_answer() {
+        let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let b = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let win = "start >= 0 AND \"end\" <= 100";
+        for clause in [
+            // min_available discarded: SelectAvailability has nowhere to put it.
+            format!("resource_id = '{a}' AND min_available = 2"),
+            // Two selectors: one silently won.
+            format!("resource_id = '{a}' AND resource_id = '{b}'"),
+            format!("resource_id = '{a}' AND resource_id IN ('{b}')"),
+            // Accepted, then empty forever, which reads as "nothing is free".
+            format!("resource_id IN ('{a}','{b}') AND min_available = 0"),
+            format!("resource_id IN ('{a}','{b}') AND min_available = 9"),
+        ] {
+            let sql = format!("SELECT * FROM availability WHERE {clause} AND {win}");
+            assert!(
+                matches!(parse_sql(&sql), Err(SqlError::Unsupported(_))),
+                "must be refused rather than half-answered: {clause}",
+            );
+        }
+
+        // The two shapes that do mean something still parse.
+        assert!(parse_sql(&format!(
+            "SELECT * FROM availability WHERE resource_id = '{a}' AND {win}"
+        ))
+        .is_ok());
+        assert!(parse_sql(&format!(
+            "SELECT * FROM availability WHERE resource_id IN ('{a}','{b}') AND min_available = 2 AND {win}"
+        ))
+        .is_ok());
+    }
+
+    /// `INSERT INTO resources (id, capacty) VALUES ('X', 5)` created a capacity-1 resource and
+    /// reported success, so a room meant to take five concurrent bookings took one. `bookings` had
+    /// this guard; its three siblings did not.
+    #[test]
+    fn an_insert_refuses_a_column_the_table_does_not_have() {
+        let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        for sql in [
+            format!("INSERT INTO resources (id, capacty) VALUES ('{a}', 5)"),
+            format!("INSERT INTO resources (id, nmae) VALUES ('{a}', 'x')"),
+            format!("INSERT INTO rules (id, resource_id, start, \"end\", blockng) VALUES ('{a}','{a}',1,2,true)"),
+            format!("INSERT INTO holds (id, resource_id, start, \"end\", expires) VALUES ('{a}','{a}',1,2,3)"),
+            format!("INSERT INTO bookings (id, resource_id, start, \"end\", lable) VALUES ('{a}','{a}',1,2,'x')"),
+        ] {
+            assert!(parse_sql(&sql).is_err(), "a misspelled column must be refused: {sql}");
+        }
+
+        // The correct spelling still carries the value through.
+        match parse_sql(&format!("INSERT INTO resources (id, capacity) VALUES ('{a}', 5)")) {
+            Ok(Command::InsertResource { capacity, .. }) => assert_eq!(capacity, 5),
+            other => panic!("expected InsertResource with capacity 5, got {other:?}"),
+        }
+    }
+
+    /// A write replies with a command tag and no rows, so asking for rows has to fail rather than
+    /// return none. ON CONFLICT is worse than ignored: a reused id is an error since 8cf7bccb, so
+    /// the statement written to tolerate duplicates is the one that fails on them.
+    #[test]
+    fn a_write_refuses_clauses_it_would_otherwise_discard() {
+        let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        for sql in [
+            format!("INSERT INTO bookings (id, resource_id, start, \"end\") VALUES ('{a}','{a}',1,2) RETURNING id"),
+            format!("INSERT INTO bookings (id, resource_id, start, \"end\") VALUES ('{a}','{a}',1,2) ON CONFLICT DO NOTHING"),
+            format!("UPDATE resources SET capacity = 5 WHERE id = '{a}' RETURNING id"),
+            format!("DELETE FROM bookings WHERE id = '{a}' RETURNING id"),
+            format!("DELETE FROM bookings WHERE id = '{a}' ORDER BY start LIMIT 1"),
+        ] {
+            assert!(
+                matches!(parse_sql(&sql), Err(SqlError::Unsupported(_))),
+                "must be refused rather than discarded: {sql}",
+            );
+        }
+    }
+
+    /// deltat has one namespace per tenant, and the tenant is the connection's database name.
+    /// `otherschema.bookings` was answered from `public` without a word.
+    #[test]
+    fn a_schema_qualifier_that_is_not_public_is_refused() {
+        let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        assert!(parse_sql(&format!(
+            "SELECT * FROM otherschema.bookings WHERE resource_id = '{a}'"
+        ))
+        .is_err());
+        // `public` means what it says, so it still works.
+        assert!(parse_sql(&format!(
+            "SELECT * FROM public.bookings WHERE resource_id = '{a}'"
+        ))
+        .is_ok());
     }
 
     /// Each of these used to return `Ok` with the extra clause discarded, so the caller received a
