@@ -58,9 +58,39 @@ All notable changes to deltat are documented here. The format follows
   silent catch-alls on those three reads are gone. `rules` had the same bug as `bookings`:
   `WHERE resource_id = 'X' AND start >= 99999` returned every rule on the resource.
 
-  **Not yet covered:** `availability` still ignores conjuncts it does not recognise, and no read
-  honours `ORDER BY`, `LIMIT`, or a projection list. Those are the same class and are tracked
-  separately in #37 rather than claimed fixed here.
+  **Now covered too** (#37, below): `availability`, and the clauses no read honoured.
+
+- **`availability` refuses a filter it cannot honour, and repeated bounds intersect.** Three
+  separate paths used to discard part of the clause and answer anyway. The sharpest was
+  `min_duration > 500`: a recognised column with an operator the walk skipped, so the caller was
+  handed slots too short to book. `label = 'x'`, `BETWEEN`, `NOT (...)`, `IN` on anything but
+  `resource_id`, and `IS NULL` were all dropped the same way, and a parenthesised clause such as
+  `WHERE (resource_id = 'X' AND start >= 1000)` vanished entirely, because `Expr::Nested` had no arm.
+
+  Repeated bounds were resolved last-write-wins rather than intersected, so
+  `start >= 1500 AND start >= 1000` yielded `start = 1000`. That is **wider** than asked for, which
+  on an availability read means offering time the caller explicitly excluded. `AND` means both
+  bounds hold; they now intersect regardless of the order they appear in.
+
+  `min_available` and `min_duration` are query parameters wearing a predicate's clothes rather than
+  filters on returned columns, so the accepted set is written out explicitly instead of inferred.
+
+- **A read refuses `ORDER BY`, `LIMIT`, `OFFSET`, a column list, `DISTINCT`, `GROUP BY`, `HAVING`,
+  `JOIN`, CTEs and row locks** instead of parsing and discarding them. `LIMIT 200` returned every
+  row, `ORDER BY start DESC` returned rows in store order, and `SELECT start` returned all columns.
+
+  Refusing is the reversible direction: a caller who needs `LIMIT` can be given it later without
+  breaking anyone, while a caller that has silently been receiving unlimited rows cannot be
+  un-broken once it depends on them. Nothing in this repo or the SDK sends any of these, and GUI
+  data browsers cannot connect regardless, since there is no `pg_catalog` to introspect.
+
+### Security
+- **`UPDATE` refuses a column the table does not have, instead of reporting a write that never
+  happened.** `UPDATE resources SET capcity = 5 WHERE id = 'X'` (a typo) replied `UPDATE 1`, changed
+  no field, and still appended a no-op `ResourceUpdated` record to the WAL. The same held for
+  `rules` and `holds`. A write that reports success and does nothing is worse than a wrong read,
+  because the caller has no reason to look again. Refusals name the assignable columns, since the
+  overwhelmingly likely cause is a misspelling.
 
 - **Reusing an entity id no longer strands an interval.** `INSERT INTO holds`, `INSERT INTO
   bookings` and `INSERT INTO rules` now reject an id that is already in use, anywhere in the

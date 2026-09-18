@@ -1492,21 +1492,6 @@ mod tests {
                 "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND min_available = $3 AND start >= $4 AND \"end\" <= $5",
                 "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND min_available = 2 AND start >= 0 AND \"end\" <= 100",
             ),
-            // `>` is not the merged marker (executor matches Eq only) → per-resource, 3 cols
-            (
-                "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND min_available > $3 AND start >= $4 AND \"end\" <= $5",
-                "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND min_available > 1 AND start >= 0 AND \"end\" <= 100",
-            ),
-            // `>=` likewise → per-resource, 3 cols
-            (
-                "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND min_available >= $3 AND start >= $4 AND \"end\" <= $5",
-                "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND min_available >= 1 AND start >= 0 AND \"end\" <= 100",
-            ),
-            // reversed operand `N = min_available` (column on the right) → executor does not match → per-resource, 3 cols
-            (
-                "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND $3 = min_available AND start >= $4 AND \"end\" <= $5",
-                "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND 2 = min_available AND start >= 0 AND \"end\" <= 100",
-            ),
             // plain per-resource IN, no min_available → 3 cols
             (
                 "SELECT * FROM availability WHERE resource_id IN ($1, $2) AND start >= $3 AND \"end\" <= $4",
@@ -1525,6 +1510,21 @@ mod tests {
             assert_eq!(
                 announced, produced,
                 "Describe announced {announced} cols but executor produces {produced} for: {describe_sql}",
+            );
+        }
+
+        // The forms this test used to cover as "routes per-resource" are now refused outright,
+        // because routing them per-resource meant silently discarding the min_available the caller
+        // asked for. A refusal carries no DataRows, so the width invariant above cannot be
+        // violated by them; what matters is that they never reach the executor at all.
+        for execute_sql in [
+            "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND min_available > 1 AND start >= 0 AND \"end\" <= 100",
+            "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND min_available >= 1 AND start >= 0 AND \"end\" <= 100",
+            "SELECT * FROM availability WHERE resource_id IN ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '01ARZ3NDEKTSV4RRFFQ69G5FAW') AND 2 = min_available AND start >= 0 AND \"end\" <= 100",
+        ] {
+            assert!(
+                sql::parse_sql(execute_sql).is_err(),
+                "a min_available form the engine cannot honour must be refused: {execute_sql}",
             );
         }
     }

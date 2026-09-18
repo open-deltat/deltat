@@ -141,6 +141,65 @@ fn parse_delete(delete: &ast::Delete) -> Result<Command, SqlError> {
     }
 }
 
+/// Refuse the parts of a `SELECT` this engine does not implement, rather than parsing and
+/// discarding them.
+///
+/// Every clause below was previously accepted and ignored, which is the failure mode this codebase
+/// keeps having to fix: `LIMIT 200` returned every row, `ORDER BY start DESC` returned rows in
+/// store order, and `SELECT start` returned all three columns. None of it was visible to the caller,
+/// because the reply carried a success tag either way.
+///
+/// Refusing is the reversible direction. A caller who needs `LIMIT` can be given it later without
+/// breaking anyone; a caller who has silently been getting unlimited rows cannot be un-broken once
+/// it depends on them. Nothing in this repo or the SDK sends any of these (every read is
+/// `SELECT * FROM <table> WHERE ...`), and GUI data browsers cannot connect regardless, since there
+/// is no `pg_catalog` to introspect.
+fn reject_unsupported_read_clauses(
+    query: &ast::Query,
+    select: &ast::Select,
+) -> Result<(), SqlError> {
+    let unsupported = |what: &str| Err(SqlError::Unsupported(format!("{what} on a deltat read")));
+
+    // Only `SELECT *`. A projection list is parsed and then ignored, so a caller asking for one
+    // column receives every column under a success tag.
+    let is_wildcard = select.projection.len() == 1
+        && matches!(select.projection[0], ast::SelectItem::Wildcard(_));
+    if !is_wildcard {
+        return Err(SqlError::Unsupported(
+            "a column list; every deltat read returns its full row, so use `SELECT *`".into(),
+        ));
+    }
+
+    if select.from.len() > 1 || select.from.iter().any(|t| !t.joins.is_empty()) {
+        return unsupported("a JOIN or a second FROM item");
+    }
+    if query.order_by.is_some() {
+        return unsupported("ORDER BY");
+    }
+    if query.limit_clause.is_some() {
+        return unsupported("LIMIT or OFFSET");
+    }
+    if query.fetch.is_some() {
+        return unsupported("FETCH");
+    }
+    if query.with.is_some() {
+        return unsupported("a common table expression");
+    }
+    if !query.locks.is_empty() {
+        return unsupported("a row lock such as FOR UPDATE");
+    }
+    if select.distinct.is_some() {
+        return unsupported("DISTINCT");
+    }
+    if select.having.is_some() {
+        return unsupported("HAVING");
+    }
+    if !matches!(select.group_by, ast::GroupByExpr::Expressions(ref e, _) if e.is_empty()) {
+        return unsupported("GROUP BY");
+    }
+    Ok(())
+}
+
 fn parse_select(query: &ast::Query) -> Result<Command, SqlError> {
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -150,6 +209,7 @@ fn parse_select(query: &ast::Query) -> Result<Command, SqlError> {
     if select.from.is_empty() {
         return Err(SqlError::Parse("SELECT without FROM".into()));
     }
+    reject_unsupported_read_clauses(query, select)?;
     let table = table_factor_name(&select.from[0].relation)?;
 
     match table.as_str() {
@@ -233,23 +293,37 @@ struct AvailabilityFilters {
     min_available: Option<usize>,
 }
 
-fn extract_availability_filters(
-    expr: &Expr,
-    f: &mut AvailabilityFilters,
-) -> Result<(), SqlError> {
+/// The availability read's accept-list, written out rather than inferred.
+///
+/// This clause is unusual: `min_available` and `min_duration` are query PARAMETERS wearing a
+/// predicate's clothes, not filters on returned columns, so "reject anything that is not a column
+/// filter" would break the feature. Every accepted shape is therefore enumerated here, and
+/// everything else is refused by name.
+///
+/// The refusals matter more than they look. Before this, `min_duration > 500` was discarded and the
+/// caller silently received slots too short to book, and `start >= 1500 AND start >= 1000` resolved
+/// last-write-wins to 1000, returning a WIDER window than asked for.
+fn extract_availability_filters(expr: &Expr, f: &mut AvailabilityFilters) -> Result<(), SqlError> {
     match expr {
+        // Parentheses are ordinary SQL. This arm used to be missing, so `WHERE (a AND b)` fell to
+        // the catch-all and every conjunct inside it vanished.
+        Expr::Nested(inner) => extract_availability_filters(inner, f),
+
         Expr::BinaryOp { left, op, right } => match op {
             ast::BinaryOperator::And => {
                 extract_availability_filters(left, f)?;
-                extract_availability_filters(right, f)?;
+                extract_availability_filters(right, f)
             }
-            ast::BinaryOperator::Eq => {
-                let col = expr_column_name(left);
-                if col.as_deref() == Some("resource_id") {
+            ast::BinaryOperator::Eq => match expr_column_name(left).as_deref() {
+                Some("resource_id") => {
                     f.resource_id = Some(parse_ulid_expr(right)?);
-                } else if col.as_deref() == Some("min_duration") {
+                    Ok(())
+                }
+                Some("min_duration") => {
                     f.min_duration = Some(parse_i64_expr(right)?);
-                } else if col.as_deref() == Some("min_available") {
+                    Ok(())
+                }
+                Some("min_available") => {
                     let v = parse_i64_expr(right)?;
                     if v < 0 {
                         return Err(SqlError::Unsupported(
@@ -257,16 +331,28 @@ fn extract_availability_filters(
                         ));
                     }
                     f.min_available = Some(v as usize);
+                    Ok(())
                 }
-            }
+                other => Err(unsupported_availability_filter(other, "=")),
+            },
+            // Repeated bounds intersect, because that is what AND means. Taking the last one seen
+            // is only correct when the bounds happen to arrive in tightening order.
             ast::BinaryOperator::GtEq if expr_column_name(left).as_deref() == Some("start") => {
-                f.start = Some(parse_i64_expr(right)?);
+                let v = parse_i64_expr(right)?;
+                f.start = Some(f.start.map_or(v, |cur| cur.max(v)));
+                Ok(())
             }
             ast::BinaryOperator::LtEq if expr_column_name(left).as_deref() == Some("end") => {
-                f.end = Some(parse_i64_expr(right)?);
+                let v = parse_i64_expr(right)?;
+                f.end = Some(f.end.map_or(v, |cur| cur.min(v)));
+                Ok(())
             }
-            _ => {}
+            _ => Err(unsupported_availability_filter(
+                expr_column_name(left).as_deref(),
+                &op.to_string(),
+            )),
         },
+
         // resource_id IN ('id1', 'id2', ...)
         Expr::InList { expr: col_expr, list, negated }
             if !negated && expr_column_name(col_expr).as_deref() == Some("resource_id") =>
@@ -281,10 +367,36 @@ fn extract_availability_filters(
             for item in list {
                 f.resource_ids.push(parse_ulid_expr(item)?);
             }
+            Ok(())
         }
-        _ => {}
+
+        // Deliberately not a catch-all. An unrecognised conjunct means the engine would answer a
+        // different question than the one asked, so it fails loudly instead.
+        other => Err(SqlError::Unsupported(format!(
+            "filter in availability WHERE clause: {other}. Supported: resource_id = or IN, \
+             start >=, \"end\" <=, min_duration =, min_available ="
+        ))),
     }
-    Ok(())
+}
+
+/// Refusal for an `UPDATE ... SET` column this table does not have.
+///
+/// Names the assignable columns, because the overwhelmingly likely cause is a typo and the caller
+/// needs to see the spelling it missed.
+fn unsupported_assignment(table: &str, column: &str, assignable: &[&str]) -> SqlError {
+    SqlError::Unsupported(format!(
+        "`{column}` is not assignable on {table}; assignable columns are {}",
+        assignable.join(", ")
+    ))
+}
+
+/// One message shape for every availability filter refusal, so a caller sees what it can use.
+fn unsupported_availability_filter(column: Option<&str>, op: &str) -> SqlError {
+    let col = column.unwrap_or("<expression>");
+    SqlError::Unsupported(format!(
+        "`{col} {op} ...` in an availability WHERE clause. Supported: resource_id = or IN, \
+         start >=, \"end\" <=, min_duration =, min_available ="
+    ))
 }
 
 /// Structural shape of an `availability` query, derived purely from the WHERE AST. Both the
@@ -364,7 +476,10 @@ fn parse_update(
                     "name" => name = Some(parse_string_or_null(&a.value)?),
                     "capacity" => capacity = Some(parse_u32(&a.value)?),
                     "buffer_after" => buffer_after = Some(parse_i64_or_null(&a.value)?),
-                    _ => {}
+                    // An ignored assignment is a silent write failure, which is worse than a
+                    // silent read: `SET capcity = 5` used to reply UPDATE 1, change nothing, and
+                    // still append a no-op ResourceUpdated record to the WAL.
+                    other => return Err(unsupported_assignment("resources", other, &["name", "capacity", "buffer_after"])),
                 }
             }
 
@@ -381,7 +496,7 @@ fn parse_update(
                     "start" => start = Some(parse_i64_expr(&a.value)?),
                     "end" => end = Some(parse_i64_expr(&a.value)?),
                     "blocking" => blocking = Some(parse_bool(&a.value)?),
-                    _ => {}
+                    other => return Err(unsupported_assignment("rules", other, &["start", "end", "blocking"])),
                 }
             }
 
@@ -404,7 +519,7 @@ fn parse_update(
                 match col.as_str() {
                     "booking_id" => booking_id = Some(parse_ulid_expr(&a.value)?),
                     "label" => label = parse_string_or_null(&a.value)?,
-                    _ => {}
+                    other => return Err(unsupported_assignment("holds", other, &["booking_id", "label"])),
                 }
             }
 
@@ -1047,11 +1162,13 @@ mod tests {
     }
 
     #[test]
-    fn only_min_available_eq_routes_to_merged() {
-        // The merged form is selected ONLY by `min_available = N` (Eq, column on the left). Any
-        // other form (`>`, `>=`, reversed `N = min_available`) routes per-resource. The Describe
-        // schema (wire::schema_for_sql) classifies with the same `availability_shape`, so the
-        // announced column set matches the produced rows. See the wire cross-check test.
+    fn only_min_available_eq_is_accepted_and_other_forms_are_refused() {
+        // The merged form is selected ONLY by `min_available = N` (Eq, column on the left).
+        //
+        // This test previously asserted that any other form (`>`, `>=`, reversed `N =
+        // min_available`) "routes per-resource", which is a polite description of the constraint
+        // being silently discarded: a caller asking for spans where at least one resource is free
+        // received per-resource rows instead, under a success tag. It now has to be refused.
         let a = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let b = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
         let prefix = format!("SELECT * FROM availability WHERE resource_id IN ('{a}', '{b}')");
@@ -1059,10 +1176,17 @@ mod tests {
         for clause in ["min_available > 1", "min_available >= 1", "2 = min_available"] {
             let sql = format!("{prefix} AND {clause} AND start >= 0 AND end <= 100");
             assert!(
-                matches!(parse_sql(&sql).unwrap(), Command::SelectAvailabilityMulti { .. }),
-                "non-Eq min_available form must route per-resource: {clause}",
+                matches!(parse_sql(&sql), Err(SqlError::Unsupported(_))),
+                "a min_available form the engine cannot honour must be refused, not dropped: {clause}",
             );
         }
+
+        // The supported form still routes to the merged read.
+        let ok = format!("{prefix} AND min_available = 2 AND start >= 0 AND end <= 100");
+        assert!(matches!(
+            parse_sql(&ok).unwrap(),
+            Command::SelectMultiAvailability { min_available: 2, .. }
+        ));
     }
 
     #[test]
@@ -1793,6 +1917,125 @@ mod tests {
                 "expected the parser to refuse {sql:?}, got {result:?}"
             );
         }
+    }
+
+    /// Each of these used to return `Ok` with the extra clause discarded, so the caller received a
+    /// confident answer to a question it did not ask. `min_duration > 500` is the sharpest: a
+    /// recognised column with an operator the parser skipped, which handed back slots too short to
+    /// book.
+    #[test]
+    fn availability_refuses_every_filter_it_cannot_honour() {
+        let rid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let base = format!(
+            "SELECT * FROM availability WHERE resource_id = '{rid}' AND start >= 1000 AND \"end\" <= 2000"
+        );
+
+        for clause in [
+            "label = 'x'",                   // a column availability does not have
+            "min_duration > 500",            // recognised column, operator the parser skipped
+            "min_available < 2",             // ditto
+            "NOT (min_available = 2)",       // negation
+            "start BETWEEN 1200 AND 1800",   // a form the walk never matched
+            "min_available IN (1, 2)",       // IN on something that is not resource_id
+            "start IS NOT NULL",             // IS predicate
+        ] {
+            let sql = format!("{base} AND {clause}");
+            assert!(
+                matches!(parse_sql(&sql), Err(SqlError::Unsupported(_))),
+                "availability must refuse `{clause}` rather than answer a different question",
+            );
+        }
+
+        // The supported shape still parses, so the refusals above are not simply a blanket ban.
+        assert!(matches!(parse_sql(&base), Ok(Command::SelectAvailability { .. })));
+    }
+
+    /// Parentheses are ordinary SQL. `Expr::Nested` had no arm, so the whole clause fell to the
+    /// catch-all and every conjunct inside it vanished.
+    #[test]
+    fn availability_reads_through_parentheses() {
+        let rid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sql = format!(
+            "SELECT * FROM availability WHERE (resource_id = '{rid}' AND start >= 1000) AND \"end\" <= 2000"
+        );
+        match parse_sql(&sql) {
+            Ok(Command::SelectAvailability { start, end, .. }) => {
+                assert_eq!((start, end), (1000, 2000), "a parenthesised conjunct must still count");
+            }
+            other => panic!("parenthesised WHERE must parse, got {other:?}"),
+        }
+    }
+
+    /// AND means both bounds hold, so repeated bounds intersect. Taking the last one seen is only
+    /// right when they happen to arrive in tightening order; reversed, it returned a WIDER window
+    /// than asked for, which on an availability read means offering slots the caller excluded.
+    #[test]
+    fn repeated_bounds_intersect_regardless_of_order() {
+        let rid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        for (clause, want_start, want_end) in [
+            ("start >= 1000 AND start >= 1500 AND \"end\" <= 2000", 1500, 2000),
+            ("start >= 1500 AND start >= 1000 AND \"end\" <= 2000", 1500, 2000),
+            ("start >= 1000 AND \"end\" <= 2000 AND \"end\" <= 1800", 1000, 1800),
+            ("start >= 1000 AND \"end\" <= 1800 AND \"end\" <= 2000", 1000, 1800),
+        ] {
+            let sql = format!("SELECT * FROM availability WHERE resource_id = '{rid}' AND {clause}");
+            match parse_sql(&sql) {
+                Ok(Command::SelectAvailability { start, end, .. }) => {
+                    assert_eq!(
+                        (start, end),
+                        (want_start, want_end),
+                        "repeated bounds must intersect: {clause}",
+                    );
+                }
+                other => panic!("expected SelectAvailability for `{clause}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every one of these was parsed and thrown away. `LIMIT 200` returning fifty thousand rows is
+    /// the kind of wrong that only shows up in production.
+    #[test]
+    fn a_read_refuses_clauses_it_would_otherwise_ignore() {
+        let rid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        for sql in [
+            format!("SELECT * FROM bookings WHERE resource_id = '{rid}' LIMIT 200"),
+            format!("SELECT * FROM bookings WHERE resource_id = '{rid}' LIMIT 200 OFFSET 0"),
+            format!("SELECT * FROM bookings WHERE resource_id = '{rid}' ORDER BY start DESC"),
+            format!("SELECT start FROM bookings WHERE resource_id = '{rid}'"),
+            format!("SELECT DISTINCT * FROM bookings WHERE resource_id = '{rid}'"),
+            format!("SELECT * FROM holds WHERE resource_id = '{rid}' ORDER BY start"),
+            "SELECT * FROM resources ORDER BY id".to_string(),
+            format!("SELECT COUNT(*) FROM bookings WHERE resource_id = '{rid}'"),
+        ] {
+            assert!(
+                matches!(parse_sql(&sql), Err(SqlError::Unsupported(_))),
+                "must refuse rather than silently ignore: {sql}",
+            );
+        }
+
+        // Refusing is reversible; silently ignoring is not. The supported shape is untouched.
+        assert!(parse_sql(&format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).is_ok());
+    }
+
+    /// A write that reports success and changes nothing is worse than a wrong read. `SET capcity`
+    /// replied UPDATE 1, altered no field, and still appended a no-op record to the WAL.
+    #[test]
+    fn an_update_refuses_a_column_the_table_does_not_have() {
+        let rid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        for sql in [
+            format!("UPDATE resources SET capcity = 5 WHERE id = '{rid}'"),
+            format!("UPDATE resources SET nmae = 'x' WHERE id = '{rid}'"),
+            format!("UPDATE rules SET blocked = true WHERE id = '{rid}'"),
+            format!("UPDATE holds SET bookingid = '{rid}' WHERE id = '{rid}'"),
+        ] {
+            assert!(
+                matches!(parse_sql(&sql), Err(SqlError::Unsupported(_))),
+                "an unassignable column must be refused, not dropped: {sql}",
+            );
+        }
+
+        // The real spelling still works.
+        assert!(parse_sql(&format!("UPDATE resources SET capacity = 5 WHERE id = '{rid}'")).is_ok());
     }
 
     /// `rules` had the identical silent-drop bug: the old walk returned as soon as it found the id

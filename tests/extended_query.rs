@@ -232,6 +232,52 @@ async fn an_unsupported_predicate_fails_loudly_over_the_wire() {
     assert!(result.is_err(), "an unhonourable predicate must not return rows");
 }
 
+/// Over a real socket, the clauses deltat cannot honour must come back as errors rather than as a
+/// confident answer to a different question.
+///
+/// Driven through tokio-postgres rather than the SDK, because the SDK only ever sends
+/// `SELECT * FROM <table> WHERE ...`. Testing only the shapes the SDK emits is exactly what let the
+/// original silent-drop bug survive 480 tests, so the point here is to speak SQL the SDK never would.
+#[tokio::test]
+async fn clauses_the_engine_cannot_honour_fail_over_the_wire() {
+    let (addr, _tm) = start_test_server().await;
+    let client = connect(addr, "default").await;
+    let rid = create_bookable_resource(&client).await;
+
+    for sql in [
+        // A recognised column with an operator the parser skipped: this used to return slots
+        // shorter than the caller asked for.
+        format!("SELECT * FROM availability WHERE resource_id = '{rid}' AND start >= 1000 AND \"end\" <= 2000 AND min_duration > 500"),
+        // A column availability does not have.
+        format!("SELECT * FROM availability WHERE resource_id = '{rid}' AND start >= 1000 AND \"end\" <= 2000 AND label = 'x'"),
+        // Parsed and discarded: LIMIT 200 used to return every row.
+        format!("SELECT * FROM bookings WHERE resource_id = '{rid}' LIMIT 200"),
+        format!("SELECT * FROM bookings WHERE resource_id = '{rid}' ORDER BY start DESC"),
+        // A column list: the caller asked for one column and received all of them.
+        format!("SELECT start FROM bookings WHERE resource_id = '{rid}'"),
+        // A silent write failure: this replied UPDATE 1, changed nothing, and still wrote a
+        // no-op record to the WAL.
+        format!("UPDATE resources SET capcity = 5 WHERE id = '{rid}'"),
+    ] {
+        assert!(
+            client.simple_query(&sql).await.is_err(),
+            "must be refused over the wire rather than silently ignored: {sql}"
+        );
+    }
+
+    // The supported shapes still work, so this is a sharpened contract and not a blanket ban.
+    client
+        .simple_query(&format!("SELECT * FROM bookings WHERE resource_id = '{rid}'"))
+        .await
+        .expect("a plain read must still work");
+    client
+        .simple_query(&format!(
+            "SELECT * FROM availability WHERE resource_id = '{rid}' AND start >= 1000 AND \"end\" <= 2000"
+        ))
+        .await
+        .expect("a supported availability read must still work");
+}
+
 /// A refused booking must reach an ordinary Postgres client with its alternatives in the standard
 /// DETAIL field, and must not name the allocation that won.
 ///
