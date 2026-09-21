@@ -19,7 +19,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: sh scripts/check-no-ambient-time.sh
+      - run: sh scripts/check-all.sh
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib -- --skip create_resource_too_many --skip interval_limit
       - run: cargo test --test listen_notify
