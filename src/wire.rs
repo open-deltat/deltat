@@ -1079,21 +1079,18 @@ pub async fn process_connection_with_auth(
                 Action::Subscribe(Some(cmd)) => {
                     match cmd {
                         SubscriptionCommand::Subscribe(rid) => {
-                            // Prune forwarders whose task already exited (e.g. the resource was
-                            // deleted, closing the broadcast). Without this a dead entry keeps
-                            // contains_key true (a re-LISTEN silently no-ops) and counts against
-                            // MAX_SUBSCRIPTIONS_PER_CONNECTION forever. The handler's `listening`
-                            // set, which LISTEN enforces the limit on, forgets them too.
+                            // Prune forwarders whose task already exited (the resource was deleted,
+                            // closing the broadcast). Without this a dead entry keeps contains_key
+                            // true, so a re-LISTEN silently no-ops. The handler's `listening` set is
+                            // deliberately left alone here: LISTEN prunes deleted resources from it
+                            // itself, and an id pruned here may be one LISTEN just re-added for a
+                            // resource re-created under the same id, which this Subscribe is about to
+                            // forward. Forgetting it made `listening` undercount by one, so LISTEN
+                            // acknowledged one subscription past the limit that was never forwarded.
                             let forget = |rid: &Ulid| {
                                 listening.lock().unwrap_or_else(PoisonError::into_inner).remove(rid);
                             };
-                            forwarders.retain(|rid, h| {
-                                let alive = !h.is_finished();
-                                if !alive {
-                                    forget(rid);
-                                }
-                                alive
-                            });
+                            forwarders.retain(|_, h| !h.is_finished());
                             if forwarders.contains_key(&rid) {
                                 continue; // already subscribed
                             }

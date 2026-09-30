@@ -1263,6 +1263,30 @@ async fn a_deleted_resource_gives_its_listen_slot_back() {
 }
 
 #[tokio::test]
+async fn a_resource_recreated_under_its_id_keeps_the_limit_honest() {
+    // Re-creating a deleted resource's id and listening to it again once made the connection loop
+    // forget that id from `listening` while forwarding it, so LISTEN then acknowledged one
+    // subscription past the limit and the loop never forwarded it: acknowledged, then silent.
+    use deltat::limits::MAX_SUBSCRIPTIONS_PER_CONNECTION as MAX;
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let ids: Vec<Ulid> = (0..=MAX).map(|_| Ulid::new()).collect();
+    let values = ids.iter().map(|id| format!("('{id}')")).collect::<Vec<_>>().join(", ");
+    client.batch_execute(&format!("INSERT INTO resources (id) VALUES {values}")).await.unwrap();
+    for id in &ids[..MAX] {
+        client.batch_execute(&format!("LISTEN resource_{id}")).await.unwrap();
+    }
+
+    client.batch_execute(&format!("DELETE FROM resources WHERE id = '{}'", ids[0])).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await; // its forwarder sees the channel close
+    client.batch_execute(&format!("INSERT INTO resources (id) VALUES ('{}')", ids[0])).await.unwrap();
+    client.batch_execute(&format!("LISTEN resource_{}", ids[0])).await.unwrap();
+
+    let err = client.batch_execute(&format!("LISTEN resource_{}", ids[MAX])).await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("54000"), "still {MAX} live subscriptions");
+}
+
+#[tokio::test]
 async fn select_resources_by_id_returns_exactly_that_resource() {
     let (addr, _tm) = start_test_server().await;
     let (client, _) = connect(addr).await;
