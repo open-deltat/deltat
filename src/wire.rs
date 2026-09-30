@@ -530,6 +530,12 @@ impl DeltaTHandler {
                 }
                 {
                     let mut listening = self.listening.lock().unwrap_or_else(PoisonError::into_inner);
+                    // A resource deleted while listened to keeps its slot until the forwarder loop
+                    // prunes it on the next Subscribe, and a refused LISTEN never sends one. So at
+                    // the limit, forget deleted resources here before refusing.
+                    if !listening.contains(&resource_id) && listening.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                        listening.retain(|id| engine.get_resource(id).is_some());
+                    }
                     if !listening.contains(&resource_id) && listening.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
