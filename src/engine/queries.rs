@@ -237,18 +237,25 @@ impl Engine {
     pub async fn list_resources(&self) -> Vec<ResourceInfo> {
         let mut result = Vec::new();
         for rid in self.store.resource_ids() {
-            if let Some(rs) = self.store.get_resource(&rid) {
-                let guard = rs.read().await;
-                result.push(ResourceInfo {
-                    id: guard.id,
-                    parent_id: guard.parent_id,
-                    name: guard.name.clone(),
-                    capacity: guard.capacity,
-                    buffer_after: guard.buffer_after,
-                });
+            if let Some(info) = self.resource_info(&rid).await {
+                result.push(info);
             }
         }
         result
+    }
+
+    /// One resource, or None when the id is unknown. A direct lookup under that resource's read
+    /// lock alone, for existence checks that should not wait on every resource in the tenant.
+    pub async fn resource_info(&self, id: &Ulid) -> Option<ResourceInfo> {
+        let rs = self.store.get_resource(id)?;
+        let guard = rs.read().await;
+        Some(ResourceInfo {
+            id: guard.id,
+            parent_id: guard.parent_id,
+            name: guard.name.clone(),
+            capacity: guard.capacity,
+            buffer_after: guard.buffer_after,
+        })
     }
 
     pub async fn get_rules(&self, resource_id: Ulid) -> Result<Vec<RuleInfo>, EngineError> {

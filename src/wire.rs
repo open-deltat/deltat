@@ -32,7 +32,9 @@ use ulid::Ulid;
 
 use crate::auth::{DeltaTAuthSource, DeltaTStartupHandler};
 use crate::engine::Engine;
-use crate::limits::{COUNTER_OFFER_MAX, MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
+use crate::limits::{
+    COUNTER_OFFER_MAX, MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION, NOTIFY_QUEUE_PER_CONNECTION,
+};
 use crate::model::*;
 use crate::notify::{lagged_payload, Notice};
 use crate::command::{Command, ResourceFilter};
@@ -429,17 +431,16 @@ impl DeltaTHandler {
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
             Command::SelectResources { filter } => {
-                let filtered: Vec<_> = engine
-                    .list_resources()
-                    .await
-                    .into_iter()
-                    .filter(|r| match filter {
-                        ResourceFilter::All => true,
-                        ResourceFilter::Roots => r.parent_id.is_none(),
-                        ResourceFilter::ChildrenOf(pid) => r.parent_id == Some(pid),
-                        ResourceFilter::Id(id) => r.id == id,
-                    })
-                    .collect();
+                let filtered: Vec<_> = match filter {
+                    ResourceFilter::Id(id) => engine.resource_info(&id).await.into_iter().collect(),
+                    ResourceFilter::All => engine.list_resources().await,
+                    ResourceFilter::Roots => {
+                        engine.list_resources().await.into_iter().filter(|r| r.parent_id.is_none()).collect()
+                    }
+                    ResourceFilter::ChildrenOf(pid) => {
+                        engine.list_resources().await.into_iter().filter(|r| r.parent_id == Some(pid)).collect()
+                    }
+                };
 
                 Ok(encode_rows(Arc::new(resources_schema()), filtered, |e, r| {
                     e.encode_field(&r.id.to_string())?;
@@ -840,22 +841,27 @@ fn substitute_params(portal: &Portal<String>) -> String {
 /// Forward one resource's broadcast events to the connection's notification channel as pgwire
 /// `NotificationResponse`s.
 ///
-/// A `Lagged` error means the subscriber briefly fell behind the bounded broadcast ring and lost
-/// some events. It must NOT end the subscription. Ending it would let a transient burst silently
-/// kill the live stream forever; instead we keep forwarding subsequent events. The loss itself is
-/// sent as a `Lagged` notification: a listener cannot tell a gap from a quiet stream, and one that
-/// keeps a running picture (who holds what, which time is free) would otherwise carry on from a
-/// state that is already wrong. Only `Closed` (all senders dropped, e.g. the resource was deleted)
-/// ends the forwarder.
+/// A `Lagged` error means the subscriber fell behind the bounded broadcast ring and lost some
+/// events. It must NOT end the subscription. Ending it would let a transient burst silently kill
+/// the live stream forever; instead we keep forwarding subsequent events. The loss itself is sent
+/// as a `Lagged` notification: a listener cannot tell a gap from a quiet stream, and one that keeps
+/// a running picture (who holds what, which time is free) would otherwise carry on from a state
+/// that is already wrong.
+///
+/// `tx` is the connection's bounded queue to its socket. A client that stops reading fills it, the
+/// `send` below waits, this forwarder falls behind the ring, and the client is told `Lagged` once it
+/// reads again. That is how a slow reader, not only a starved forwarder, learns about its gap, and
+/// why the server's memory per connection stays bounded. Only `Closed` (all senders dropped, e.g.
+/// the resource was deleted) ends the forwarder.
 async fn forward_resource_events(
     mut rx: tokio::sync::broadcast::Receiver<Notice>,
-    tx: mpsc::UnboundedSender<NotificationResponse>,
+    tx: mpsc::Sender<NotificationResponse>,
     channel: String,
 ) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
         let payload = match rx.recv().await {
-            Ok(notice) => notice.to_payload(),
+            Ok(notice) => notice.payload().to_string(),
             Err(RecvError::Lagged(missed)) => {
                 metrics::counter!(crate::observability::NOTIFICATIONS_LAGGED_TOTAL)
                     .increment(missed);
@@ -865,6 +871,7 @@ async fn forward_resource_events(
         };
         if tx
             .send(NotificationResponse::new(0, channel.clone(), payload))
+            .await
             .is_err()
         {
             break;
@@ -918,7 +925,7 @@ pub async fn process_connection_with_auth(
 
     // 2. Per-connection channels
     let (subscribe_tx, mut subscribe_rx) = mpsc::unbounded_channel::<SubscriptionCommand>();
-    let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<NotificationResponse>();
+    let (notify_tx, mut notify_rx) = mpsc::channel::<NotificationResponse>(NOTIFY_QUEUE_PER_CONNECTION);
 
     // 3. Per-connection handlers
     let auth_handler = Arc::new(DeltaTStartupHandler::new(auth_source));
@@ -1359,7 +1366,7 @@ mod tests {
         // it two behind. The old `while let Ok(..)` ended the task on that Lagged and dropped the
         // stream forever; the fix continues and still forwards the surviving event.
         let (btx, brx) = broadcast::channel::<Notice>(1);
-        let (mtx, mut mrx) = mpsc::unbounded_channel();
+        let (mtx, mut mrx) = mpsc::channel(16);
         let mk = || {
             Notice::of(&Event::BookingConfirmed {
                 id: Ulid::new(),
@@ -1386,7 +1393,49 @@ mod tests {
             .await
             .expect("forwarder must not hang")
             .expect("and keep forwarding after it");
-        assert_eq!(after.payload, survivor.to_payload());
+        assert_eq!(after.payload, *survivor.payload());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_bounded_and_told_what_it_missed() {
+        use tokio::sync::broadcast;
+        // The slow-reader case the ring alone never catches: the forwarder drains the ring into the
+        // connection's queue, so with an unbounded queue a client that stops reading grows server
+        // memory and never lags. With a bounded queue the forwarder waits, falls behind the ring,
+        // and the client hears Lagged once it reads again.
+        const RING: usize = 4;
+        const QUEUE: usize = 2;
+        const SENT: usize = 20;
+        let (btx, brx) = broadcast::channel::<Notice>(RING);
+        let (mtx, mut mrx) = mpsc::channel(QUEUE);
+        tokio::spawn(forward_resource_events(brx, mtx, "resource_x".into()));
+
+        let rid = Ulid::new();
+        let sent: Vec<Notice> = (0..SENT)
+            .map(|i| {
+                let start = 1000 + i as i64 * 1000;
+                Notice::of(&Event::HoldPlaced { id: Ulid::new(), resource_id: rid, span: Span::new(start, start + 500), expires_at: 1 })
+            })
+            .collect();
+        for notice in &sent {
+            let _ = btx.send(notice.clone());
+            tokio::task::yield_now().await; // let the forwarder run, as a live server would
+        }
+
+        // The client reads only now. The queue held at most QUEUE, so the server never buffered
+        // more than QUEUE + RING notifications for it.
+        let mut got = Vec::new();
+        while let Ok(Some(n)) = tokio::time::timeout(Duration::from_millis(200), mrx.recv()).await {
+            got.push(n.payload);
+        }
+        let lagged: Vec<u64> = got
+            .iter()
+            .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok()?["Lagged"]["missed"].as_u64())
+            .collect();
+        let delivered = got.len() - lagged.len();
+        assert!(!lagged.is_empty(), "a reader that fell behind must be told: {got:?}");
+        assert_eq!(delivered as u64 + lagged.iter().sum::<u64>(), SENT as u64, "every notice is either delivered or counted as missed");
+        assert_eq!(got.last().map(|p| p.as_str()), Some(&*sent[SENT - 1].payload()), "the newest change still arrives");
     }
 
     // ── enforce_query_len ────────────────────────────────────────
@@ -2261,7 +2310,7 @@ mod tests {
             block_on(async {
                 use tokio::sync::broadcast;
                 let (btx, brx) = broadcast::channel::<Notice>(1);
-                let (mtx, mut mrx) = mpsc::unbounded_channel();
+                let (mtx, mut mrx) = mpsc::channel(16);
                 let mk = || {
                     Notice::of(&Event::BookingConfirmed {
                         id: Ulid::new(),

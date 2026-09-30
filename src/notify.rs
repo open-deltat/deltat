@@ -5,6 +5,8 @@
 //! writers, and is told so with a `Lagged` notification (see `lagged_payload`), so it knows to
 //! re-read authoritative state instead of trusting the stream.
 
+use std::sync::Arc;
+
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -42,42 +44,67 @@ pub struct Ended {
 ///
 /// `Event` is the WAL record format (bincode, no schema version), so it cannot grow fields without
 /// making existing logs unreadable. The extra facts ride here, on the notification only.
+///
+/// The JSON payload is built once, here, and shared by every subscriber's forwarder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub event: Event,
     pub ended: Option<Ended>,
+    payload: Arc<str>,
+}
+
+/// `{"<Variant>": {"id": .., "resource_id": .., <Ended fields>}}` for an event that ended a hold or
+/// booking. Typed structs rather than a `serde_json::Value`, so fields keep their declared order
+/// (a Value map sorts keys) and the old fields come first, exactly where they always were.
+#[derive(Serialize)]
+struct Ending<'a> {
+    id: &'a Ulid,
+    resource_id: &'a Ulid,
+    #[serde(flatten)]
+    ended: &'a Ended,
+}
+
+#[derive(Serialize)]
+enum EndedPayload<'a> {
+    HoldReleased(Ending<'a>),
+    BookingCancelled(Ending<'a>),
+}
+
+fn payload_of(event: &Event, ended: Option<&Ended>) -> Arc<str> {
+    let json = match (event, ended) {
+        (Event::HoldReleased { id, resource_id }, Some(ended)) => {
+            serde_json::to_string(&EndedPayload::HoldReleased(Ending { id, resource_id, ended }))
+        }
+        (Event::BookingCancelled { id, resource_id }, Some(ended)) => {
+            serde_json::to_string(&EndedPayload::BookingCancelled(Ending { id, resource_id, ended }))
+        }
+        _ => serde_json::to_string(event),
+    };
+    json.unwrap_or_default().into()
 }
 
 impl Notice {
     pub fn of(event: &Event) -> Self {
-        Self { event: event.clone(), ended: None }
+        Self { event: event.clone(), ended: None, payload: payload_of(event, None) }
     }
 
+    /// `ended` only reaches the payload for the events it describes (`HoldReleased`,
+    /// `BookingCancelled`); any other event goes out exactly as `Notice::of` would send it.
     pub fn ended(event: &Event, ended: Ended) -> Self {
-        Self { event: event.clone(), ended: Some(ended) }
+        let payload = payload_of(event, Some(&ended));
+        Self { event: event.clone(), ended: Some(ended), payload }
     }
 
-    /// The JSON payload: the event in exactly the shape it always had, with the `Ended` fields added
-    /// inside the variant's object. A client that does not know them reads what it always read.
-    pub fn to_payload(&self) -> String {
-        let Ok(mut value) = serde_json::to_value(&self.event) else {
-            return String::new();
-        };
-        if let Some(ended) = &self.ended {
-            let inner = value
-                .as_object_mut()
-                .and_then(|outer| outer.values_mut().next())
-                .and_then(|v| v.as_object_mut());
-            if let (Some(inner), Ok(serde_json::Value::Object(extra))) = (inner, serde_json::to_value(ended)) {
-                inner.extend(extra);
-            }
-        }
-        value.to_string()
+    /// The JSON payload: the event in the shape it always had, keys in the same order, with the
+    /// `Ended` fields appended inside the variant's object for an ending. A client that does not
+    /// know them reads what it always read.
+    pub fn payload(&self) -> Arc<str> {
+        self.payload.clone()
     }
 }
 
-/// Sent instead of silence when a subscriber fell behind the ring and `missed` notifications were
-/// dropped, so it knows the stream has a hole and re-reads state rather than trusting what it has.
+/// Sent instead of silence when a subscriber fell behind and `missed` notifications were dropped,
+/// so it knows the stream has a hole and re-reads state rather than trusting what it has.
 pub fn lagged_payload(missed: u64) -> String {
     serde_json::json!({ "Lagged": { "missed": missed } }).to_string()
 }
@@ -210,14 +237,36 @@ mod tests {
     // both halves of it: old fields exactly where they were, new fields only where they are due.
 
     fn parsed(notice: &Notice) -> serde_json::Value {
-        serde_json::from_str(&notice.to_payload()).unwrap()
+        serde_json::from_str(&notice.payload()).unwrap()
     }
 
     #[test]
-    fn a_plain_notice_is_the_event_unchanged() {
+    fn a_plain_notice_is_the_event_byte_for_byte() {
+        // Compared as bytes, not parsed values: a client may string-match or prefix-scan payloads,
+        // and a parsed comparison would not notice keys changing order.
         let rid = Ulid::new();
         let event = Event::HoldPlaced { id: rid, resource_id: rid, span: Span::new(1000, 2000), expires_at: 5000 };
-        assert_eq!(parsed(&Notice::of(&event)), serde_json::to_value(&event).unwrap());
+        assert_eq!(&*Notice::of(&event).payload(), serde_json::to_string(&event).unwrap());
+    }
+
+    #[test]
+    fn an_ending_keeps_the_old_fields_first_in_their_old_order() {
+        let (hid, rid) = (Ulid::new(), Ulid::new());
+        let event = Event::HoldReleased { id: hid, resource_id: rid };
+        let before = serde_json::to_string(&event).unwrap(); // {"HoldReleased":{"id":..,"resource_id":..}}
+        let ended = Ended { span: Span::new(1000, 2000), reason: Some(HoldEnd::Released), booking_id: None };
+        let payload = Notice::ended(&event, ended).payload();
+        let old_prefix = &before[..before.len() - 2]; // without the closing "}}"
+        assert!(payload.starts_with(old_prefix), "{payload} must start with {old_prefix}");
+        assert!(payload.ends_with(r#","span":{"start":1000,"end":2000},"reason":"released"}}"#), "{payload}");
+    }
+
+    #[test]
+    fn ended_facts_on_an_event_they_do_not_describe_are_not_sent() {
+        let rid = Ulid::new();
+        let event = Event::ResourceDeleted { id: rid };
+        let ended = Ended { span: Span::new(1000, 2000), reason: None, booking_id: None };
+        assert_eq!(&*Notice::ended(&event, ended).payload(), serde_json::to_string(&event).unwrap());
     }
 
     #[test]

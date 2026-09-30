@@ -15,14 +15,22 @@ All notable changes to deltat are documented here. The format follows
   before it read as "booked". The fields are added inside the existing variant object, so a client
   that does not know them reads exactly the payload it always did. They are notification-only: the
   WAL record format is unchanged.
-- **A lagging listener is told.** When a subscriber falls behind the 256-entry broadcast ring, it now
-  receives `{"Lagged": {"missed": N}}` in place of the dropped notifications, instead of only a metric
+- **A lagging listener is told.** When a subscriber falls behind, it now receives
+  `{"Lagged": {"missed": N}}` in place of the dropped notifications, instead of only a metric
   increment. A client that keeps a running picture of a calendar could not otherwise tell a gap from
-  a quiet stream.
-- **`SELECT * FROM resources WHERE id = '...'`.** An existence check for one resource. Reads of an
-  unknown resource's availability, holds or bookings come back empty rather than as an error, so a
-  client that wants to tell "wrong id" from "empty calendar" previously had to fetch every resource
-  in the tenant. Any other resources filter is still refused rather than ignored.
+  a quiet stream. This covers a client that stops reading, too: each connection's queue of pending
+  notifications is now bounded (`NOTIFY_QUEUE_PER_CONNECTION`, 1024), so a slow reader makes its
+  forwarders fall behind the ring and is told, where before the server queued for it without limit.
+- **`SELECT * FROM resources WHERE id = '...'`.** An existence check for one resource, answered by a
+  direct lookup under that resource's lock alone. Reads of an unknown resource's availability, holds
+  or bookings come back empty rather than as an error, so a client that wants to tell "wrong id" from
+  "empty calendar" previously had to fetch every resource in the tenant. Any other resources filter
+  is still refused rather than ignored.
+
+### Changed
+- Notification payloads are serialized once per change and shared by every subscriber, instead of
+  once per subscriber. Their bytes are unchanged for every event except the endings above, which
+  append their new fields after `id` and `resource_id`.
 
 - **A refusal now says when, not just no.** When a hold or booking is refused because the span is
   taken, the resource is at capacity, or the time is outside open hours, the same error carries up
