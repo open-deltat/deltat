@@ -4,9 +4,9 @@
 //! forwarding. A parsed [`crate::command::Command`] becomes engine calls whose rows it encodes,
 //! and this is where a connection's lifetime and subscription limits are enforced.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,9 +32,12 @@ use ulid::Ulid;
 
 use crate::auth::{DeltaTAuthSource, DeltaTStartupHandler};
 use crate::engine::Engine;
-use crate::limits::{COUNTER_OFFER_MAX, MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
+use crate::limits::{
+    COUNTER_OFFER_MAX, MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION, NOTIFY_QUEUE_PER_CONNECTION,
+};
 use crate::model::*;
-use crate::command::Command;
+use crate::notify::{lagged_payload, Notice};
+use crate::command::{Command, ResourceFilter};
 use crate::sql;
 use crate::tenant::TenantManager;
 
@@ -50,6 +53,11 @@ pub struct DeltaTHandler {
     tenant_manager: Arc<TenantManager>,
     query_parser: Arc<DeltaTQueryParser>,
     subscribe_tx: Option<mpsc::UnboundedSender<SubscriptionCommand>>,
+    /// Resources this connection LISTENs to, shared with its connection loop. LISTEN is answered
+    /// here, before the loop creates the forwarder, so the per-connection limit has to be enforced
+    /// here too: the loop enforcing it alone meant a LISTEN over the limit answered success and
+    /// then silently delivered nothing.
+    listening: Arc<Mutex<HashSet<Ulid>>>,
     slow_query_threshold_ms: u64,
     /// How many alternative spans a refusal may carry. `0` disables the feature entirely, which is
     /// the kill switch: an error then looks exactly as it did before this existed.
@@ -67,6 +75,7 @@ impl DeltaTHandler {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: None,
+            listening: Arc::default(),
             slow_query_threshold_ms: 0,
             counter_offer_limit: Self::configured_counter_offer_limit(),
         }
@@ -80,9 +89,16 @@ impl DeltaTHandler {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: Some(subscribe_tx),
+            listening: Arc::default(),
             slow_query_threshold_ms: 0,
             counter_offer_limit: Self::configured_counter_offer_limit(),
         }
+    }
+
+    /// The set of resources this connection LISTENs to, for the connection loop to keep in step
+    /// when a forwarder ends (its resource was deleted) or cannot be started.
+    pub fn listening(&self) -> Arc<Mutex<HashSet<Ulid>>> {
+        self.listening.clone()
     }
 
     pub fn with_slow_query_threshold(mut self, threshold_ms: u64) -> Self {
@@ -427,12 +443,16 @@ impl DeltaTHandler {
                     .await?;
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
-            Command::SelectResources { parent_id } => {
-                let all = engine.list_resources().await;
-                let filtered: Vec<_> = match parent_id {
-                    None => all,
-                    Some(None) => all.into_iter().filter(|r| r.parent_id.is_none()).collect(),
-                    Some(Some(pid)) => all.into_iter().filter(|r| r.parent_id == Some(pid)).collect(),
+            Command::SelectResources { filter } => {
+                let filtered: Vec<_> = match filter {
+                    ResourceFilter::Id(id) => engine.resource_info(&id).await.into_iter().collect(),
+                    ResourceFilter::All => engine.list_resources().await,
+                    ResourceFilter::Roots => {
+                        engine.list_resources().await.into_iter().filter(|r| r.parent_id.is_none()).collect()
+                    }
+                    ResourceFilter::ChildrenOf(pid) => {
+                        engine.list_resources().await.into_iter().filter(|r| r.parent_id == Some(pid)).collect()
+                    }
                 };
 
                 Ok(encode_rows(Arc::new(resources_schema()), filtered, |e, r| {
@@ -508,6 +528,26 @@ impl DeltaTHandler {
                     )))
                     .into());
                 }
+                {
+                    let mut listening = self.listening.lock().unwrap_or_else(PoisonError::into_inner);
+                    // A resource deleted while listened to keeps its slot until the forwarder loop
+                    // prunes it on the next Subscribe, and a refused LISTEN never sends one. So at
+                    // the limit, forget deleted resources here before refusing.
+                    if !listening.contains(&resource_id) && listening.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                        listening.retain(|id| engine.get_resource(id).is_some());
+                    }
+                    if !listening.contains(&resource_id) && listening.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "54000".into(),
+                            format!(
+                                "this connection already listens to {MAX_SUBSCRIPTIONS_PER_CONNECTION} resources; UNLISTEN one or open another connection"
+                            ),
+                        )))
+                        .into());
+                    }
+                    listening.insert(resource_id);
+                }
                 if let Some(ref tx) = self.subscribe_tx {
                     let _ = tx.send(SubscriptionCommand::Subscribe(resource_id));
                 }
@@ -515,12 +555,14 @@ impl DeltaTHandler {
             }
             Command::Unlisten { channel } => {
                 let resource_id = Self::parse_channel_resource_id(&channel)?;
+                self.listening.lock().unwrap_or_else(PoisonError::into_inner).remove(&resource_id);
                 if let Some(ref tx) = self.subscribe_tx {
                     let _ = tx.send(SubscriptionCommand::Unsubscribe(resource_id));
                 }
                 Ok(vec![Response::Execution(Tag::new("UNLISTEN"))])
             }
             Command::UnlistenAll => {
+                self.listening.lock().unwrap_or_else(PoisonError::into_inner).clear();
                 if let Some(ref tx) = self.subscribe_tx {
                     let _ = tx.send(SubscriptionCommand::UnsubscribeAll);
                 }
@@ -834,33 +876,40 @@ fn substitute_params(portal: &Portal<String>) -> String {
 /// Forward one resource's broadcast events to the connection's notification channel as pgwire
 /// `NotificationResponse`s.
 ///
-/// A `Lagged` error means the subscriber briefly fell behind the bounded broadcast ring and lost
-/// some events. It must NOT end the subscription. Ending it would let a transient burst silently
-/// kill the live stream forever; instead we keep forwarding subsequent events (the listener
-/// re-reads authoritative state on the next one; availability is never derived from the stream).
-/// Only `Closed` (all senders dropped, e.g. the resource was deleted) ends the forwarder.
+/// A `Lagged` error means the subscriber fell behind the bounded broadcast ring and lost some
+/// events. It must NOT end the subscription. Ending it would let a transient burst silently kill
+/// the live stream forever; instead we keep forwarding subsequent events. The loss itself is sent
+/// as a `Lagged` notification: a listener cannot tell a gap from a quiet stream, and one that keeps
+/// a running picture (who holds what, which time is free) would otherwise carry on from a state
+/// that is already wrong.
+///
+/// `tx` is the connection's bounded queue to its socket. A client that stops reading fills it, the
+/// `send` below waits, this forwarder falls behind the ring, and the client is told `Lagged` once it
+/// reads again. That is how a slow reader, not only a starved forwarder, learns about its gap, and
+/// why the server's memory per connection stays bounded. Only `Closed` (all senders dropped, e.g.
+/// the resource was deleted) ends the forwarder.
 async fn forward_resource_events(
-    mut rx: tokio::sync::broadcast::Receiver<Event>,
-    tx: mpsc::UnboundedSender<NotificationResponse>,
+    mut rx: tokio::sync::broadcast::Receiver<Notice>,
+    tx: mpsc::Sender<NotificationResponse>,
     channel: String,
 ) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let payload = serde_json::to_string(&event).unwrap_or_default();
-                if tx
-                    .send(NotificationResponse::new(0, channel.clone(), payload))
-                    .is_err()
-                {
-                    break;
-                }
-            }
+        let payload = match rx.recv().await {
+            Ok(notice) => notice.payload().to_string(),
             Err(RecvError::Lagged(missed)) => {
                 metrics::counter!(crate::observability::NOTIFICATIONS_LAGGED_TOTAL)
                     .increment(missed);
+                lagged_payload(missed)
             }
             Err(RecvError::Closed) => break,
+        };
+        if tx
+            .send(NotificationResponse::new(0, channel.clone(), payload))
+            .await
+            .is_err()
+        {
+            break;
         }
     }
 }
@@ -911,7 +960,7 @@ pub async fn process_connection_with_auth(
 
     // 2. Per-connection channels
     let (subscribe_tx, mut subscribe_rx) = mpsc::unbounded_channel::<SubscriptionCommand>();
-    let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<NotificationResponse>();
+    let (notify_tx, mut notify_rx) = mpsc::channel::<NotificationResponse>(NOTIFY_QUEUE_PER_CONNECTION);
 
     // 3. Per-connection handlers
     let auth_handler = Arc::new(DeltaTStartupHandler::new(auth_source));
@@ -919,6 +968,7 @@ pub async fn process_connection_with_auth(
         DeltaTHandler::with_subscriptions(tenant_manager.clone(), subscribe_tx)
             .with_slow_query_threshold(slow_query_ms),
     );
+    let listening = handler.listening();
     let noop = Arc::new(NoopHandler);
 
     // 4. Forwarder tasks state
@@ -1029,28 +1079,46 @@ pub async fn process_connection_with_auth(
                 Action::Subscribe(Some(cmd)) => {
                     match cmd {
                         SubscriptionCommand::Subscribe(rid) => {
-                            // Prune forwarders whose task already exited (e.g. the resource was
-                            // deleted, closing the broadcast). Without this a dead entry keeps
-                            // contains_key true (a re-LISTEN silently no-ops) and counts against
-                            // MAX_SUBSCRIPTIONS_PER_CONNECTION forever.
+                            // Prune forwarders whose task already exited (the resource was deleted,
+                            // closing the broadcast). Without this a dead entry keeps contains_key
+                            // true, so a re-LISTEN silently no-ops. The handler's `listening` set is
+                            // deliberately left alone here: LISTEN prunes deleted resources from it
+                            // itself, and an id pruned here may be one LISTEN just re-added for a
+                            // resource re-created under the same id, which this Subscribe is about to
+                            // forward. Forgetting it made `listening` undercount by one, so LISTEN
+                            // acknowledged one subscription past the limit that was never forwarded.
+                            let forget = |rid: &Ulid| {
+                                listening.lock().unwrap_or_else(PoisonError::into_inner).remove(rid);
+                            };
                             forwarders.retain(|_, h| !h.is_finished());
                             if forwarders.contains_key(&rid) {
                                 continue; // already subscribed
                             }
-                            if forwarders.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
-                                continue; // limit reached
-                            }
                             // Resolve the engine to get the notify hub
                             let engine = match handler.resolve_engine(&socket) {
                                 Ok((e, _)) => e,
-                                Err(_) => continue,
+                                Err(_) => {
+                                    forget(&rid);
+                                    continue;
+                                }
                             };
                             // Defense in depth against a delete racing between the LISTEN's
                             // existence check and this Subscribe: never recreate a broadcast channel
                             // for a resource that no longer exists (it would leak, since only delete
                             // reclaims it).
                             if engine.get_resource(&rid).is_none() {
+                                forget(&rid);
                                 continue;
+                            }
+                            // Counted the way LISTEN counts `listening`: resources that still exist.
+                            // A deleted resource's forwarder is left to finish on its own, since it
+                            // may still have the ResourceDeleted notice to deliver, but it no longer
+                            // takes a slot. Counting it here and not there acknowledged a LISTEN and
+                            // then skipped it, which delivers nothing and says nothing.
+                            let live = forwarders.keys().filter(|id| engine.get_resource(id).is_some()).count();
+                            if live >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                                forget(&rid);
+                                continue; // LISTEN refuses before this can happen
                             }
                             let rx = engine.notify.subscribe(rid);
                             let tx = notify_tx.clone();
@@ -1351,26 +1419,77 @@ mod tests {
         // channel() time, then three sends overflow the ring before the forwarder drains, leaving
         // it two behind. The old `while let Ok(..)` ended the task on that Lagged and dropped the
         // stream forever; the fix continues and still forwards the surviving event.
-        let (btx, brx) = broadcast::channel::<Event>(1);
-        let (mtx, mut mrx) = mpsc::unbounded_channel();
-        let mk = || Event::BookingConfirmed {
-            id: Ulid::new(),
-            resource_id: Ulid::new(),
-            span: Span::new(1000, 2000),
-            label: None,
+        let (btx, brx) = broadcast::channel::<Notice>(1);
+        let (mtx, mut mrx) = mpsc::channel(16);
+        let mk = || {
+            Notice::of(&Event::BookingConfirmed {
+                id: Ulid::new(),
+                resource_id: Ulid::new(),
+                span: Span::new(1000, 2000),
+                label: None,
+            })
         };
         btx.send(mk()).unwrap();
         btx.send(mk()).unwrap();
-        btx.send(mk()).unwrap(); // receiver now 2 behind a cap-1 ring → next recv() is Lagged
+        let survivor = mk();
+        btx.send(survivor.clone()).unwrap(); // receiver now 2 behind a cap-1 ring → next recv() is Lagged
 
         tokio::spawn(forward_resource_events(brx, mtx, "resource_x".into()));
 
-        let got = tokio::time::timeout(Duration::from_secs(1), mrx.recv())
+        // The gap is announced, not swallowed: a listener keeping a running picture must learn
+        // that it is stale. The old behavior only counted it in a metric.
+        let gap = tokio::time::timeout(Duration::from_secs(1), mrx.recv())
             .await
-            .expect("forwarder must not hang");
-        // Some(_) only if the forwarder survived the Lagged; the old behavior dropped the sender
-        // and recv() would return None.
-        assert!(got.is_some(), "forwarder must survive a broadcast Lagged and keep forwarding");
+            .expect("forwarder must not hang")
+            .expect("forwarder must survive a broadcast Lagged");
+        assert_eq!(gap.payload, lagged_payload(2));
+        let after = tokio::time::timeout(Duration::from_secs(1), mrx.recv())
+            .await
+            .expect("forwarder must not hang")
+            .expect("and keep forwarding after it");
+        assert_eq!(after.payload, *survivor.payload());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_bounded_and_told_what_it_missed() {
+        use tokio::sync::broadcast;
+        // The slow-reader case the ring alone never catches: the forwarder drains the ring into the
+        // connection's queue, so with an unbounded queue a client that stops reading grows server
+        // memory and never lags. With a bounded queue the forwarder waits, falls behind the ring,
+        // and the client hears Lagged once it reads again.
+        const RING: usize = 4;
+        const QUEUE: usize = 2;
+        const SENT: usize = 20;
+        let (btx, brx) = broadcast::channel::<Notice>(RING);
+        let (mtx, mut mrx) = mpsc::channel(QUEUE);
+        tokio::spawn(forward_resource_events(brx, mtx, "resource_x".into()));
+
+        let rid = Ulid::new();
+        let sent: Vec<Notice> = (0..SENT)
+            .map(|i| {
+                let start = 1000 + i as i64 * 1000;
+                Notice::of(&Event::HoldPlaced { id: Ulid::new(), resource_id: rid, span: Span::new(start, start + 500), expires_at: 1 })
+            })
+            .collect();
+        for notice in &sent {
+            let _ = btx.send(notice.clone());
+            tokio::task::yield_now().await; // let the forwarder run, as a live server would
+        }
+
+        // The client reads only now. The queue held at most QUEUE, so the server never buffered
+        // more than QUEUE + RING notifications for it.
+        let mut got = Vec::new();
+        while let Ok(Some(n)) = tokio::time::timeout(Duration::from_millis(200), mrx.recv()).await {
+            got.push(n.payload);
+        }
+        let lagged: Vec<u64> = got
+            .iter()
+            .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok()?["Lagged"]["missed"].as_u64())
+            .collect();
+        let delivered = got.len() - lagged.len();
+        assert!(!lagged.is_empty(), "a reader that fell behind must be told: {got:?}");
+        assert_eq!(delivered as u64 + lagged.iter().sum::<u64>(), SENT as u64, "every notice is either delivered or counted as missed");
+        assert_eq!(got.last().map(|p| p.as_str()), Some(&*sent[SENT - 1].payload()), "the newest change still arrives");
     }
 
     // ── enforce_query_len ────────────────────────────────────────
@@ -2244,13 +2363,15 @@ mod tests {
         let (log, ()) = with_metrics(|| {
             block_on(async {
                 use tokio::sync::broadcast;
-                let (btx, brx) = broadcast::channel::<Event>(1);
-                let (mtx, mut mrx) = mpsc::unbounded_channel();
-                let mk = || Event::BookingConfirmed {
-                    id: Ulid::new(),
-                    resource_id: Ulid::new(),
-                    span: Span::new(1000, 2000),
-                    label: None,
+                let (btx, brx) = broadcast::channel::<Notice>(1);
+                let (mtx, mut mrx) = mpsc::channel(16);
+                let mk = || {
+                    Notice::of(&Event::BookingConfirmed {
+                        id: Ulid::new(),
+                        resource_id: Ulid::new(),
+                        span: Span::new(1000, 2000),
+                        label: None,
+                    })
                 };
                 btx.send(mk()).unwrap();
                 btx.send(mk()).unwrap();

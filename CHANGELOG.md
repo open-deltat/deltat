@@ -7,6 +7,26 @@ All notable changes to deltat are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **An ending says when it was and why.** `HoldReleased` and `BookingCancelled` notifications now
+  carry the `span` that ended, and a released hold says `"reason"`: `"released"` (a DELETE),
+  `"expired"` (the reaper) or `"committed"` (turned into a booking, with that `"booking_id"`; its
+  `BookingConfirmed` follows). Before, both arrived as a bare id whose interval was already gone, so
+  a subscriber could not say which time had become free, and a commit read as "free" an instant
+  before it read as "booked". The fields are added inside the existing variant object, so a client
+  that does not know them reads exactly the payload it always did. They are notification-only: the
+  WAL record format is unchanged.
+- **A lagging listener is told.** When a subscriber falls behind, it now receives
+  `{"Lagged": {"missed": N}}` in place of the dropped notifications, instead of only a metric
+  increment. A client that keeps a running picture of a calendar could not otherwise tell a gap from
+  a quiet stream. This covers a client that stops reading, too: each connection's queue of pending
+  notifications is now bounded (`NOTIFY_QUEUE_PER_CONNECTION`, 1024), so a slow reader makes its
+  forwarders fall behind the ring and is told, where before the server queued for it without limit.
+- **`SELECT * FROM resources WHERE id = '...'`.** An existence check for one resource, answered by a
+  direct lookup under that resource's lock alone. Reads of an unknown resource's availability, holds
+  or bookings come back empty rather than as an error, so a client that wants to tell "wrong id" from
+  "empty calendar" previously had to fetch every resource in the tenant. Any other resources filter
+  is still refused rather than ignored.
+
 - **A refusal now says when, not just no.** When a hold or booking is refused because the span is
   taken, the resource is at capacity, or the time is outside open hours, the same error carries up
   to three spans of the same duration that were free at that instant, in the standard PostgreSQL
@@ -43,6 +63,11 @@ All notable changes to deltat are documented here. The format follows
   spans themselves belong in `DETAIL` where a client can parse them.
 
 ### Fixed
+- **A LISTEN over the per-connection limit is refused instead of silently ignored.** It used to
+  answer success and then never deliver anything, because the limit
+  (`MAX_SUBSCRIPTIONS_PER_CONNECTION`, 100) was only checked later, when the forwarder was set up.
+  It now fails with SQLSTATE `54000`; listening again to a resource already listened to still
+  succeeds.
 - **`WHERE` clauses on `bookings` and `holds` reads are honoured instead of silently dropped.**
   `SELECT * FROM bookings WHERE resource_id = 'X' AND start >= 1000 AND "end" <= 2000` used to
   return *every* booking on the resource, with a success code and no warning: the parser collected
@@ -143,6 +168,10 @@ All notable changes to deltat are documented here. The format follows
   to commit.
 
 ### Changed
+- Notification payloads are serialized at most once per change, on first use, and shared by every
+  subscriber, instead of once per subscriber; a change nobody listens to is never serialized. Their
+  bytes are unchanged for every event except the endings described under Added, which append their
+  new fields after `id` and `resource_id`.
 - **Breaking, in the honest direction:** a read whose `WHERE` clause previously "worked" by having
   part of itself discarded now fails with `unsupported`. Any caller relying on that silence was
   already receiving rows that did not match what it asked for.

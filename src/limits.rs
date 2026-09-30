@@ -46,3 +46,7 @@ pub const MAX_QUERY_LEN: usize = 1_048_576; // 1MB
 /// hostile input and is rejected before it can size an allocation.
 pub const MAX_PARAMS: usize = 65_535;
 pub const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 100;
+/// Notifications a connection may have waiting to be written to its socket. When a client stops
+/// reading, its forwarders wait on this queue, fall behind the broadcast ring, and the client gets a
+/// `Lagged` notification once it reads again, instead of the server queueing for it without limit.
+pub const NOTIFY_QUEUE_PER_CONNECTION: usize = 1024;

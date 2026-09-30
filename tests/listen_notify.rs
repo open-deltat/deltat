@@ -942,9 +942,15 @@ async fn setup_held_span(client: &tokio_postgres::Client) -> (Ulid, Ulid) {
         .await
         .unwrap();
     let expires = client_now_ms() + 60_000;
+    // A live span, for the reason reordered_booking_insert_round_trips gives: the commit tests turn
+    // this hold into a booking, and a booking ending in 1970 can lose a race with the GC first tick
+    // (7-day retention) and vanish before the SELECT. commit_hold_via_simple_query failed that way
+    // once in CI on 30.09.2026 and passed on rerun.
+    let start = client_now_ms() + 3_600_000;
+    let end = start + 1000;
     client
         .batch_execute(&format!(
-            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {expires})"#
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', {start}, {end}, {expires})"#
         ))
         .await
         .unwrap();
@@ -1132,4 +1138,166 @@ async fn reordered_booking_insert_round_trips() {
     assert_eq!(rows.len(), 1, "the booking must land on the declared resource");
     assert_eq!(rows[0].0, bid.to_string(), "the booking must carry the declared id");
     assert_eq!(rows[0].1, "swapped");
+}
+
+/// The next notification's payload as JSON, failing the test if none arrives.
+async fn next_payload(rx: &mut mpsc::UnboundedReceiver<Notification>) -> serde_json::Value {
+    let n = recv_notification(rx, Duration::from_secs(5)).await.expect("expected a notification");
+    serde_json::from_str(n.payload()).expect("payload is JSON")
+}
+
+#[tokio::test]
+async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
+    // What an SDK actually receives. Before this, a released hold and a cancelled booking arrived as
+    // a bare id, and a commit's release was indistinguishable from a plain release, so every client
+    // announced the span as free in the instant before the booking.
+    let (addr, _tm) = start_test_server().await;
+    let (listener, mut rx) = connect(addr).await;
+    let (client, _) = connect(addr).await;
+    let rid = Ulid::new();
+    // Spans in the future: the tenant's GC deletes intervals that ended before its retention
+    // cutoff and first runs as the tenant starts, so a 1970 span could vanish mid-test.
+    let t0 = client_now_ms() + 86_400_000;
+    let expires = client_now_ms() + 60_000;
+    let span = |start: i64| serde_json::json!({ "start": start, "end": start + 1000 });
+    client
+        .batch_execute(&format!("INSERT INTO resources (id, capacity) VALUES ('{rid}', 5)"))
+        .await
+        .unwrap();
+    listener.batch_execute(&format!("LISTEN resource_{rid}")).await.unwrap();
+
+    let (released, committed, booking) = (Ulid::new(), Ulid::new(), Ulid::new());
+    for (hid, start) in [(released, t0), (committed, t0 + 2000)] {
+        client
+            .batch_execute(&format!(
+                r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', {start}, {}, {expires})"#,
+                start + 1000
+            ))
+            .await
+            .unwrap();
+        assert!(next_payload(&mut rx).await.get("HoldPlaced").is_some());
+    }
+
+    client.batch_execute(&format!("DELETE FROM holds WHERE id = '{released}'")).await.unwrap();
+    let v = next_payload(&mut rx).await;
+    assert_eq!(v["HoldReleased"]["id"], released.to_string());
+    assert_eq!(v["HoldReleased"]["span"], span(t0));
+    assert_eq!(v["HoldReleased"]["reason"], "released");
+
+    client
+        .batch_execute(&format!("UPDATE holds SET booking_id = '{booking}' WHERE id = '{committed}'"))
+        .await
+        .unwrap();
+    let v = next_payload(&mut rx).await;
+    assert_eq!(v["HoldReleased"]["reason"], "committed");
+    assert_eq!(v["HoldReleased"]["booking_id"], booking.to_string());
+    assert_eq!(v["HoldReleased"]["span"], span(t0 + 2000));
+    let v = next_payload(&mut rx).await;
+    assert_eq!(v["BookingConfirmed"]["id"], booking.to_string());
+
+    client.batch_execute(&format!("DELETE FROM bookings WHERE id = '{booking}'")).await.unwrap();
+    let v = next_payload(&mut rx).await;
+    assert_eq!(v["BookingCancelled"]["span"], span(t0 + 2000));
+}
+
+#[tokio::test]
+async fn listen_over_the_per_connection_limit_is_refused_not_silently_ignored() {
+    // Before: LISTEN answered success and the connection loop then skipped the subscription, so the
+    // client waited on a channel that would never deliver anything and was never told.
+    use deltat::limits::MAX_SUBSCRIPTIONS_PER_CONNECTION as MAX;
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let ids: Vec<Ulid> = (0..=MAX).map(|_| Ulid::new()).collect();
+    let values = ids.iter().map(|id| format!("('{id}')")).collect::<Vec<_>>().join(", ");
+    client.batch_execute(&format!("INSERT INTO resources (id) VALUES {values}")).await.unwrap();
+
+    for id in &ids[..MAX] {
+        client.batch_execute(&format!("LISTEN resource_{id}")).await.unwrap();
+    }
+    // Listening again to one already listened to is not a new subscription.
+    client.batch_execute(&format!("LISTEN resource_{}", ids[0])).await.unwrap();
+
+    let err = client.batch_execute(&format!("LISTEN resource_{}", ids[MAX])).await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("54000"));
+
+    client.batch_execute(&format!("UNLISTEN resource_{}", ids[0])).await.unwrap();
+    client.batch_execute(&format!("LISTEN resource_{}", ids[MAX])).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_deleted_resource_gives_its_listen_slot_back() {
+    // Before: the slot was only freed on the next accepted LISTEN, and at the limit every LISTEN was
+    // refused, so a connection whose resources were deleted stayed full for good. And the LISTEN
+    // accepted in its place has to deliver: the connection loop once still counted the deleted
+    // resource's forwarder, skipped the new subscription, and the client waited on silence.
+    use deltat::limits::MAX_SUBSCRIPTIONS_PER_CONNECTION as MAX;
+    let (addr, _tm) = start_test_server().await;
+    let (client, mut rx) = connect(addr).await;
+    let ids: Vec<Ulid> = (0..=MAX).map(|_| Ulid::new()).collect();
+    let values = ids.iter().map(|id| format!("('{id}')")).collect::<Vec<_>>().join(", ");
+    client.batch_execute(&format!("INSERT INTO resources (id) VALUES {values}")).await.unwrap();
+    for id in &ids[..MAX] {
+        client.batch_execute(&format!("LISTEN resource_{id}")).await.unwrap();
+    }
+
+    client.batch_execute(&format!("DELETE FROM resources WHERE id = '{}'", ids[0])).await.unwrap();
+    client.batch_execute(&format!("LISTEN resource_{}", ids[MAX])).await.unwrap();
+
+    let (hid, rid) = (Ulid::new(), ids[MAX]);
+    let start = client_now_ms() + 3_600_000;
+    let (end, expires) = (start + 1000, client_now_ms() + 60_000);
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', {start}, {end}, {expires})"#
+        ))
+        .await
+        .unwrap();
+    let wanted = format!("resource_{rid}");
+    // The deleted resource's own notice may come first; only the new channel's counts.
+    loop {
+        let n = recv_notification(&mut rx, Duration::from_secs(5)).await.expect("the new channel delivers");
+        if n.channel() == wanted {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_resource_recreated_under_its_id_keeps_the_limit_honest() {
+    // Re-creating a deleted resource's id and listening to it again once made the connection loop
+    // forget that id from `listening` while forwarding it, so LISTEN then acknowledged one
+    // subscription past the limit and the loop never forwarded it: acknowledged, then silent.
+    use deltat::limits::MAX_SUBSCRIPTIONS_PER_CONNECTION as MAX;
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let ids: Vec<Ulid> = (0..=MAX).map(|_| Ulid::new()).collect();
+    let values = ids.iter().map(|id| format!("('{id}')")).collect::<Vec<_>>().join(", ");
+    client.batch_execute(&format!("INSERT INTO resources (id) VALUES {values}")).await.unwrap();
+    for id in &ids[..MAX] {
+        client.batch_execute(&format!("LISTEN resource_{id}")).await.unwrap();
+    }
+
+    client.batch_execute(&format!("DELETE FROM resources WHERE id = '{}'", ids[0])).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await; // its forwarder sees the channel close
+    client.batch_execute(&format!("INSERT INTO resources (id) VALUES ('{}')", ids[0])).await.unwrap();
+    client.batch_execute(&format!("LISTEN resource_{}", ids[0])).await.unwrap();
+
+    let err = client.batch_execute(&format!("LISTEN resource_{}", ids[MAX])).await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("54000"), "still {MAX} live subscriptions");
+}
+
+#[tokio::test]
+async fn select_resources_by_id_returns_exactly_that_resource() {
+    let (addr, _tm) = start_test_server().await;
+    let (client, _) = connect(addr).await;
+    let (a, b) = (Ulid::new(), Ulid::new());
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{a}'), ('{b}')"))
+        .await
+        .unwrap();
+
+    let rows = select_rows(&client, &format!("SELECT * FROM resources WHERE id = '{a}'")).await;
+    assert_eq!(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec![a.to_string()]);
+    let none = select_rows(&client, &format!("SELECT * FROM resources WHERE id = '{}'", Ulid::new())).await;
+    assert!(none.is_empty(), "an unknown id is an empty result, which is the existence check");
 }
