@@ -942,9 +942,15 @@ async fn setup_held_span(client: &tokio_postgres::Client) -> (Ulid, Ulid) {
         .await
         .unwrap();
     let expires = client_now_ms() + 60_000;
+    // A live span, for the reason reordered_booking_insert_round_trips gives: the commit tests turn
+    // this hold into a booking, and a booking ending in 1970 can lose a race with the GC first tick
+    // (7-day retention) and vanish before the SELECT. commit_hold_via_simple_query failed that way
+    // once in CI on 30.09.2026 and passed on rerun.
+    let start = client_now_ms() + 3_600_000;
+    let end = start + 1000;
     client
         .batch_execute(&format!(
-            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', 1000, 2000, {expires})"#
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', {start}, {end}, {expires})"#
         ))
         .await
         .unwrap();
@@ -1149,7 +1155,11 @@ async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
     let (listener, mut rx) = connect(addr).await;
     let (client, _) = connect(addr).await;
     let rid = Ulid::new();
-    let expires = 9_999_999_999_999u64;
+    // Spans in the future: the tenant's GC deletes intervals that ended before its retention
+    // cutoff and first runs as the tenant starts, so a 1970 span could vanish mid-test.
+    let t0 = client_now_ms() + 86_400_000;
+    let expires = client_now_ms() + 60_000;
+    let span = |start: i64| serde_json::json!({ "start": start, "end": start + 1000 });
     client
         .batch_execute(&format!("INSERT INTO resources (id, capacity) VALUES ('{rid}', 5)"))
         .await
@@ -1157,7 +1167,7 @@ async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
     listener.batch_execute(&format!("LISTEN resource_{rid}")).await.unwrap();
 
     let (released, committed, booking) = (Ulid::new(), Ulid::new(), Ulid::new());
-    for (hid, start) in [(released, 1000), (committed, 3000)] {
+    for (hid, start) in [(released, t0), (committed, t0 + 2000)] {
         client
             .batch_execute(&format!(
                 r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', {start}, {}, {expires})"#,
@@ -1171,7 +1181,7 @@ async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
     client.batch_execute(&format!("DELETE FROM holds WHERE id = '{released}'")).await.unwrap();
     let v = next_payload(&mut rx).await;
     assert_eq!(v["HoldReleased"]["id"], released.to_string());
-    assert_eq!(v["HoldReleased"]["span"], serde_json::json!({ "start": 1000, "end": 2000 }));
+    assert_eq!(v["HoldReleased"]["span"], span(t0));
     assert_eq!(v["HoldReleased"]["reason"], "released");
 
     client
@@ -1181,13 +1191,13 @@ async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
     let v = next_payload(&mut rx).await;
     assert_eq!(v["HoldReleased"]["reason"], "committed");
     assert_eq!(v["HoldReleased"]["booking_id"], booking.to_string());
-    assert_eq!(v["HoldReleased"]["span"], serde_json::json!({ "start": 3000, "end": 4000 }));
+    assert_eq!(v["HoldReleased"]["span"], span(t0 + 2000));
     let v = next_payload(&mut rx).await;
     assert_eq!(v["BookingConfirmed"]["id"], booking.to_string());
 
     client.batch_execute(&format!("DELETE FROM bookings WHERE id = '{booking}'")).await.unwrap();
     let v = next_payload(&mut rx).await;
-    assert_eq!(v["BookingCancelled"]["span"], serde_json::json!({ "start": 3000, "end": 4000 }));
+    assert_eq!(v["BookingCancelled"]["span"], span(t0 + 2000));
 }
 
 #[tokio::test]
