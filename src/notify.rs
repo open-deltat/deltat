@@ -5,7 +5,7 @@
 //! writers, and is told so with a `Lagged` notification (see `lagged_payload`), so it knows to
 //! re-read authoritative state instead of trusting the stream.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use serde::Serialize;
@@ -45,13 +45,23 @@ pub struct Ended {
 /// `Event` is the WAL record format (bincode, no schema version), so it cannot grow fields without
 /// making existing logs unreadable. The extra facts ride here, on the notification only.
 ///
-/// The JSON payload is built once, here, and shared by every subscriber's forwarder.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The JSON payload is built on first use and shared by every subscriber's copy (clones share the
+/// cell), so a change nobody listens to is never serialized and one many listen to is serialized once.
+#[derive(Debug, Clone)]
 pub struct Notice {
     pub event: Event,
     pub ended: Option<Ended>,
-    payload: Arc<str>,
+    payload: Arc<OnceLock<Arc<str>>>,
 }
+
+/// Two notices are the same change; whether either has built its payload yet is not part of that.
+impl PartialEq for Notice {
+    fn eq(&self, other: &Self) -> bool {
+        self.event == other.event && self.ended == other.ended
+    }
+}
+
+impl Eq for Notice {}
 
 /// `{"<Variant>": {"id": .., "resource_id": .., <Ended fields>}}` for an event that ended a hold or
 /// booking. Typed structs rather than a `serde_json::Value`, so fields keep their declared order
@@ -85,21 +95,20 @@ fn payload_of(event: &Event, ended: Option<&Ended>) -> Arc<str> {
 
 impl Notice {
     pub fn of(event: &Event) -> Self {
-        Self { event: event.clone(), ended: None, payload: payload_of(event, None) }
+        Self { event: event.clone(), ended: None, payload: Arc::default() }
     }
 
     /// `ended` only reaches the payload for the events it describes (`HoldReleased`,
     /// `BookingCancelled`); any other event goes out exactly as `Notice::of` would send it.
     pub fn ended(event: &Event, ended: Ended) -> Self {
-        let payload = payload_of(event, Some(&ended));
-        Self { event: event.clone(), ended: Some(ended), payload }
+        Self { event: event.clone(), ended: Some(ended), payload: Arc::default() }
     }
 
     /// The JSON payload: the event in the shape it always had, keys in the same order, with the
     /// `Ended` fields appended inside the variant's object for an ending. A client that does not
     /// know them reads what it always read.
     pub fn payload(&self) -> Arc<str> {
-        self.payload.clone()
+        self.payload.get_or_init(|| payload_of(&self.event, self.ended.as_ref())).clone()
     }
 }
 
@@ -259,6 +268,16 @@ mod tests {
         let old_prefix = &before[..before.len() - 2]; // without the closing "}}"
         assert!(payload.starts_with(old_prefix), "{payload} must start with {old_prefix}");
         assert!(payload.ends_with(r#","span":{"start":1000,"end":2000},"reason":"released"}}"#), "{payload}");
+    }
+
+    #[test]
+    fn clones_share_one_payload_built_on_first_use() {
+        let rid = Ulid::new();
+        let notice = Notice::of(&Event::ResourceDeleted { id: rid });
+        let copy = notice.clone(); // what each subscriber's broadcast receiver gets
+        assert!(notice.payload.get().is_none(), "nothing is serialized until someone reads it");
+        let first = copy.payload();
+        assert!(Arc::ptr_eq(&first, &notice.payload()), "the second reader reuses the first one's bytes");
     }
 
     #[test]

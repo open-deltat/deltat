@@ -1201,6 +1201,30 @@ async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
 }
 
 #[tokio::test]
+async fn listen_over_the_per_connection_limit_is_refused_not_silently_ignored() {
+    // Before: LISTEN answered success and the connection loop then skipped the subscription, so the
+    // client waited on a channel that would never deliver anything and was never told.
+    use deltat::limits::MAX_SUBSCRIPTIONS_PER_CONNECTION as MAX;
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+    let ids: Vec<Ulid> = (0..=MAX).map(|_| Ulid::new()).collect();
+    let values = ids.iter().map(|id| format!("('{id}')")).collect::<Vec<_>>().join(", ");
+    client.batch_execute(&format!("INSERT INTO resources (id) VALUES {values}")).await.unwrap();
+
+    for id in &ids[..MAX] {
+        client.batch_execute(&format!("LISTEN resource_{id}")).await.unwrap();
+    }
+    // Listening again to one already listened to is not a new subscription.
+    client.batch_execute(&format!("LISTEN resource_{}", ids[0])).await.unwrap();
+
+    let err = client.batch_execute(&format!("LISTEN resource_{}", ids[MAX])).await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("54000"));
+
+    client.batch_execute(&format!("UNLISTEN resource_{}", ids[0])).await.unwrap();
+    client.batch_execute(&format!("LISTEN resource_{}", ids[MAX])).await.unwrap();
+}
+
+#[tokio::test]
 async fn select_resources_by_id_returns_exactly_that_resource() {
     let (addr, _tm) = start_test_server().await;
     let (client, _) = connect(addr).await;

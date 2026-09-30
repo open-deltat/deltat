@@ -4,9 +4,9 @@
 //! forwarding. A parsed [`crate::command::Command`] becomes engine calls whose rows it encodes,
 //! and this is where a connection's lifetime and subscription limits are enforced.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -53,6 +53,11 @@ pub struct DeltaTHandler {
     tenant_manager: Arc<TenantManager>,
     query_parser: Arc<DeltaTQueryParser>,
     subscribe_tx: Option<mpsc::UnboundedSender<SubscriptionCommand>>,
+    /// Resources this connection LISTENs to, shared with its connection loop. LISTEN is answered
+    /// here, before the loop creates the forwarder, so the per-connection limit has to be enforced
+    /// here too: the loop enforcing it alone meant a LISTEN over the limit answered success and
+    /// then silently delivered nothing.
+    listening: Arc<Mutex<HashSet<Ulid>>>,
     slow_query_threshold_ms: u64,
     /// How many alternative spans a refusal may carry. `0` disables the feature entirely, which is
     /// the kill switch: an error then looks exactly as it did before this existed.
@@ -70,6 +75,7 @@ impl DeltaTHandler {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: None,
+            listening: Arc::default(),
             slow_query_threshold_ms: 0,
             counter_offer_limit: Self::configured_counter_offer_limit(),
         }
@@ -83,9 +89,16 @@ impl DeltaTHandler {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
             subscribe_tx: Some(subscribe_tx),
+            listening: Arc::default(),
             slow_query_threshold_ms: 0,
             counter_offer_limit: Self::configured_counter_offer_limit(),
         }
+    }
+
+    /// The set of resources this connection LISTENs to, for the connection loop to keep in step
+    /// when a forwarder ends (its resource was deleted) or cannot be started.
+    pub fn listening(&self) -> Arc<Mutex<HashSet<Ulid>>> {
+        self.listening.clone()
     }
 
     pub fn with_slow_query_threshold(mut self, threshold_ms: u64) -> Self {
@@ -515,6 +528,20 @@ impl DeltaTHandler {
                     )))
                     .into());
                 }
+                {
+                    let mut listening = self.listening.lock().unwrap_or_else(PoisonError::into_inner);
+                    if !listening.contains(&resource_id) && listening.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "54000".into(),
+                            format!(
+                                "this connection already listens to {MAX_SUBSCRIPTIONS_PER_CONNECTION} resources; UNLISTEN one or open another connection"
+                            ),
+                        )))
+                        .into());
+                    }
+                    listening.insert(resource_id);
+                }
                 if let Some(ref tx) = self.subscribe_tx {
                     let _ = tx.send(SubscriptionCommand::Subscribe(resource_id));
                 }
@@ -522,12 +549,14 @@ impl DeltaTHandler {
             }
             Command::Unlisten { channel } => {
                 let resource_id = Self::parse_channel_resource_id(&channel)?;
+                self.listening.lock().unwrap_or_else(PoisonError::into_inner).remove(&resource_id);
                 if let Some(ref tx) = self.subscribe_tx {
                     let _ = tx.send(SubscriptionCommand::Unsubscribe(resource_id));
                 }
                 Ok(vec![Response::Execution(Tag::new("UNLISTEN"))])
             }
             Command::UnlistenAll => {
+                self.listening.lock().unwrap_or_else(PoisonError::into_inner).clear();
                 if let Some(ref tx) = self.subscribe_tx {
                     let _ = tx.send(SubscriptionCommand::UnsubscribeAll);
                 }
@@ -933,6 +962,7 @@ pub async fn process_connection_with_auth(
         DeltaTHandler::with_subscriptions(tenant_manager.clone(), subscribe_tx)
             .with_slow_query_threshold(slow_query_ms),
     );
+    let listening = handler.listening();
     let noop = Arc::new(NoopHandler);
 
     // 4. Forwarder tasks state
@@ -1046,24 +1076,38 @@ pub async fn process_connection_with_auth(
                             // Prune forwarders whose task already exited (e.g. the resource was
                             // deleted, closing the broadcast). Without this a dead entry keeps
                             // contains_key true (a re-LISTEN silently no-ops) and counts against
-                            // MAX_SUBSCRIPTIONS_PER_CONNECTION forever.
-                            forwarders.retain(|_, h| !h.is_finished());
+                            // MAX_SUBSCRIPTIONS_PER_CONNECTION forever. The handler's `listening`
+                            // set, which LISTEN enforces the limit on, forgets them too.
+                            let forget = |rid: &Ulid| {
+                                listening.lock().unwrap_or_else(PoisonError::into_inner).remove(rid);
+                            };
+                            forwarders.retain(|rid, h| {
+                                let alive = !h.is_finished();
+                                if !alive {
+                                    forget(rid);
+                                }
+                                alive
+                            });
                             if forwarders.contains_key(&rid) {
                                 continue; // already subscribed
                             }
                             if forwarders.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
-                                continue; // limit reached
+                                continue; // limit reached; LISTEN refuses before this can happen
                             }
                             // Resolve the engine to get the notify hub
                             let engine = match handler.resolve_engine(&socket) {
                                 Ok((e, _)) => e,
-                                Err(_) => continue,
+                                Err(_) => {
+                                    forget(&rid);
+                                    continue;
+                                }
                             };
                             // Defense in depth against a delete racing between the LISTEN's
                             // existence check and this Subscribe: never recreate a broadcast channel
                             // for a resource that no longer exists (it would leak, since only delete
                             // reclaims it).
                             if engine.get_resource(&rid).is_none() {
+                                forget(&rid);
                                 continue;
                             }
                             let rx = engine.notify.subscribe(rid);
