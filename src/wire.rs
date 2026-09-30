@@ -34,7 +34,8 @@ use crate::auth::{DeltaTAuthSource, DeltaTStartupHandler};
 use crate::engine::Engine;
 use crate::limits::{COUNTER_OFFER_MAX, MAX_PARAMS, MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
 use crate::model::*;
-use crate::command::Command;
+use crate::notify::{lagged_payload, Notice};
+use crate::command::{Command, ResourceFilter};
 use crate::sql;
 use crate::tenant::TenantManager;
 
@@ -427,13 +428,18 @@ impl DeltaTHandler {
                     .await?;
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
-            Command::SelectResources { parent_id } => {
-                let all = engine.list_resources().await;
-                let filtered: Vec<_> = match parent_id {
-                    None => all,
-                    Some(None) => all.into_iter().filter(|r| r.parent_id.is_none()).collect(),
-                    Some(Some(pid)) => all.into_iter().filter(|r| r.parent_id == Some(pid)).collect(),
-                };
+            Command::SelectResources { filter } => {
+                let filtered: Vec<_> = engine
+                    .list_resources()
+                    .await
+                    .into_iter()
+                    .filter(|r| match filter {
+                        ResourceFilter::All => true,
+                        ResourceFilter::Roots => r.parent_id.is_none(),
+                        ResourceFilter::ChildrenOf(pid) => r.parent_id == Some(pid),
+                        ResourceFilter::Id(id) => r.id == id,
+                    })
+                    .collect();
 
                 Ok(encode_rows(Arc::new(resources_schema()), filtered, |e, r| {
                     e.encode_field(&r.id.to_string())?;
@@ -836,31 +842,32 @@ fn substitute_params(portal: &Portal<String>) -> String {
 ///
 /// A `Lagged` error means the subscriber briefly fell behind the bounded broadcast ring and lost
 /// some events. It must NOT end the subscription. Ending it would let a transient burst silently
-/// kill the live stream forever; instead we keep forwarding subsequent events (the listener
-/// re-reads authoritative state on the next one; availability is never derived from the stream).
-/// Only `Closed` (all senders dropped, e.g. the resource was deleted) ends the forwarder.
+/// kill the live stream forever; instead we keep forwarding subsequent events. The loss itself is
+/// sent as a `Lagged` notification: a listener cannot tell a gap from a quiet stream, and one that
+/// keeps a running picture (who holds what, which time is free) would otherwise carry on from a
+/// state that is already wrong. Only `Closed` (all senders dropped, e.g. the resource was deleted)
+/// ends the forwarder.
 async fn forward_resource_events(
-    mut rx: tokio::sync::broadcast::Receiver<Event>,
+    mut rx: tokio::sync::broadcast::Receiver<Notice>,
     tx: mpsc::UnboundedSender<NotificationResponse>,
     channel: String,
 ) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let payload = serde_json::to_string(&event).unwrap_or_default();
-                if tx
-                    .send(NotificationResponse::new(0, channel.clone(), payload))
-                    .is_err()
-                {
-                    break;
-                }
-            }
+        let payload = match rx.recv().await {
+            Ok(notice) => notice.to_payload(),
             Err(RecvError::Lagged(missed)) => {
                 metrics::counter!(crate::observability::NOTIFICATIONS_LAGGED_TOTAL)
                     .increment(missed);
+                lagged_payload(missed)
             }
             Err(RecvError::Closed) => break,
+        };
+        if tx
+            .send(NotificationResponse::new(0, channel.clone(), payload))
+            .is_err()
+        {
+            break;
         }
     }
 }
@@ -1351,26 +1358,35 @@ mod tests {
         // channel() time, then three sends overflow the ring before the forwarder drains, leaving
         // it two behind. The old `while let Ok(..)` ended the task on that Lagged and dropped the
         // stream forever; the fix continues and still forwards the surviving event.
-        let (btx, brx) = broadcast::channel::<Event>(1);
+        let (btx, brx) = broadcast::channel::<Notice>(1);
         let (mtx, mut mrx) = mpsc::unbounded_channel();
-        let mk = || Event::BookingConfirmed {
-            id: Ulid::new(),
-            resource_id: Ulid::new(),
-            span: Span::new(1000, 2000),
-            label: None,
+        let mk = || {
+            Notice::of(&Event::BookingConfirmed {
+                id: Ulid::new(),
+                resource_id: Ulid::new(),
+                span: Span::new(1000, 2000),
+                label: None,
+            })
         };
         btx.send(mk()).unwrap();
         btx.send(mk()).unwrap();
-        btx.send(mk()).unwrap(); // receiver now 2 behind a cap-1 ring → next recv() is Lagged
+        let survivor = mk();
+        btx.send(survivor.clone()).unwrap(); // receiver now 2 behind a cap-1 ring → next recv() is Lagged
 
         tokio::spawn(forward_resource_events(brx, mtx, "resource_x".into()));
 
-        let got = tokio::time::timeout(Duration::from_secs(1), mrx.recv())
+        // The gap is announced, not swallowed: a listener keeping a running picture must learn
+        // that it is stale. The old behavior only counted it in a metric.
+        let gap = tokio::time::timeout(Duration::from_secs(1), mrx.recv())
             .await
-            .expect("forwarder must not hang");
-        // Some(_) only if the forwarder survived the Lagged; the old behavior dropped the sender
-        // and recv() would return None.
-        assert!(got.is_some(), "forwarder must survive a broadcast Lagged and keep forwarding");
+            .expect("forwarder must not hang")
+            .expect("forwarder must survive a broadcast Lagged");
+        assert_eq!(gap.payload, lagged_payload(2));
+        let after = tokio::time::timeout(Duration::from_secs(1), mrx.recv())
+            .await
+            .expect("forwarder must not hang")
+            .expect("and keep forwarding after it");
+        assert_eq!(after.payload, survivor.to_payload());
     }
 
     // ── enforce_query_len ────────────────────────────────────────
@@ -2244,13 +2260,15 @@ mod tests {
         let (log, ()) = with_metrics(|| {
             block_on(async {
                 use tokio::sync::broadcast;
-                let (btx, brx) = broadcast::channel::<Event>(1);
+                let (btx, brx) = broadcast::channel::<Notice>(1);
                 let (mtx, mut mrx) = mpsc::unbounded_channel();
-                let mk = || Event::BookingConfirmed {
-                    id: Ulid::new(),
-                    resource_id: Ulid::new(),
-                    span: Span::new(1000, 2000),
-                    label: None,
+                let mk = || {
+                    Notice::of(&Event::BookingConfirmed {
+                        id: Ulid::new(),
+                        resource_id: Ulid::new(),
+                        span: Span::new(1000, 2000),
+                        label: None,
+                    })
                 };
                 btx.send(mk()).unwrap();
                 btx.send(mk()).unwrap();

@@ -64,6 +64,20 @@ pub fn span_filters_match(filters: &[SpanFilter], start: Ms, end: Ms) -> bool {
     filters.iter().all(|f| f.matches(start, end))
 }
 
+/// Which resources a `SELECT ... FROM resources` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceFilter {
+    All,
+    /// `WHERE parent_id IS NULL`
+    Roots,
+    /// `WHERE parent_id = 'X'`
+    ChildrenOf(Ulid),
+    /// `WHERE id = 'X'`: an existence check. Without it a client had to fetch every resource in the
+    /// tenant to learn whether one id exists, which it needs because reads of an unknown resource's
+    /// availability, holds or bookings come back empty rather than as an error.
+    Id(Ulid),
+}
+
 /// A parsed, transport-neutral request to the engine.
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -140,7 +154,7 @@ pub enum Command {
         id: Ulid,
     },
     SelectResources {
-        parent_id: Option<Option<Ulid>>, // None = no filter, Some(None) = root only, Some(Some(id)) = children of id
+        filter: ResourceFilter,
     },
     SelectRules {
         resource_id: Ulid,

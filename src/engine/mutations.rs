@@ -12,6 +12,7 @@ use ulid::Ulid;
 
 use crate::limits::*;
 use crate::model::*;
+use crate::notify::{Ended, HoldEnd, Notice};
 
 use super::availability::subtract_intervals;
 use super::conflict::{
@@ -91,8 +92,9 @@ impl Engine {
         if let Some(pid) = parent_id {
             self.store.add_child(pid, id);
         }
-        self.notify.send(id, &event);
-        self.notify_ancestors(parent_id, &event);
+        let notice = Notice::of(&event);
+        self.notify.send(id, &notice);
+        self.notify_ancestors(parent_id, &notice);
         Ok(())
     }
 
@@ -145,8 +147,9 @@ impl Engine {
         let event = Event::ResourceDeleted { id };
         self.wal_append(&event).await?;
         self.store.remove_resource(&id);
-        self.notify.send(id, &event);
-        self.notify_ancestors(parent_id, &event);
+        let notice = Notice::of(&event);
+        self.notify.send(id, &notice);
+        self.notify_ancestors(parent_id, &notice);
         // Deliver the deletion to current listeners above, then reclaim the channel so a
         // long-lived tenant does not leak one broadcast sender per ever-deleted resource.
         self.notify.remove(&id);
@@ -368,7 +371,7 @@ impl Engine {
     }
 
     pub async fn release_hold(&self, id: Ulid) -> Result<Ulid, EngineError> {
-        let resource_id = self.remove_hold(id).await?;
+        let resource_id = self.remove_hold(id, HoldEnd::Released).await?;
         metrics::counter!(crate::observability::HOLDS_RELEASED_TOTAL).increment(1);
         Ok(resource_id)
     }
@@ -377,16 +380,17 @@ impl Engine {
     /// calls this so a reaped hold does not inflate the released count (HOLDS_EXPIRED_TOTAL
     /// documents the abandonment arithmetic that depends on it).
     pub async fn expire_hold(&self, id: Ulid) -> Result<Ulid, EngineError> {
-        let resource_id = self.remove_hold(id).await?;
+        let resource_id = self.remove_hold(id, HoldEnd::Expired).await?;
         metrics::counter!(crate::observability::HOLDS_EXPIRED_TOTAL).increment(1);
         Ok(resource_id)
     }
 
-    async fn remove_hold(&self, id: Ulid) -> Result<Ulid, EngineError> {
+    async fn remove_hold(&self, id: Ulid, reason: HoldEnd) -> Result<Ulid, EngineError> {
         let (resource_id, mut guard) = self.resolve_entity_write(&id).await?;
-        find_interval_of_kind(&guard, &id, is_hold)?;
+        let span = find_interval_of_kind(&guard, &id, is_hold)?.span;
         let event = Event::HoldReleased { id, resource_id };
-        self.persist_and_apply(resource_id, &mut guard, &event).await?;
+        let ended = Ended { span, reason: Some(reason), booking_id: None };
+        self.persist_and_apply_ended(resource_id, &mut guard, &event, Some(ended)).await?;
         Ok(resource_id)
     }
 
@@ -463,10 +467,14 @@ impl Engine {
         self.store.apply_event(&mut guard, &release);
         self.store.apply_event(&mut guard, &book);
         let parent_id = guard.parent_id;
-        self.notify.send(resource_id, &release);
-        self.notify.send(resource_id, &book);
-        self.notify_ancestors(parent_id, &release);
-        self.notify_ancestors(parent_id, &book);
+        // The release says it was this commit and names the booking, so a subscriber never reports
+        // the span as free in the instant before the booking arrives.
+        let released = Notice::ended(&release, Ended { span, reason: Some(HoldEnd::Committed), booking_id: Some(booking_id) });
+        let booked = Notice::of(&book);
+        self.notify.send(resource_id, &released);
+        self.notify.send(resource_id, &booked);
+        self.notify_ancestors(parent_id, &released);
+        self.notify_ancestors(parent_id, &booked);
         metrics::counter!(crate::observability::HOLDS_COMMITTED_TOTAL).increment(1);
         metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL).increment(1);
         Ok(())
@@ -669,8 +677,9 @@ impl Engine {
                 let guard_idx = rs_map[resource_id];
                 let parent_id = guards[guard_idx].parent_id;
                 self.store.apply_event(&mut guards[guard_idx], event);
-                self.notify.send(*resource_id, event);
-                self.notify_ancestors(parent_id, event);
+                let notice = Notice::of(event);
+                self.notify.send(*resource_id, &notice);
+                self.notify_ancestors(parent_id, &notice);
             }
         }
         metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL)
@@ -681,9 +690,10 @@ impl Engine {
 
     pub async fn cancel_booking(&self, id: Ulid) -> Result<Ulid, EngineError> {
         let (resource_id, mut guard) = self.resolve_entity_write(&id).await?;
-        find_interval_of_kind(&guard, &id, is_booking)?;
+        let span = find_interval_of_kind(&guard, &id, is_booking)?.span;
         let event = Event::BookingCancelled { id, resource_id };
-        self.persist_and_apply(resource_id, &mut guard, &event).await?;
+        let ended = Ended { span, reason: None, booking_id: None };
+        self.persist_and_apply_ended(resource_id, &mut guard, &event, Some(ended)).await?;
         metrics::counter!(crate::observability::BOOKINGS_DELETED_TOTAL).increment(1);
         Ok(resource_id)
     }

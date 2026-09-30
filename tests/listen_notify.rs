@@ -1133,3 +1133,75 @@ async fn reordered_booking_insert_round_trips() {
     assert_eq!(rows[0].0, bid.to_string(), "the booking must carry the declared id");
     assert_eq!(rows[0].1, "swapped");
 }
+
+/// The next notification's payload as JSON, failing the test if none arrives.
+async fn next_payload(rx: &mut mpsc::UnboundedReceiver<Notification>) -> serde_json::Value {
+    let n = recv_notification(rx, Duration::from_secs(5)).await.expect("expected a notification");
+    serde_json::from_str(n.payload()).expect("payload is JSON")
+}
+
+#[tokio::test]
+async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
+    // What an SDK actually receives. Before this, a released hold and a cancelled booking arrived as
+    // a bare id, and a commit's release was indistinguishable from a plain release, so every client
+    // announced the span as free in the instant before the booking.
+    let (addr, _tm) = start_test_server().await;
+    let (listener, mut rx) = connect(addr).await;
+    let (client, _) = connect(addr).await;
+    let rid = Ulid::new();
+    let expires = 9_999_999_999_999u64;
+    client
+        .batch_execute(&format!("INSERT INTO resources (id, capacity) VALUES ('{rid}', 5)"))
+        .await
+        .unwrap();
+    listener.batch_execute(&format!("LISTEN resource_{rid}")).await.unwrap();
+
+    let (released, committed, booking) = (Ulid::new(), Ulid::new(), Ulid::new());
+    for (hid, start) in [(released, 1000), (committed, 3000)] {
+        client
+            .batch_execute(&format!(
+                r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', {start}, {}, {expires})"#,
+                start + 1000
+            ))
+            .await
+            .unwrap();
+        assert!(next_payload(&mut rx).await.get("HoldPlaced").is_some());
+    }
+
+    client.batch_execute(&format!("DELETE FROM holds WHERE id = '{released}'")).await.unwrap();
+    let v = next_payload(&mut rx).await;
+    assert_eq!(v["HoldReleased"]["id"], released.to_string());
+    assert_eq!(v["HoldReleased"]["span"], serde_json::json!({ "start": 1000, "end": 2000 }));
+    assert_eq!(v["HoldReleased"]["reason"], "released");
+
+    client
+        .batch_execute(&format!("UPDATE holds SET booking_id = '{booking}' WHERE id = '{committed}'"))
+        .await
+        .unwrap();
+    let v = next_payload(&mut rx).await;
+    assert_eq!(v["HoldReleased"]["reason"], "committed");
+    assert_eq!(v["HoldReleased"]["booking_id"], booking.to_string());
+    assert_eq!(v["HoldReleased"]["span"], serde_json::json!({ "start": 3000, "end": 4000 }));
+    let v = next_payload(&mut rx).await;
+    assert_eq!(v["BookingConfirmed"]["id"], booking.to_string());
+
+    client.batch_execute(&format!("DELETE FROM bookings WHERE id = '{booking}'")).await.unwrap();
+    let v = next_payload(&mut rx).await;
+    assert_eq!(v["BookingCancelled"]["span"], serde_json::json!({ "start": 3000, "end": 4000 }));
+}
+
+#[tokio::test]
+async fn select_resources_by_id_returns_exactly_that_resource() {
+    let (addr, _tm) = start_test_server().await;
+    let (client, _) = connect(addr).await;
+    let (a, b) = (Ulid::new(), Ulid::new());
+    client
+        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{a}'), ('{b}')"))
+        .await
+        .unwrap();
+
+    let rows = select_rows(&client, &format!("SELECT * FROM resources WHERE id = '{a}'")).await;
+    assert_eq!(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec![a.to_string()]);
+    let none = select_rows(&client, &format!("SELECT * FROM resources WHERE id = '{}'", Ulid::new())).await;
+    assert!(none.is_empty(), "an unknown id is an empty result, which is the existence check");
+}

@@ -31,7 +31,7 @@ use ulid::Ulid;
 
 use crate::clock::{Clock, SystemClock};
 use crate::model::*;
-use crate::notify::NotifyHub;
+use crate::notify::{Ended, Notice, NotifyHub};
 use crate::wal::Wal;
 
 pub type SharedResourceState = Arc<RwLock<ResourceState>>;
@@ -475,10 +475,26 @@ impl Engine {
         rs: &mut ResourceState,
         event: &Event,
     ) -> Result<(), EngineError> {
+        self.persist_and_apply_ended(resource_id, rs, event, None).await
+    }
+
+    /// `persist_and_apply` for an event that ends a hold or booking: `ended` goes out on the
+    /// notification (never into the WAL) so subscribers learn when it was and why it ended.
+    pub(super) async fn persist_and_apply_ended(
+        &self,
+        resource_id: Ulid,
+        rs: &mut ResourceState,
+        event: &Event,
+        ended: Option<Ended>,
+    ) -> Result<(), EngineError> {
         self.wal_append(event).await?;
         self.store.apply_event(rs, event);
-        self.notify.send(resource_id, event);
-        self.notify_ancestors(rs.parent_id, event);
+        let notice = match ended {
+            Some(ended) => Notice::ended(event, ended),
+            None => Notice::of(event),
+        };
+        self.notify.send(resource_id, &notice);
+        self.notify_ancestors(rs.parent_id, &notice);
         Ok(())
     }
 
@@ -486,11 +502,11 @@ impl Engine {
     /// lock-free parent index, so it never truncates under contention (the old try_read walk dropped
     /// the rest of the chain whenever an ancestor was locked) and cannot deadlock (C1). The depth
     /// bound guards against a corrupt/cyclic index rather than looping forever.
-    fn notify_ancestors(&self, parent_id: Option<Ulid>, event: &Event) {
+    fn notify_ancestors(&self, parent_id: Option<Ulid>, notice: &Notice) {
         let mut current = parent_id;
         let mut depth = 0usize;
         while let Some(pid) = current {
-            self.notify.send(pid, event);
+            self.notify.send(pid, notice);
             depth += 1;
             if depth > crate::limits::MAX_HIERARCHY_DEPTH {
                 break;

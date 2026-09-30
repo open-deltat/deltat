@@ -7,6 +7,23 @@ All notable changes to deltat are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **An ending says when it was and why.** `HoldReleased` and `BookingCancelled` notifications now
+  carry the `span` that ended, and a released hold says `"reason"`: `"released"` (a DELETE),
+  `"expired"` (the reaper) or `"committed"` (turned into a booking, with that `"booking_id"`; its
+  `BookingConfirmed` follows). Before, both arrived as a bare id whose interval was already gone, so
+  a subscriber could not say which time had become free, and a commit read as "free" an instant
+  before it read as "booked". The fields are added inside the existing variant object, so a client
+  that does not know them reads exactly the payload it always did. They are notification-only: the
+  WAL record format is unchanged.
+- **A lagging listener is told.** When a subscriber falls behind the 256-entry broadcast ring, it now
+  receives `{"Lagged": {"missed": N}}` in place of the dropped notifications, instead of only a metric
+  increment. A client that keeps a running picture of a calendar could not otherwise tell a gap from
+  a quiet stream.
+- **`SELECT * FROM resources WHERE id = '...'`.** An existence check for one resource. Reads of an
+  unknown resource's availability, holds or bookings come back empty rather than as an error, so a
+  client that wants to tell "wrong id" from "empty calendar" previously had to fetch every resource
+  in the tenant. Any other resources filter is still refused rather than ignored.
+
 - **A refusal now says when, not just no.** When a hold or booking is refused because the span is
   taken, the resource is at capacity, or the time is outside open hours, the same error carries up
   to three spans of the same duration that were free at that instant, in the standard PostgreSQL

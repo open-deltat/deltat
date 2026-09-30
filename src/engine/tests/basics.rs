@@ -1,5 +1,6 @@
 use crate::engine::*;
 use crate::clock::{now_ms, TestClock};
+use crate::notify::{Ended, HoldEnd};
 use super::helpers::*;
 
 #[tokio::test]
@@ -754,12 +755,61 @@ async fn engine_commit_hold_notifies_resource_and_ancestors() {
     let mut on_child = engine.notify.subscribe(child);
     let mut on_parent = engine.notify.subscribe(parent);
 
-    engine.commit_hold(hid, Ulid::new(), None).await.unwrap();
+    let bid = Ulid::new();
+    engine.commit_hold(hid, bid, None).await.unwrap();
 
-    assert!(matches!(on_child.recv().await.unwrap(), Event::HoldReleased { .. }));
-    assert!(matches!(on_child.recv().await.unwrap(), Event::BookingConfirmed { .. }));
-    assert!(matches!(on_parent.recv().await.unwrap(), Event::HoldReleased { .. }));
-    assert!(matches!(on_parent.recv().await.unwrap(), Event::BookingConfirmed { .. }));
+    // The release names this commit and its booking, on the resource and on every ancestor, so no
+    // subscriber reads the span as free in between.
+    let committed = Ended { span: Span::new(10, 20), reason: Some(HoldEnd::Committed), booking_id: Some(bid) };
+    for rx in [&mut on_child, &mut on_parent] {
+        let released = rx.recv().await.unwrap();
+        assert!(matches!(released.event, Event::HoldReleased { .. }));
+        assert_eq!(released.ended.as_ref(), Some(&committed));
+        assert!(matches!(rx.recv().await.unwrap().event, Event::BookingConfirmed { .. }));
+    }
+}
+
+#[tokio::test]
+async fn engine_ended_holds_and_bookings_say_when_and_why() {
+    // A released hold, an expired hold and a cancelled booking each tell subscribers the span they
+    // held and, for a hold, why it ended. Without it a subscriber hears only an id whose interval
+    // is already gone, and cannot say which time just became free.
+    let path = test_wal_path("ended_notices.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 5, None).await.unwrap();
+    let (released, expired, booked) = (Ulid::new(), Ulid::new(), Ulid::new());
+    engine.place_hold(released, rid, Span::new(10, 20), now_ms() + H).await.unwrap();
+    engine.place_hold(expired, rid, Span::new(30, 40), now_ms() + H).await.unwrap();
+    engine.confirm_booking(booked, rid, Span::new(50, 60), None).await.unwrap();
+
+    let mut rx = engine.notify.subscribe(rid);
+    engine.release_hold(released).await.unwrap();
+    engine.expire_hold(expired).await.unwrap();
+    engine.cancel_booking(booked).await.unwrap();
+
+    let want = [
+        Ended { span: Span::new(10, 20), reason: Some(HoldEnd::Released), booking_id: None },
+        Ended { span: Span::new(30, 40), reason: Some(HoldEnd::Expired), booking_id: None },
+        Ended { span: Span::new(50, 60), reason: None, booking_id: None },
+    ];
+    for expected in want {
+        assert_eq!(rx.recv().await.unwrap().ended, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn engine_other_events_carry_nothing_extra() {
+    // Only an ending adds fields; everything else goes out exactly as the WAL records it.
+    let path = test_wal_path("plain_notices.wal");
+    let engine = Engine::new(path, Arc::new(NotifyHub::new())).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    let mut rx = engine.notify.subscribe(rid);
+    engine.place_hold(Ulid::new(), rid, Span::new(10, 20), now_ms() + H).await.unwrap();
+    engine.confirm_booking(Ulid::new(), rid, Span::new(30, 40), None).await.unwrap();
+    assert_eq!(rx.recv().await.unwrap().ended, None);
+    assert_eq!(rx.recv().await.unwrap().ended, None);
 }
 
 #[tokio::test]

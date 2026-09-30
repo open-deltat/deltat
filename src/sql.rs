@@ -9,7 +9,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use ulid::Ulid;
 
-use crate::command::{Command, SpanColumn, SpanFilter, SpanOp};
+use crate::command::{Command, ResourceFilter, SpanColumn, SpanFilter, SpanOp};
 use crate::limits::{MAX_BATCH_SIZE, MAX_IN_CLAUSE_IDS};
 use crate::model::*;
 
@@ -340,13 +340,12 @@ fn parse_select(query: &ast::Query) -> Result<Command, SqlError> {
             }
         }
         "resources" => {
-            // Optional: WHERE parent_id = 'X' or WHERE parent_id IS NULL
-            let parent_id = if let Some(selection) = &select.selection {
-                Some(extract_parent_id_filter(selection)?)
-            } else {
-                None
+            // Optional: WHERE parent_id = 'X', WHERE parent_id IS NULL, or WHERE id = 'X'
+            let filter = match &select.selection {
+                Some(selection) => extract_resource_filter(selection)?,
+                None => ResourceFilter::All,
             };
-            Ok(Command::SelectResources { parent_id })
+            Ok(Command::SelectResources { filter })
         }
         "rules" => {
             let resource_id = extract_resource_id_filter(&select.selection)?;
@@ -797,27 +796,21 @@ fn collect_resource_ids(
     Ok(())
 }
 
-fn extract_parent_id_filter(selection: &Expr) -> Result<Option<Ulid>, SqlError> {
+/// The one filter a resources SELECT may carry. Anything else is refused rather than ignored, so a
+/// query never silently returns more rows than it asked for.
+fn extract_resource_filter(selection: &Expr) -> Result<ResourceFilter, SqlError> {
     match selection {
         Expr::BinaryOp {
             left,
             op: ast::BinaryOperator::Eq,
             right,
-        } => {
-            if expr_column_name(left).as_deref() == Some("parent_id") {
-                Ok(Some(parse_ulid_expr(right)?))
-            } else {
-                Err(SqlError::MissingFilter("parent_id"))
-            }
-        }
-        Expr::IsNull(inner) => {
-            if expr_column_name(inner).as_deref() == Some("parent_id") {
-                Ok(None)
-            } else {
-                Err(SqlError::MissingFilter("parent_id"))
-            }
-        }
-        _ => Err(SqlError::MissingFilter("parent_id")),
+        } => match expr_column_name(left).as_deref() {
+            Some("parent_id") => Ok(ResourceFilter::ChildrenOf(parse_ulid_expr(right)?)),
+            Some("id") => Ok(ResourceFilter::Id(parse_ulid_expr(right)?)),
+            _ => Err(SqlError::MissingFilter("parent_id or id")),
+        },
+        Expr::IsNull(inner) if expr_column_name(inner).as_deref() == Some("parent_id") => Ok(ResourceFilter::Roots),
+        _ => Err(SqlError::MissingFilter("parent_id or id")),
     }
 }
 
@@ -1930,34 +1923,38 @@ mod tests {
     #[test]
     fn parse_select_resources_all() {
         let cmd = parse_sql("SELECT * FROM resources").unwrap();
-        match cmd {
-            Command::SelectResources { parent_id } => assert_eq!(parent_id, None),
-            _ => panic!("expected SelectResources, got {cmd:?}"),
-        }
+        assert_eq!(cmd, Command::SelectResources { filter: ResourceFilter::All });
     }
 
     #[test]
     fn parse_select_resources_by_parent_id() {
         let sql = "SELECT * FROM resources WHERE parent_id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
-        let cmd = parse_sql(sql).unwrap();
-        match cmd {
-            Command::SelectResources { parent_id } => {
-                let uid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
-                assert_eq!(parent_id, Some(Some(uid)));
-            }
-            _ => panic!("expected SelectResources, got {cmd:?}"),
-        }
+        let uid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        assert_eq!(parse_sql(sql).unwrap(), Command::SelectResources { filter: ResourceFilter::ChildrenOf(uid) });
     }
 
     #[test]
     fn parse_select_resources_roots_only() {
         let sql = "SELECT * FROM resources WHERE parent_id IS NULL";
-        let cmd = parse_sql(sql).unwrap();
-        match cmd {
-            Command::SelectResources { parent_id } => {
-                assert_eq!(parent_id, Some(None)); // Some(None) = root only
-            }
-            _ => panic!("expected SelectResources, got {cmd:?}"),
+        assert_eq!(parse_sql(sql).unwrap(), Command::SelectResources { filter: ResourceFilter::Roots });
+    }
+
+    #[test]
+    fn parse_select_resources_by_id() {
+        let sql = "SELECT * FROM resources WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
+        let uid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        assert_eq!(parse_sql(sql).unwrap(), Command::SelectResources { filter: ResourceFilter::Id(uid) });
+    }
+
+    #[test]
+    fn select_resources_refuses_filters_it_cannot_honour() {
+        // Refused, never ignored: an ignored filter would answer with every resource in the tenant.
+        for sql in [
+            "SELECT * FROM resources WHERE name = 'Room A'",
+            "SELECT * FROM resources WHERE id IS NULL",
+            "SELECT * FROM resources WHERE id = 'not-a-ulid'",
+        ] {
+            assert!(parse_sql(sql).is_err(), "{sql} must be refused");
         }
     }
 
