@@ -1227,10 +1227,12 @@ async fn listen_over_the_per_connection_limit_is_refused_not_silently_ignored() 
 #[tokio::test]
 async fn a_deleted_resource_gives_its_listen_slot_back() {
     // Before: the slot was only freed on the next accepted LISTEN, and at the limit every LISTEN was
-    // refused, so a connection whose resources were deleted stayed full for good.
+    // refused, so a connection whose resources were deleted stayed full for good. And the LISTEN
+    // accepted in its place has to deliver: the connection loop once still counted the deleted
+    // resource's forwarder, skipped the new subscription, and the client waited on silence.
     use deltat::limits::MAX_SUBSCRIPTIONS_PER_CONNECTION as MAX;
     let (addr, _tm) = start_test_server().await;
-    let (client, _rx) = connect(addr).await;
+    let (client, mut rx) = connect(addr).await;
     let ids: Vec<Ulid> = (0..=MAX).map(|_| Ulid::new()).collect();
     let values = ids.iter().map(|id| format!("('{id}')")).collect::<Vec<_>>().join(", ");
     client.batch_execute(&format!("INSERT INTO resources (id) VALUES {values}")).await.unwrap();
@@ -1240,6 +1242,24 @@ async fn a_deleted_resource_gives_its_listen_slot_back() {
 
     client.batch_execute(&format!("DELETE FROM resources WHERE id = '{}'", ids[0])).await.unwrap();
     client.batch_execute(&format!("LISTEN resource_{}", ids[MAX])).await.unwrap();
+
+    let (hid, rid) = (Ulid::new(), ids[MAX]);
+    let start = client_now_ms() + 3_600_000;
+    let (end, expires) = (start + 1000, client_now_ms() + 60_000);
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', {start}, {end}, {expires})"#
+        ))
+        .await
+        .unwrap();
+    let wanted = format!("resource_{rid}");
+    // The deleted resource's own notice may come first; only the new channel's counts.
+    loop {
+        let n = recv_notification(&mut rx, Duration::from_secs(5)).await.expect("the new channel delivers");
+        if n.channel() == wanted {
+            break;
+        }
+    }
 }
 
 #[tokio::test]

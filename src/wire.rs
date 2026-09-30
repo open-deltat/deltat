@@ -1097,9 +1097,6 @@ pub async fn process_connection_with_auth(
                             if forwarders.contains_key(&rid) {
                                 continue; // already subscribed
                             }
-                            if forwarders.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
-                                continue; // limit reached; LISTEN refuses before this can happen
-                            }
                             // Resolve the engine to get the notify hub
                             let engine = match handler.resolve_engine(&socket) {
                                 Ok((e, _)) => e,
@@ -1115,6 +1112,16 @@ pub async fn process_connection_with_auth(
                             if engine.get_resource(&rid).is_none() {
                                 forget(&rid);
                                 continue;
+                            }
+                            // Counted the way LISTEN counts `listening`: resources that still exist.
+                            // A deleted resource's forwarder is left to finish on its own, since it
+                            // may still have the ResourceDeleted notice to deliver, but it no longer
+                            // takes a slot. Counting it here and not there acknowledged a LISTEN and
+                            // then skipped it, which delivers nothing and says nothing.
+                            let live = forwarders.keys().filter(|id| engine.get_resource(id).is_some()).count();
+                            if live >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                                forget(&rid);
+                                continue; // LISTEN refuses before this can happen
                             }
                             let rx = engine.notify.subscribe(rid);
                             let tx = notify_tx.clone();
