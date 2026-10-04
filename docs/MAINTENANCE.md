@@ -32,8 +32,8 @@ Everything else was on rung 1. Here is what that cost:
 - Issue #24 still carries a "silently divides by 1000" framing that `FORMAT.md` §9 now formally
   contradicts.
 - `FORMAT.md` evolution rule 3 is unimplementable under bincode and contradicts rule 4.
-- `benches/stress.rs:298` queries a 365-day window against a 90-day cap, so phase 3 panics and phase
-  4 has never run. Nobody noticed, because the bench is not in CI (TEST-11).
+- The stress bench queried a 365-day window against a 90-day cap, so phase 3 panicked and phase 4
+  never ran. Nobody noticed for months, because the bench is not in CI (TEST-11). Fixed with #25.
 - The audit needed a section titled "Do not re-litigate". That section is a symptom: decisions were
   made and not captured where the next decider would see them.
 

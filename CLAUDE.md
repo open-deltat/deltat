@@ -101,7 +101,7 @@ cargo test --lib                   # unit suite
 cargo test --test listen_notify    # plus extended_query, auth_isolation
 cargo clippy --all-targets -- -D warnings
 sh scripts/check-all.sh            # every enforced principle
-cargo bench --bench stress         # not gated in CI (TEST-11); see #25 before trusting it
+cargo bench --bench stress         # not gated in CI (TEST-11); phase 3 is reads beside writers on one resource
 ```
 
 CI additionally runs the lib suite under `--release`, because the release-only `overflow-checks`

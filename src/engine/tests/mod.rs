@@ -16,5 +16,6 @@ mod metrics;
 mod multi_availability;
 mod multi_hold;
 mod queries;
+mod read_path;
 mod verticals;
 mod wal_durability;

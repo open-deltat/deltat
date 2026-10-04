@@ -21,7 +21,7 @@ use super::conflict::{
     validate_timestamp,
 };
 use super::offer::{self, Refused};
-use super::{Engine, EngineError, WalCommand};
+use super::{Announcement, Engine, EngineError, WalCommand};
 
 /// The rule-collection window for a write that may need to offer alternatives.
 ///
@@ -97,9 +97,7 @@ impl Engine {
         if let Some(pid) = parent_id {
             self.store.add_child(pid, id);
         }
-        let notice = Notice::of(&event);
-        self.notify.send(id, &notice);
-        self.notify_ancestors(parent_id, &notice);
+        self.publish(id, parent_id, &Notice::of(&event));
         Ok(())
     }
 
@@ -152,9 +150,7 @@ impl Engine {
         let event = Event::ResourceDeleted { id };
         self.wal_append(&event).await?;
         self.store.remove_resource(&id);
-        let notice = Notice::of(&event);
-        self.notify.send(id, &notice);
-        self.notify_ancestors(parent_id, &notice);
+        self.publish(id, parent_id, &Notice::of(&event));
         // Deliver the deletion to current listeners above, then reclaim the channel so a
         // long-lived tenant does not leak one broadcast sender per ever-deleted resource.
         self.notify.remove(&id);
@@ -331,7 +327,7 @@ impl Engine {
         let (inherited_nb, inherited_blocking, ancestor_has_schedule) = self
             .collect_inherited_rules(resource_id, parent_id, &rule_window)
             .await?;
-        let mut guard = rs.write().await;
+        let guard = rs.write_owned().await;
         self.reject_reused_id(id)?;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource").into());
@@ -356,8 +352,8 @@ impl Engine {
         }
 
         self.watch_hold_expiry(expires_at);
-        let event = Event::HoldPlaced { id, resource_id, span, expires_at };
-        self.persist_and_apply(resource_id, &mut guard, &event).await?;
+        self.persist_early_one(resource_id, guard, Event::HoldPlaced { id, resource_id, span, expires_at })
+            .await?;
         metrics::counter!(crate::observability::HOLDS_PLACED_TOTAL).increment(1);
         Ok(())
     }
@@ -455,7 +451,7 @@ impl Engine {
             .iter()
             .map(|(hold_id, ..)| self.get_resource_for_entity(hold_id).ok_or(EngineError::NotFound(*hold_id)))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut locked = self.lock_resources(resource_ids.iter().copied()).await?;
+        let locked = self.lock_resources(resource_ids.iter().copied()).await?;
 
         let now = self.now_ms();
         let offer_limit = if commits.len() == 1 { offer_limit } else { 0 };
@@ -479,31 +475,26 @@ impl Engine {
             entries.push(HoldCommit { hold_id, booking_id, resource_id, span, label });
         }
 
-        // Applied only once durable, like persist_and_apply.
-        self.wal_append(&Event::HoldsCommitted { commits: entries.clone() }).await?;
-        for (resource_id, guard) in locked.iter_mut() {
-            for commit in entries.iter().filter(|c| c.resource_id == *resource_id) {
-                self.apply_commit(guard, commit);
-            }
-        }
+        // A commit swaps a hold for a booking on the same span, so the span is never shown free:
+        // it may be applied before it is durable.
+        let announce = entries.iter().flat_map(|commit| self.announce_commit(&locked, commit)).collect();
         let count = entries.len() as u64;
+        self.persist_early(locked, vec![Event::HoldsCommitted { commits: entries }], announce).await?;
         metrics::counter!(crate::observability::HOLDS_COMMITTED_TOTAL).increment(count);
         metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL).increment(count);
         Ok(())
     }
 
-    /// Apply one durable commit entry to its resource and publish it. The release names the commit
-    /// and its booking, so a subscriber never reports the span as free in the instant before the
-    /// booking arrives.
-    fn apply_commit(&self, guard: &mut ResourceState, commit: &HoldCommit) {
+    /// What subscribers hear of a commit entry. The release names the commit and its booking, so a
+    /// subscriber never reports the span as free in the instant before the booking arrives.
+    fn announce_commit(&self, locked: &Locked, commit: &HoldCommit) -> [Announcement; 2] {
+        let parent_id = locked.get(&commit.resource_id).and_then(|guard| guard.parent_id);
         let [release, book] = commit.events();
-        self.store.apply_event(guard, &release);
-        self.store.apply_event(guard, &book);
         let ended = Ended { span: commit.span, reason: Some(HoldEnd::Committed), booking_id: Some(commit.booking_id) };
-        for notice in [Notice::ended(&release, ended), Notice::of(&book)] {
-            self.notify.send(commit.resource_id, &notice);
-            self.notify_ancestors(guard.parent_id, &notice);
-        }
+        [
+            self.announcement(commit.resource_id, parent_id, Notice::ended(&release, ended)),
+            self.announcement(commit.resource_id, parent_id, Notice::of(&book)),
+        ]
     }
 
     pub async fn confirm_booking(
@@ -539,7 +530,7 @@ impl Engine {
         let (inherited_nb, inherited_blocking, ancestor_has_schedule) = self
             .collect_inherited_rules(resource_id, parent_id, &rule_window)
             .await?;
-        let mut guard = rs.write().await;
+        let guard = rs.write_owned().await;
         self.reject_reused_id(id)?;
         if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
             return Err(EngineError::LimitExceeded("too many intervals on resource").into());
@@ -563,8 +554,8 @@ impl Engine {
             ));
         }
 
-        let event = Event::BookingConfirmed { id, resource_id, span, label };
-        self.persist_and_apply(resource_id, &mut guard, &event).await?;
+        self.persist_early_one(resource_id, guard, Event::BookingConfirmed { id, resource_id, span, label })
+            .await?;
         metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL).increment(1);
         Ok(())
     }
@@ -582,7 +573,7 @@ impl Engine {
             validate_label(label.as_ref())?;
         }
         let members: Vec<(Ulid, Ulid, Span)> = bookings.iter().map(|(id, rid, span, _)| (*id, *rid, *span)).collect();
-        let mut locked = self.admit_batch(&members).await?;
+        let locked = self.admit_batch(&members).await?;
 
         // A single append is the all-or-nothing durability boundary (AVAIL-06): the previous
         // per-booking loop did N awaited appends, so a mid-batch WAL error left earlier bookings
@@ -592,10 +583,10 @@ impl Engine {
             .into_iter()
             .map(|(id, resource_id, span, label)| Event::BookingConfirmed { id, resource_id, span, label })
             .collect();
-        self.wal_append_atomic(&events).await?;
-        self.apply_and_publish(&mut locked, &events);
-        metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL)
-            .increment(events.len() as u64);
+        let count = events.len() as u64;
+        let announce = self.announce_each(&locked, &events);
+        self.persist_early(locked, events, announce).await?;
+        metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL).increment(count);
         Ok(())
     }
 
@@ -614,16 +605,17 @@ impl Engine {
             return Ok(());
         };
         let members: Vec<(Ulid, Ulid, Span)> = holds.iter().map(|(id, rid, span, _)| (*id, *rid, *span)).collect();
-        let mut locked = self.admit_batch(&members).await?;
+        let locked = self.admit_batch(&members).await?;
 
         self.watch_hold_expiry(earliest);
         let events: Vec<Event> = holds
             .into_iter()
             .map(|(id, resource_id, span, expires_at)| Event::HoldPlaced { id, resource_id, span, expires_at })
             .collect();
-        self.wal_append_atomic(&events).await?;
-        self.apply_and_publish(&mut locked, &events);
-        metrics::counter!(crate::observability::HOLDS_PLACED_TOTAL).increment(events.len() as u64);
+        let count = events.len() as u64;
+        let announce = self.announce_each(&locked, &events);
+        self.persist_early(locked, events, announce).await?;
+        metrics::counter!(crate::observability::HOLDS_PLACED_TOTAL).increment(count);
         Ok(())
     }
 
@@ -638,17 +630,61 @@ impl Engine {
         Ok(locked)
     }
 
-    /// Apply durable single-resource events to the locked resources they name, and publish each
-    /// to its resource and that resource's ancestors.
-    fn apply_and_publish(&self, locked: &mut Locked, events: &[Event]) {
+    /// Persist and apply writes that only ever take time away (holds, bookings, commits) without
+    /// making readers wait out the fsync (#25).
+    ///
+    /// The record is queued and the change applied while every lock is held; then the locks are
+    /// released and only this caller waits for the flush. A reader may see the change a moment
+    /// before it is durable, which can only show less availability than the truth, never more
+    /// (src/engine/CLAUDE.md, failure direction). Queuing before applying keeps compaction honest:
+    /// a snapshot that sees the change was taken after its record was queued, so the record is
+    /// flushed or refused before that snapshot is written. A failed flush stops the tenant, so the
+    /// not-yet-durable change is never built on. Subscribers hear of it once durable, from the
+    /// writer, in log order. One record joins the shared group commit; several flush together.
+    async fn persist_early(
+        &self,
+        mut locked: Locked,
+        records: Vec<Event>,
+        announce: Vec<Announcement>,
+    ) -> Result<(), EngineError> {
+        let changes: Vec<Event> = records.iter().flat_map(Event::per_resource).collect();
+        let outcome = self
+            .queue(|response| match <[Event; 1]>::try_from(records) {
+                Ok([event]) => WalCommand::Append { event, announce, response },
+                Err(events) => WalCommand::AppendAtomic { events, announce, response },
+            })
+            .await?;
         for (resource_id, guard) in locked.iter_mut() {
-            for event in events.iter().filter(|e| super::event_resource_id(e) == Some(*resource_id)) {
-                self.store.apply_event(guard, event);
-                let notice = Notice::of(event);
-                self.notify.send(*resource_id, &notice);
-                self.notify_ancestors(guard.parent_id, &notice);
+            for change in changes.iter().filter(|c| super::event_resource_id(c) == Some(*resource_id)) {
+                self.store.apply_event(guard, change);
             }
         }
+        drop(locked);
+        Self::durable(outcome).await
+    }
+
+    /// `persist_early` for one event on one resource, announced as it is.
+    async fn persist_early_one(
+        &self,
+        resource_id: Ulid,
+        guard: tokio::sync::OwnedRwLockWriteGuard<ResourceState>,
+        event: Event,
+    ) -> Result<(), EngineError> {
+        let announce = vec![self.announcement(resource_id, guard.parent_id, Notice::of(&event))];
+        self.persist_early(Locked::from([(resource_id, guard)]), vec![event], announce).await
+    }
+
+    /// Each single-resource event announced as it is, to its resource and that resource's
+    /// ancestors.
+    fn announce_each(&self, locked: &Locked, events: &[Event]) -> Vec<Announcement> {
+        events
+            .iter()
+            .filter_map(|event| {
+                let resource_id = super::event_resource_id(event)?;
+                let parent_id = locked.get(&resource_id)?.parent_id;
+                Some(self.announcement(resource_id, parent_id, Notice::of(event)))
+            })
+            .collect()
     }
 
     /// Lock and admit a batch of new allocations `(id, resource_id, span)`, all or nothing. Every
