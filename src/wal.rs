@@ -39,7 +39,10 @@ const MAGIC: &[u8; 8] = b"DELTATWL";
 ///   version catches the difference.
 ///
 /// `format_fingerprint` at the bottom of this file fails on either class under an unchanged version.
-const FORMAT_VERSION: u16 = 1;
+///
+/// 2 added `HoldsCommitted` (MCP-K1). Every version-1 record decodes unchanged, so `open` migrates a
+/// version-1 file by rewriting its header; a version-1 binary refuses the result.
+const FORMAT_VERSION: u16 = 2;
 
 /// Files written before 0.3.0 begin with a record instead of a header. They are format 0 by
 /// definition: their records are identical to version 1's, only the self-identifying header is
@@ -512,6 +515,47 @@ mod tests {
             "and must be stamped with the current format version"
         );
         assert_eq!(Wal::replay(&path).unwrap(), events, "every record must survive the upgrade");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_version_1_wal_upgrades_and_then_takes_a_holds_committed_record() {
+        // 0.3.0 writes version 1. Version 2 only adds HoldsCommitted, so every version-1 record
+        // decodes unchanged: opening restamps the header, keeps every record, and only then can a
+        // record a version-1 binary cannot read land behind them.
+        let path = tmp_path("v1_to_v2.wal");
+        let _ = fs::remove_file(&path);
+        let v1_records = vec![sample_event(), sample_event()];
+        {
+            let mut f = BufWriter::new(File::create(&path).unwrap());
+            f.write_all(MAGIC).unwrap();
+            f.write_all(&1u16.to_le_bytes()).unwrap();
+            for e in &v1_records {
+                encode_event(&mut f, e).unwrap();
+            }
+            f.flush().unwrap();
+        }
+
+        let commit = Event::HoldsCommitted {
+            commits: vec![crate::model::HoldCommit {
+                hold_id: Ulid::new(),
+                booking_id: Ulid::new(),
+                resource_id: Ulid::new(),
+                span: crate::model::Span::new(1000, 2000),
+                label: None,
+            }],
+        };
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&commit).unwrap();
+        }
+
+        let head = head_bytes(&path, HEADER_BYTES);
+        assert_eq!(u16::from_le_bytes([head[8], head[9]]), FORMAT_VERSION);
+        let mut expected = v1_records;
+        expected.push(commit);
+        assert_eq!(Wal::replay(&path).unwrap(), expected);
 
         let _ = fs::remove_file(&path);
     }
@@ -1036,13 +1080,14 @@ mod tests {
 #[cfg(test)]
 mod format_fingerprint {
     use super::*;
-    use crate::model::Span;
+    use crate::model::{HoldCommit, Span};
     use ulid::Ulid;
 
     /// The encoding table's digest at each `FORMAT_VERSION`. Append-only: an entry describes data
     /// already on someone's disk, so editing a shipped one hides exactly the change it records.
     /// Version 0 (headerless, before 0.3.0) and 1 differ only in the file header, not the records.
-    const FORMAT_HISTORY: &[(u16, u32)] = &[(0, 193150730), (1, 193150730)];
+    /// Version 2 adds `HoldsCommitted` (MCP-K1); every earlier variant encodes as in version 1.
+    const FORMAT_HISTORY: &[(u16, u32)] = &[(0, 193150730), (1, 193150730), (2, 1880441572)];
 
     /// One sample per variant and its golden bincode payload. Every field gets a distinct,
     /// non-default value (`Some` rather than `None`), so a swapped or retyped field moves bytes.
@@ -1090,6 +1135,8 @@ mod format_fingerprint {
             => "080000001a0000000000000030303030303030303030303030303030303030303030303030541a0000000000000030303030303030303030303030303030303030303030303030561c000000000000001d0000000000000001040000000000000073656174",
         BookingCancelled { id: id(30), resource_id: id(31) }
             => "090000001a0000000000000030303030303030303030303030303030303030303030303030591a00000000000000303030303030303030303030303030303030303030303030305a",
+        HoldsCommitted { commits: vec![HoldCommit { hold_id: id(32), booking_id: id(33), resource_id: id(34), span: Span { start: 35, end: 36 }, label: Some("kit".into()) }] }
+            => "0a00000001000000000000001a0000000000000030303030303030303030303030303030303030303030303031301a0000000000000030303030303030303030303030303030303030303030303031311a000000000000003030303030303030303030303030303030303030303030303132230000000000000024000000000000000103000000000000006b6974",
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -1110,12 +1157,20 @@ mod format_fingerprint {
                 (name, hex(&bincode::serialize(&event).unwrap()))
             })
             .collect();
-        let drifted: Vec<String> = goldens()
+        let mismatched: Vec<(&str, &str, &str)> = goldens()
             .iter()
             .zip(&actual)
             .filter(|((_, _, golden), (_, now))| golden != now)
-            .map(|((name, _, golden), (_, now))| format!("  {name}\n    pinned {golden}\n    now    {now}"))
+            .map(|((name, _, golden), (_, now))| (*name, *golden, now.as_str()))
             .collect();
+        let (unpinned, drifted): (Vec<_>, Vec<_>) =
+            mismatched.into_iter().partition(|(_, golden, _)| golden.is_empty());
+        let show = |rows: &[(&str, &str, &str)]| {
+            rows.iter()
+                .map(|(name, golden, now)| format!("  {name}\n    pinned {golden}\n    now    {now}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         assert!(
             drifted.is_empty(),
             "The WAL encoding of these Event variants changed:\n{}\n\n\
@@ -1124,7 +1179,14 @@ mod format_fingerprint {
              bump FORMAT_VERSION in src/wal.rs, teach Wal::scan to decode the old shape for older \
              versions (it decodes every record with today's Event), then paste the new bytes above \
              and append the new digest that every_format_version_pins_its_encoding_table prints.",
-            drifted.join("\n")
+            show(&drifted)
+        );
+        assert!(
+            unpinned.is_empty(),
+            "These Event variants have no pinned bytes yet:\n{}\n\n\
+             Paste each `now` value in as its golden. A new variant also needs a FORMAT_VERSION bump \
+             before anything can write it; every_format_version_pins_its_encoding_table says which.",
+            show(&unpinned)
         );
     }
 

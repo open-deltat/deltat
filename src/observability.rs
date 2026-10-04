@@ -206,6 +206,8 @@ pub fn command_label(cmd: &Command) -> &'static str {
         Command::CommitHold { .. } => "commit_hold",
         Command::InsertBooking { .. } => "insert_booking",
         Command::BatchInsertBookings { .. } => "batch_insert_bookings",
+        Command::BatchInsertHolds { .. } => "batch_insert_holds",
+        Command::CommitHolds { .. } => "commit_holds",
         Command::DeleteBooking { .. } => "delete_booking",
         Command::SelectResources { .. } => "select_resources",
         Command::SelectRules { .. } => "select_rules",

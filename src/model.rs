@@ -214,6 +214,39 @@ pub enum Event {
         id: Ulid,
         resource_id: Ulid,
     },
+    /// Holds turned into bookings, possibly across several resources, as ONE record so a crash
+    /// keeps every one of them or none (MCP-K1, AVAIL-07). Each entry means exactly a
+    /// `HoldReleased` then a `BookingConfirmed` on its own resource; see `HoldCommit::events`.
+    HoldsCommitted {
+        commits: Vec<HoldCommit>,
+    },
+}
+
+/// One hold becoming a booking on the hold's resource and span, inside `Event::HoldsCommitted`.
+/// The record carries the span and resource rather than leaving replay to look them up, so it
+/// explains itself without the hold it consumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldCommit {
+    pub hold_id: Ulid,
+    pub booking_id: Ulid,
+    pub resource_id: Ulid,
+    pub span: Span,
+    pub label: Option<String>,
+}
+
+impl HoldCommit {
+    /// The two single-resource events this entry stands for, in the order they take effect.
+    pub fn events(&self) -> [Event; 2] {
+        [
+            Event::HoldReleased { id: self.hold_id, resource_id: self.resource_id },
+            Event::BookingConfirmed {
+                id: self.booking_id,
+                resource_id: self.resource_id,
+                span: self.span,
+                label: self.label.clone(),
+            },
+        ]
+    }
 }
 
 impl Event {
@@ -226,7 +259,18 @@ impl Event {
             | Event::RuleUpdated { span, .. }
             | Event::HoldPlaced { span, .. }
             | Event::BookingConfirmed { span, .. } => span.start < span.end,
+            Event::HoldsCommitted { commits } => commits.iter().all(|c| c.span.start < c.span.end),
             _ => true,
+        }
+    }
+
+    /// This event as single-resource events. Only `HoldsCommitted` spans resources, and it is one
+    /// record purely so a crash cannot split it; anything that dedupes or routes events by resource
+    /// works on this expansion instead.
+    pub fn per_resource(&self) -> Vec<Event> {
+        match self {
+            Event::HoldsCommitted { commits } => commits.iter().flat_map(HoldCommit::events).collect(),
+            other => vec![other.clone()],
         }
     }
 }

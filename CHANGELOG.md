@@ -7,6 +7,13 @@ All notable changes to deltat are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Hold several resources at once, and book them all or none.** A camera body, its lens and the
+  crew; an operating room, the surgeon and the anaesthetist; an appointment and the drive to it.
+  A multi-row `INSERT INTO holds` now holds every row or none, across resources, where it used to be
+  refused. `INSERT INTO bookings (id, hold_id, label)` books every listed hold or none, each booking
+  taking its hold's resource and span, and is one WAL record, so neither a competing writer nor a
+  crash can leave some of the kit booked and the rest free. The existing
+  `UPDATE holds SET booking_id = ...` commit is unchanged on the wire.
 - **An ending says when it was and why.** `HoldReleased` and `BookingCancelled` notifications now
   carry the `span` that ended, and a released hold says `"reason"`: `"released"` (a DELETE),
   `"expired"` (the reaper) or `"committed"` (turned into a booking, with that `"booking_id"`; its
@@ -168,6 +175,11 @@ All notable changes to deltat are documented here. The format follows
   to commit.
 
 ### Changed
+- **WAL format 2.** Committing a hold now writes one `HoldsCommitted` record instead of a release and
+  a booking, so a crash can no longer keep the release and lose the booking. Data written by 0.3.0
+  is kept as it is: on first open the log's header is restamped to 2 and every record replays
+  unchanged. **An older deltat refuses to open the log after that**, so to roll back past this
+  release, restore the data directory from before the upgrade.
 - Notification payloads are serialized at most once per change, on first use, and shared by every
   subscriber, instead of once per subscriber; a change nobody listens to is never serialized. Their
   bytes are unchanged for every event except the endings described under Added, which append their

@@ -1082,31 +1082,93 @@ async fn hold_expiry_is_clamped_over_wire() {
 }
 
 #[tokio::test]
-async fn multi_row_holds_insert_is_rejected_not_truncated() {
-    // A two-row holds VALUES must error as a whole: accepting only the first row with INSERT
-    // success would leave the second slot free for a competitor while the client believes it
-    // is held.
+async fn multi_row_holds_insert_holds_every_row_or_none() {
+    // A two-row holds VALUES is one all-or-nothing batch (MCP-K1). Holding only the first row with
+    // INSERT success would leave the second slot free for a competitor while the client believes it
+    // is held, so every row lands, or, when one cannot, none does.
     let (addr, _tm) = start_test_server().await;
     let (client, _rx) = connect(addr).await;
 
-    let rid = Ulid::new();
+    let (body, lens) = (Ulid::new(), Ulid::new());
+    for rid in [body, lens] {
+        client
+            .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+            .await
+            .unwrap();
+    }
+    let expires = client_now_ms() + 60_000;
+    let hold_both = |h1: Ulid, h2: Ulid| {
+        format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{h1}', '{body}', 1000, 2000, {expires}), ('{h2}', '{lens}', 1000, 2000, {expires})"#
+        )
+    };
+
+    client.batch_execute(&hold_both(Ulid::new(), Ulid::new())).await.unwrap();
+    for rid in [body, lens] {
+        let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+        assert_eq!(holds.len(), 1, "every row is held, not just the first");
+    }
+
+    // Both resources are now held on that span, so a second pair conflicts on both and lands on
+    // neither.
+    let result = client.simple_query(&hold_both(Ulid::new(), Ulid::new())).await;
+    assert!(result.is_err(), "a batch that cannot hold every row must fail");
+    for rid in [body, lens] {
+        let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+        assert_eq!(holds.len(), 1, "no partial hold may land from a refused batch");
+    }
+}
+
+#[tokio::test]
+async fn holds_on_several_resources_commit_together_over_the_wire() {
+    // The published contract, spoken by a plain Postgres client: hold a kit in one statement, then
+    // book every hold in one statement. The bookings take the holds' resources and spans.
+    let (addr, _tm) = start_test_server().await;
+    let (client, _rx) = connect(addr).await;
+
+    let (body, lens) = (Ulid::new(), Ulid::new());
+    for rid in [body, lens] {
+        client
+            .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+            .await
+            .unwrap();
+    }
+    // A live span, so the collector's first tick cannot take the bookings before the SELECT.
+    let start = client_now_ms() + 3_600_000;
+    let end = start + 3_600_000;
+    let expires = client_now_ms() + 60_000;
+    let (h1, h2, b1, b2) = (Ulid::new(), Ulid::new(), Ulid::new(), Ulid::new());
     client
-        .batch_execute(&format!("INSERT INTO resources (id) VALUES ('{rid}')"))
+        .batch_execute(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{h1}', '{body}', {start}, {end}, {expires}), ('{h2}', '{lens}', {start}, {end}, {expires})"#
+        ))
         .await
         .unwrap();
 
-    let expires = client_now_ms() + 60_000;
-    let h1 = Ulid::new();
-    let h2 = Ulid::new();
-    let result = client
+    client
+        .batch_execute(&format!(
+            "INSERT INTO bookings (id, hold_id, label) VALUES ('{b1}', '{h1}', 'body'), ('{b2}', '{h2}', 'lens')"
+        ))
+        .await
+        .unwrap();
+
+    for (rid, bid) in [(body, b1), (lens, b2)] {
+        let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+        assert!(holds.is_empty(), "every hold is consumed by its booking");
+        let bookings = select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+        assert_eq!(bookings.len(), 1);
+        assert_eq!(bookings[0].0, bid.to_string());
+    }
+
+    // Committing the same holds again finds nothing to commit and books nothing more.
+    let again = client
         .simple_query(&format!(
-            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{h1}', '{rid}', 1000, 2000, {expires}), ('{h2}', '{rid}', 3000, 4000, {expires})"#
+            "INSERT INTO bookings (id, hold_id) VALUES ('{}', '{h1}'), ('{}', '{h2}')",
+            Ulid::new(),
+            Ulid::new()
         ))
         .await;
-    assert!(result.is_err(), "multi-row holds INSERT must be rejected, not truncated");
-
-    let holds = select_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
-    assert!(holds.is_empty(), "no partial hold may land from a rejected statement");
+    assert!(again.is_err(), "a consumed hold cannot be committed twice");
 }
 
 #[tokio::test]

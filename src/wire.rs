@@ -340,6 +340,25 @@ impl DeltaTHandler {
                     .await?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
             }
+            Command::BatchInsertHolds { holds } => {
+                let count = holds.len();
+                let batch: Vec<_> = holds
+                    .into_iter()
+                    .map(|(id, resource_id, start, end, expires_at)| {
+                        Span::try_new(start, end)
+                            .map(|span| (id, resource_id, span, expires_at))
+                            .map_err(span_err)
+                    })
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                engine.batch_place_holds(batch).await?;
+                Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
+            }
+            Command::CommitHolds { commits } => {
+                // An INSERT of bookings, so the tag counts bookings created, as a batch booking's does.
+                let count = commits.len();
+                engine.commit_holds(commits).await?;
+                Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
+            }
             Command::DeleteBooking { id } => {
                 engine.cancel_booking(id).await?;
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
