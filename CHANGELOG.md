@@ -22,8 +22,10 @@ All notable changes to deltat are documented here. The format follows
 
 ### Security
 - **Notifications no longer carry booking labels** (AUTHZ-07, first half). A label is whatever
-  the booker typed, often their name, and every LISTEN subscriber on a resource received it, not
-  only whoever may read the resource's bookings. `BookingConfirmed` payloads now send
+  the booker typed, often their name, and notifications are what gets passed on: an app that
+  forwards changes to browsers watching a public page, an agent reading a change stream
+  unprompted. Every one of them received it. Inside deltat, any connection that may LISTEN may
+  still read labels with SELECT; this closes the push path only. `BookingConfirmed` payloads now send
   `"label": null` with the key where it always was, so parsers keep working, but a client that
   displayed the label from the notification now has to read it with the booking
   (`SELECT * FROM bookings`). Hold ids and resource names are still sent; that half of AUTHZ-07

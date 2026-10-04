@@ -40,8 +40,8 @@ pub struct Ended {
     pub booking_id: Option<Ulid>,
 }
 
-/// What a LISTEN subscriber is sent for one committed change. `event` is already what subscribers
-/// may see (see `broadcastable`), so nothing reading a notice can reach a label.
+/// What a LISTEN subscriber is sent for one committed change. Its event is already what subscribers
+/// may see (see `broadcastable`), and private, so nothing reading a notice can reach a label.
 ///
 /// `Event` is the WAL record format (bincode, no schema version), so it cannot grow fields without
 /// making existing logs unreadable. The extra facts ride here, on the notification only.
@@ -50,7 +50,7 @@ pub struct Ended {
 /// cell), so a change nobody listens to is never serialized and one many listen to is serialized once.
 #[derive(Debug, Clone)]
 pub struct Notice {
-    pub event: Event,
+    event: Event,
     pub ended: Option<Ended>,
     payload: Arc<OnceLock<Arc<str>>>,
 }
@@ -82,28 +82,38 @@ enum EndedPayload<'a> {
 }
 
 /// What a subscriber may be told of `event`: all of it except booking labels. A label is whatever
-/// the booker typed, often a name, and anyone who may LISTEN on a resource hears its changes, not
-/// only whoever may read its bookings (AUTHZ-07). The key stays, as `null`, so the payload keeps
-/// its shape; the label is read with the booking. Every variant is named, so a new one does not
-/// compile until someone decides what of it may be broadcast.
+/// the booker typed, often a name, and notifications are what gets passed on: to browsers watching
+/// a public page, to agents reading a change stream unprompted (AUTHZ-07). Who may read a label is
+/// the read path's decision, so the key stays, as `null`, and the label is read with the booking.
+/// Every variant and every field is named, so a new one of either does not compile until someone
+/// decides whether it may be broadcast.
 fn broadcastable(event: &Event) -> Event {
     match event {
         Event::BookingConfirmed { id, resource_id, span, label: _ } => {
             Event::BookingConfirmed { id: *id, resource_id: *resource_id, span: *span, label: None }
         }
         Event::HoldsCommitted { commits } => Event::HoldsCommitted {
-            commits: commits.iter().map(|commit| HoldCommit { label: None, ..commit.clone() }).collect(),
+            commits: commits
+                .iter()
+                .map(|&HoldCommit { hold_id, booking_id, resource_id, span, label: _ }| HoldCommit {
+                    hold_id,
+                    booking_id,
+                    resource_id,
+                    span,
+                    label: None,
+                })
+                .collect(),
         },
         // Nothing a booker types. A resource's name is set by whoever creates the resource.
-        Event::ResourceCreated { .. }
-        | Event::ResourceUpdated { .. }
-        | Event::ResourceDeleted { .. }
-        | Event::RuleAdded { .. }
-        | Event::RuleUpdated { .. }
-        | Event::RuleRemoved { .. }
-        | Event::HoldPlaced { .. }
-        | Event::HoldReleased { .. }
-        | Event::BookingCancelled { .. } => event.clone(),
+        Event::ResourceCreated { id: _, parent_id: _, name: _, capacity: _, buffer_after: _ }
+        | Event::ResourceUpdated { id: _, name: _, capacity: _, buffer_after: _ }
+        | Event::ResourceDeleted { id: _ }
+        | Event::RuleAdded { id: _, resource_id: _, span: _, blocking: _ }
+        | Event::RuleUpdated { id: _, resource_id: _, span: _, blocking: _ }
+        | Event::RuleRemoved { id: _, resource_id: _ }
+        | Event::HoldPlaced { id: _, resource_id: _, span: _, expires_at: _ }
+        | Event::HoldReleased { id: _, resource_id: _ }
+        | Event::BookingCancelled { id: _, resource_id: _ } => event.clone(),
     }
 }
 
@@ -129,6 +139,10 @@ impl Notice {
     /// `BookingCancelled`); any other event goes out exactly as `Notice::of` would send it.
     pub fn ended(event: &Event, ended: Ended) -> Self {
         Self { event: broadcastable(event), ended: Some(ended), payload: Arc::default() }
+    }
+
+    pub fn event(&self) -> &Event {
+        &self.event
     }
 
     /// The JSON payload: the event in the shape it always had, keys in the same order, with the

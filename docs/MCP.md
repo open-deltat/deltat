@@ -252,7 +252,7 @@ MCP is one skin. It should be the thinnest of several over a single policy core,
 
 ## 9. Risks
 
-**Prompt injection through booking labels is the sharpest new risk MCP adds.** Today `label` is free text in the kernel (`model.rs:61/189`). Under MCP, one tenant's booking label lands in another party's agent context during a joint availability read or a NOTIFY push. That is attacker-controlled text entering an agent's instruction stream. GAP-02 (`label` becomes an opaque `external_ref: Ulid`) was hygiene; it is now a security control, and it should be enforced by a test that no free-text byte crosses an agent-visible surface.
+**Prompt injection through booking labels is the sharpest new risk MCP adds.** Today `label` is free text in the kernel (`model.rs:61/189`). Under MCP, one tenant's booking label lands in another party's agent context during a joint availability read (a NOTIFY push no longer carries labels since deltat#49). That is attacker-controlled text entering an agent's instruction stream. GAP-02 (`label` becomes an opaque `external_ref: Ulid`) was hygiene; it is now a security control, and it should be enforced by a test that no free-text byte crosses an agent-visible surface.
 
 **Hold squatting is the cheapest attack.** Creating a hold costs an attacker nothing and costs the tenant a slot. Idempotency collapses retries, not fresh-Ulid floods. The bounds are per-identity concurrent-hold caps, TTL, and cost (MCP-S5, L6).
 
