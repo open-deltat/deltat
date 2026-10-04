@@ -391,9 +391,8 @@ impl Engine {
                     engine.store.remove_resource(id);
                 }
                 Event::HoldsCommitted { commits } => {
-                    let mut resource_ids: Vec<Ulid> = commits.iter().map(|c| c.resource_id).collect();
-                    resource_ids.sort();
-                    resource_ids.dedup();
+                    let resource_ids: std::collections::BTreeSet<Ulid> =
+                        commits.iter().map(|c| c.resource_id).collect();
                     for resource_id in resource_ids {
                         engine.replay_on(resource_id, event);
                     }

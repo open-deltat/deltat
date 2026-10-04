@@ -311,6 +311,43 @@ async fn an_offer_on_a_past_dated_request_does_not_panic() {
     let _ = refused.offer;
 }
 
+/// One commit path serves a single hold and a kit, so the rule that only a single hold is offered
+/// alternatives is one condition in it. A kit's alternative would have to fit every resource at once,
+/// which the per-resource sweep cannot answer, so offering anything there would be a guess.
+#[tokio::test]
+async fn a_lost_single_commit_is_offered_alternatives_and_a_lost_kit_is_not() {
+    let clock = Arc::new(TestClock::new(0));
+    let engine =
+        Engine::with_clock(test_wal_path("offer_commit.wal"), Arc::new(NotifyHub::new()), clock.clone()).unwrap();
+    let (a, b) = (Ulid::new(), Ulid::new());
+    for rid in [a, b] {
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), rid, Span::new(9 * H, 17 * H), false).await.unwrap();
+    }
+    let wanted = Span::new(10 * H, 11 * H);
+    // Both holds lapse at t=1, so a competitor can take A's span before they are committed.
+    let (ha, hb) = (Ulid::new(), Ulid::new());
+    engine.place_hold(ha, a, wanted, 1).await.unwrap();
+    engine.place_hold(hb, b, wanted, 1).await.unwrap();
+    clock.advance(2);
+    engine.confirm_booking(Ulid::new(), a, wanted, None).await.unwrap();
+
+    let single = engine
+        .commit_holds_offering(vec![(ha, Ulid::new(), None)], COUNTER_OFFER_MAX)
+        .await
+        .expect_err("A's span was taken");
+    assert!(
+        single.offer.is_some_and(|o| !o.alternatives.is_empty()),
+        "A is open until 17:00, so a lost single commit has somewhere else to go"
+    );
+
+    let kit = engine
+        .commit_holds_offering(vec![(ha, Ulid::new(), None), (hb, Ulid::new(), None)], COUNTER_OFFER_MAX)
+        .await
+        .expect_err("A's span was taken");
+    assert!(kit.offer.is_none(), "a kit is never offered a per-resource guess");
+}
+
 /// `offer::rank` must stay a pure, synchronous function of resource state. A refactor that made it
 /// async or lock-taking would reintroduce the C1 deadlock hazard and would still pass a wall-clock
 /// benchmark on an idle box, so the type system is the only reliable guard.

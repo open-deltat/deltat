@@ -13,7 +13,8 @@ All notable changes to deltat are documented here. The format follows
   refused. `INSERT INTO bookings (id, hold_id, label)` books every listed hold or none, each booking
   taking its hold's resource and span, and is one WAL record, so neither a competing writer nor a
   crash can leave some of the kit booked and the rest free. The existing
-  `UPDATE holds SET booking_id = ...` commit is unchanged on the wire.
+  `UPDATE holds SET booking_id = ...` commit is unchanged on the wire, and both statements share one
+  commit path: a single hold refused by either is offered alternatives; a kit is offered none.
 - **An ending says when it was and why.** `HoldReleased` and `BookingCancelled` notifications now
   carry the `span` that ended, and a released hold says `"reason"`: `"released"` (a DELETE),
   `"expired"` (the reaper) or `"committed"` (turned into a booking, with that `"booking_id"`; its
