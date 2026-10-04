@@ -14,6 +14,7 @@ mod hierarchy_toctou;
 mod limits;
 mod metrics;
 mod multi_availability;
+mod multi_hold;
 mod queries;
 mod verticals;
 mod wal_durability;

@@ -38,6 +38,27 @@ fn offer_window(span: &Span, offer_limit: usize) -> Span {
     Span::try_new(span.start, end).unwrap_or(*span)
 }
 
+/// The resources a multi-resource write touches, write-locked in ascending id order by
+/// `Engine::lock_resources`. Holding this across check, append and apply is what makes the write
+/// all-or-nothing to every other writer.
+struct LockedResources {
+    guards: Vec<tokio::sync::OwnedRwLockWriteGuard<ResourceState>>,
+    slot: HashMap<Ulid, usize>,
+}
+
+impl LockedResources {
+    /// The guard for a resource this write locked. Every caller asks only for resources it passed
+    /// to `lock_resources`, so a miss is a bug in the caller, not a runtime condition.
+    fn get(&self, resource_id: &Ulid) -> &ResourceState {
+        &self.guards[self.slot[resource_id]]
+    }
+
+    fn get_mut(&mut self, resource_id: &Ulid) -> &mut ResourceState {
+        let i = self.slot[resource_id];
+        &mut self.guards[i]
+    }
+}
+
 impl Engine {
     pub async fn create_resource(
         &self,
@@ -454,30 +475,90 @@ impl Engine {
             ));
         }
 
-        // Release + confirm share one fsync (WalCommand::AppendAtomic): an fsync error or a crash
-        // before the flush leaves neither durable. They are still two WAL records, so a torn write
-        // between them can lose the booking, but release is written before confirm, so the worst
-        // case a crash can leave is a freed (re-bookable) slot, never a live hold AND booking, i.e.
-        // never an overbook (INV-01 holds). Apply only after the append is durable, like
-        // persist_and_apply. (This closes the in-memory release-then-book TOCTOU; it is not a
-        // claim of torn-write crash atomicity. See WalCommand::AppendAtomic.)
-        let release = Event::HoldReleased { id: hold_id, resource_id };
-        let book = Event::BookingConfirmed { id: booking_id, resource_id, span, label };
-        self.wal_append_atomic(&[release.clone(), book.clone()]).await?;
-        self.store.apply_event(&mut guard, &release);
-        self.store.apply_event(&mut guard, &book);
-        let parent_id = guard.parent_id;
-        // The release says it was this commit and names the booking, so a subscriber never reports
-        // the span as free in the instant before the booking arrives.
-        let released = Notice::ended(&release, Ended { span, reason: Some(HoldEnd::Committed), booking_id: Some(booking_id) });
-        let booked = Notice::of(&book);
-        self.notify.send(resource_id, &released);
-        self.notify.send(resource_id, &booked);
-        self.notify_ancestors(parent_id, &released);
-        self.notify_ancestors(parent_id, &booked);
+        // One record, so a torn write loses the whole commit rather than keeping the release and
+        // losing the booking: the caller, never acknowledged, still holds the slot until it
+        // expires. Applied only once durable, like persist_and_apply.
+        let commit = HoldCommit { hold_id, booking_id, resource_id, span, label };
+        self.wal_append(&Event::HoldsCommitted { commits: vec![commit.clone()] }).await?;
+        self.apply_commit(&mut guard, &commit);
         metrics::counter!(crate::observability::HOLDS_COMMITTED_TOTAL).increment(1);
         metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL).increment(1);
         Ok(())
+    }
+
+    /// Several holds become bookings at once, all or nothing (MCP-K1). Each booking takes its hold's
+    /// resource and span, and the holds may sit on different resources: a camera body, its lens and
+    /// the crew, or an appointment and the drive to it.
+    ///
+    /// Every resource involved is write-locked before anything is checked, each hold must still be
+    /// a hold whose span is free of everything but itself, and the commit is one WAL record. So
+    /// neither a competing writer nor a crash can leave some of them booked and the rest not.
+    /// Refusals carry no alternatives: a joint alternative is a joint availability question.
+    pub async fn commit_holds(
+        &self,
+        commits: Vec<(Ulid, Ulid, Option<String>)>,
+    ) -> Result<(), EngineError> {
+        if commits.is_empty() {
+            return Ok(());
+        }
+        if commits.len() > MAX_BATCH_SIZE {
+            return Err(EngineError::LimitExceeded("batch too large"));
+        }
+        let mut holds_seen = HashSet::with_capacity(commits.len());
+        for (hold_id, _, label) in &commits {
+            if label.as_ref().is_some_and(|l| l.len() > MAX_LABEL_LEN) {
+                return Err(EngineError::LimitExceeded("label too long"));
+            }
+            if !holds_seen.insert(*hold_id) {
+                return Err(EngineError::AlreadyExists(*hold_id));
+            }
+        }
+        let resource_ids = commits
+            .iter()
+            .map(|(hold_id, ..)| self.get_resource_for_entity(hold_id).ok_or(EngineError::NotFound(*hold_id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut locked = self.lock_resources(resource_ids.clone()).await?;
+
+        // Checked under every lock, so the verdict cannot go stale before the append. A hold
+        // released, reaped or never a hold resolves to NotFound here even if it resolved above.
+        let now = self.now_ms();
+        let mut bookings_seen = HashSet::with_capacity(commits.len());
+        let mut entries = Vec::with_capacity(commits.len());
+        for ((hold_id, booking_id, label), resource_id) in commits.into_iter().zip(resource_ids) {
+            let guard = locked.get(&resource_id);
+            let span = find_interval_of_kind(guard, &hold_id, is_hold)?.span;
+            self.reject_reused_id(booking_id)?;
+            if !bookings_seen.insert(booking_id) {
+                return Err(EngineError::AlreadyExists(booking_id));
+            }
+            // Each hold is excluded only from its own check. The batch's other holds stay counted,
+            // which is exact: each becomes a booking of the same span, so the load does not change.
+            check_no_conflict_excluding(guard, &span, now, Some(hold_id))?;
+            entries.push(HoldCommit { hold_id, booking_id, resource_id, span, label });
+        }
+
+        self.wal_append(&Event::HoldsCommitted { commits: entries.clone() }).await?;
+        for commit in &entries {
+            self.apply_commit(locked.get_mut(&commit.resource_id), commit);
+        }
+        let count = entries.len() as u64;
+        metrics::counter!(crate::observability::HOLDS_COMMITTED_TOTAL).increment(count);
+        metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL).increment(count);
+        Ok(())
+    }
+
+    /// Apply one durable commit entry to its resource and publish it. The release names the commit
+    /// and its booking, so a subscriber never reports the span as free in the instant before the
+    /// booking arrives.
+    fn apply_commit(&self, guard: &mut ResourceState, commit: &HoldCommit) {
+        let [release, book] = commit.events();
+        self.store.apply_event(guard, &release);
+        self.store.apply_event(guard, &book);
+        let ended = Ended { span: commit.span, reason: Some(HoldEnd::Committed), booking_id: Some(commit.booking_id) };
+        for notice in [Notice::ended(&release, ended), Notice::of(&book)] {
+            self.notify.send(commit.resource_id, &notice);
+            self.notify_ancestors(guard.parent_id, &notice);
+        }
     }
 
     pub async fn confirm_booking(
@@ -555,19 +636,115 @@ impl Engine {
         if bookings.is_empty() {
             return Ok(());
         }
-        if bookings.len() > MAX_BATCH_SIZE {
+        if bookings.iter().any(|(.., label)| label.as_ref().is_some_and(|l| l.len() > MAX_LABEL_LEN)) {
+            return Err(EngineError::LimitExceeded("label too long"));
+        }
+        let members: Vec<(Ulid, Ulid, Span)> = bookings.iter().map(|(id, rid, span, _)| (*id, *rid, *span)).collect();
+        let mut locked = self.admit_batch(&members).await?;
+
+        // A single append is the all-or-nothing durability boundary (AVAIL-06): the previous
+        // per-booking loop did N awaited appends, so a mid-batch WAL error left earlier bookings
+        // durable while later ones failed, and each append was a serialized fsync held under every
+        // batch resource's write lock.
+        let events: Vec<Event> = bookings
+            .into_iter()
+            .map(|(id, resource_id, span, label)| Event::BookingConfirmed { id, resource_id, span, label })
+            .collect();
+        self.wal_append_atomic(&events).await?;
+        self.apply_and_publish(&mut locked, &events);
+        metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL)
+            .increment(events.len() as u64);
+        Ok(())
+    }
+
+    /// Place several holds at once, all or nothing, possibly across resources (MCP-K1), so a kit is
+    /// held together or not at all. Admission is exactly a batch booking's.
+    ///
+    /// The holds are separate WAL records under one fsync, so a torn write can keep a prefix of
+    /// them. That is safe without a combined record: the caller was never told they were placed,
+    /// and every hold expires on its own, so the expiry is the rollback.
+    pub async fn batch_place_holds(&self, holds: Vec<(Ulid, Ulid, Span, Ms)>) -> Result<(), EngineError> {
+        if holds.is_empty() {
+            return Ok(());
+        }
+        for (.., expires_at) in &holds {
+            validate_timestamp(*expires_at)?;
+        }
+        // AVAIL-08, as in place_hold: the server clock is the expiry authority.
+        let ceiling = self.now_ms().saturating_add(self.max_hold_ttl_ms);
+        let members: Vec<(Ulid, Ulid, Span)> = holds.iter().map(|(id, rid, span, _)| (*id, *rid, *span)).collect();
+        let mut locked = self.admit_batch(&members).await?;
+
+        let events: Vec<Event> = holds
+            .into_iter()
+            .map(|(id, resource_id, span, expires_at)| Event::HoldPlaced {
+                id,
+                resource_id,
+                span,
+                expires_at: expires_at.min(ceiling),
+            })
+            .collect();
+        // Lower the reaper's watermark before the holds exist, as place_hold does.
+        let earliest = events.iter().filter_map(|e| match e {
+            Event::HoldPlaced { expires_at, .. } => Some(*expires_at),
+            _ => None,
+        });
+        if let Some(earliest) = earliest.min() {
+            self.earliest_hold_expiry
+                .fetch_min(earliest, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.hold_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        self.wal_append_atomic(&events).await?;
+        self.apply_and_publish(&mut locked, &events);
+        metrics::counter!(crate::observability::HOLDS_PLACED_TOTAL).increment(events.len() as u64);
+        Ok(())
+    }
+
+    /// Write-lock every resource in `resource_ids`, in ascending id order. Every multi-resource
+    /// write takes its locks here, so two batches over overlapping sets cannot deadlock each other.
+    async fn lock_resources(&self, mut resource_ids: Vec<Ulid>) -> Result<LockedResources, EngineError> {
+        resource_ids.sort();
+        resource_ids.dedup();
+        let mut guards = Vec::with_capacity(resource_ids.len());
+        let mut slot = HashMap::with_capacity(resource_ids.len());
+        for rid in resource_ids {
+            let rs = self.get_resource(&rid).ok_or(EngineError::NotFound(rid))?;
+            slot.insert(rid, guards.len());
+            guards.push(rs.write_owned().await);
+        }
+        Ok(LockedResources { guards, slot })
+    }
+
+    /// Apply durable single-resource events to the locked resources they name, and publish each
+    /// to its resource and that resource's ancestors.
+    fn apply_and_publish(&self, locked: &mut LockedResources, events: &[Event]) {
+        for event in events {
+            let Some(resource_id) = super::event_resource_id(event) else {
+                continue;
+            };
+            let guard = locked.get_mut(&resource_id);
+            self.store.apply_event(guard, event);
+            let notice = Notice::of(event);
+            self.notify.send(resource_id, &notice);
+            self.notify_ancestors(guard.parent_id, &notice);
+        }
+    }
+
+    /// Lock and admit a batch of new allocations `(id, resource_id, span)`, all or nothing. Every
+    /// member must pass the schedule, conflict and capacity checks, against current state and
+    /// against the rest of the batch, before the caller writes anything. Batch bookings and batch
+    /// holds share this, differing only in the event they persist.
+    async fn admit_batch(&self, members: &[(Ulid, Ulid, Span)]) -> Result<LockedResources, EngineError> {
+        if members.len() > MAX_BATCH_SIZE {
             return Err(EngineError::LimitExceeded("batch too large"));
         }
-        for (_, _, span, label) in &bookings {
+        for (_, _, span) in members {
             validate_span(span)?;
-            if let Some(l) = label
-                && l.len() > MAX_LABEL_LEN {
-                    return Err(EngineError::LimitExceeded("label too long"));
-                }
         }
 
-        // Acquire write locks in sorted order to prevent deadlocks.
-        let mut resource_ids: Vec<Ulid> = bookings.iter().map(|(_, rid, _, _)| *rid).collect();
+        let mut resource_ids: Vec<Ulid> = members.iter().map(|(_, rid, _)| *rid).collect();
         resource_ids.sort();
         resource_ids.dedup();
 
@@ -576,9 +753,9 @@ impl Engine {
         // clamped inherited spans cover each member's admission check.
         let mut rule_ctx: HashMap<Ulid, (Vec<Span>, Vec<Span>, bool)> = HashMap::new();
         for rid in &resource_ids {
-            let member_spans = bookings.iter().filter(|(_, r, _, _)| r == rid);
-            let lo = member_spans.clone().map(|(_, _, s, _)| s.start).min();
-            let hi = member_spans.map(|(_, _, s, _)| s.end).max();
+            let member_spans = members.iter().filter(|(_, r, _)| r == rid);
+            let lo = member_spans.clone().map(|(_, _, s)| s.start).min();
+            let hi = member_spans.map(|(_, _, s)| s.end).max();
             let (Some(lo), Some(hi)) = (lo, hi) else {
                 continue;
             };
@@ -587,19 +764,9 @@ impl Engine {
             rule_ctx.insert(*rid, self.collect_inherited_rules(*rid, parent_id, &hull).await?);
         }
 
-        let mut guards = Vec::with_capacity(resource_ids.len());
-        let mut rs_map = HashMap::new();
-
-        for rid in &resource_ids {
-            let rs = self
-                .get_resource(rid)
-                .ok_or(EngineError::NotFound(*rid))?;
-            let guard = rs.write_owned().await;
-            if guard.intervals.len() >= MAX_INTERVALS_PER_RESOURCE {
-                return Err(EngineError::LimitExceeded("too many intervals on resource"));
-            }
-            rs_map.insert(*rid, guards.len());
-            guards.push(guard);
+        let locked = self.lock_resources(resource_ids).await?;
+        if locked.guards.iter().any(|g| g.intervals.len() >= MAX_INTERVALS_PER_RESOURCE) {
+            return Err(EngineError::LimitExceeded("too many intervals on resource"));
         }
 
         // Reuse rejection, under the guards so concurrent retries serialise, and before anything is
@@ -607,24 +774,24 @@ impl Engine {
         // anywhere in the tenant, which `reject_reused_id` catches, and two members of this batch
         // sharing one id, which no amount of state inspection can catch because neither exists yet.
         // Both produce the same stranded-interval outcome described on `reject_reused_id`.
-        let mut batch_ids = HashSet::with_capacity(bookings.len());
-        for (id, _, _, _) in &bookings {
+        let mut batch_ids = HashSet::with_capacity(members.len());
+        for (id, _, _) in members {
             self.reject_reused_id(*id)?;
             if !batch_ids.insert(*id) {
                 return Err(EngineError::AlreadyExists(*id));
             }
         }
 
-        // Phase 1: Validate all bookings against current state + intra-batch.
+        // Validate all members against current state + intra-batch.
         let now = self.now_ms();
 
         let mut by_resource: HashMap<Ulid, Vec<(Ulid, Span)>> = HashMap::new();
-        for (id, rid, span, _) in &bookings {
+        for (id, rid, span) in members {
             by_resource.entry(*rid).or_default().push((*id, *span));
         }
 
         for (rid, batch) in &by_resource {
-            let guard = &guards[rs_map[rid]];
+            let guard = locked.get(rid);
             let (inherited_nb, inherited_blocking, ancestor_has_schedule) = &rule_ctx[rid];
 
             for (_, span) in batch {
@@ -657,35 +824,7 @@ impl Engine {
             }
         }
 
-        // Phase 2: All validated, persist the whole batch under ONE fsync, then apply + notify.
-        // A single append is the all-or-nothing durability boundary (AVAIL-06): the previous
-        // per-booking loop did N awaited appends, so a mid-batch WAL error left earlier bookings
-        // durable while later ones failed, and each append was a serialized fsync held under every
-        // batch resource's write lock.
-        let events: Vec<Event> = bookings
-            .iter()
-            .map(|(id, resource_id, span, label)| Event::BookingConfirmed {
-                id: *id,
-                resource_id: *resource_id,
-                span: *span,
-                label: label.clone(),
-            })
-            .collect();
-        self.wal_append_atomic(&events).await?;
-        for event in &events {
-            if let Event::BookingConfirmed { resource_id, .. } = event {
-                let guard_idx = rs_map[resource_id];
-                let parent_id = guards[guard_idx].parent_id;
-                self.store.apply_event(&mut guards[guard_idx], event);
-                let notice = Notice::of(event);
-                self.notify.send(*resource_id, &notice);
-                self.notify_ancestors(parent_id, &notice);
-            }
-        }
-        metrics::counter!(crate::observability::BOOKINGS_CREATED_TOTAL)
-            .increment(events.len() as u64);
-
-        Ok(())
+        Ok(locked)
     }
 
     pub async fn cancel_booking(&self, id: Ulid) -> Result<Ulid, EngineError> {

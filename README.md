@@ -150,9 +150,20 @@ VALUES ('01J...', '01J...', 1706000000000, 1706003600000, 1706000900000);
 DELETE FROM holds WHERE id = '01J...';
 
 -- Commit the hold: atomically convert it into a booking on the held span.
--- One lock, one WAL flush; there is no release-then-rebook gap for a
--- competing booker to steal. label is optional.
+-- One lock, one WAL record; there is no release-then-rebook gap for a
+-- competing booker to steal, and a crash keeps all of it or none. label is optional.
 UPDATE holds SET booking_id = '01J...', label = 'seat 14F' WHERE id = '01J...';
+
+-- Hold a kit across resources: every row is held, or none is.
+INSERT INTO holds (id, resource_id, start, "end", expires_at)
+VALUES ('01J_H1...', '01J_BODY...', 1706000000000, 1706003600000, 1706000900000),
+       ('01J_H2...', '01J_LENS...', 1706000000000, 1706003600000, 1706000900000);
+
+-- Book every hold at once: each booking takes its hold's resource and span.
+-- All of them are booked, or none are.
+INSERT INTO bookings (id, hold_id, label)
+VALUES ('01J_B1...', '01J_H1...', 'body'),
+       ('01J_B2...', '01J_H2...', 'lens');
 ```
 
 ### Availability

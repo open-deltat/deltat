@@ -150,6 +150,15 @@ pub enum Command {
     BatchInsertBookings {
         bookings: Vec<(Ulid, Ulid, Ms, Ms, Option<String>)>, // (id, resource_id, start, end, label)
     },
+    /// Several holds placed at once, all or nothing, possibly across resources (MCP-K1).
+    BatchInsertHolds {
+        holds: Vec<(Ulid, Ulid, Ms, Ms, Ms)>, // (id, resource_id, start, end, expires_at)
+    },
+    /// Several holds turned into bookings at once, all or nothing (MCP-K1). Each booking takes its
+    /// hold's resource and span.
+    CommitHolds {
+        commits: Vec<(Ulid, Ulid, Option<String>)>, // (hold_id, booking_id, label)
+    },
     DeleteBooking {
         id: Ulid,
     },

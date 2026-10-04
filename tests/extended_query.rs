@@ -349,3 +349,43 @@ async fn a_refusal_carries_its_alternatives_in_the_detail_field() {
             .unwrap_or_else(|e| panic!("offered span [{start}, {end}) was refused: {e}"));
     }
 }
+
+#[tokio::test]
+async fn several_holds_hold_and_commit_together_with_bound_parameters() {
+    // MCP-K1 the way an SDK sends it: one prepared multi-row INSERT holds a kit across resources,
+    // and one prepared multi-row INSERT books every hold. Bound parameters, not literals.
+    let (addr, _tm) = start_test_server().await;
+    let client = connect(addr, "test").await;
+    let (body, lens) = (create_bookable_resource(&client).await, create_bookable_resource(&client).await);
+    let (body, lens) = (body.to_string(), lens.to_string());
+    let (h1, h2) = (Ulid::new().to_string(), Ulid::new().to_string());
+    // The server clamps a far-future expiry to its own ceiling, so these holds are live without a
+    // client clock.
+    let expires = "32503680000000";
+
+    let hold = client
+        .prepare(r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ($1, $2, $3, $4, $5), ($6, $7, $8, $9, $10)"#)
+        .await
+        .unwrap();
+    let params: [&(dyn ToSql + Sync); 10] =
+        [&h1, &body, &"1200", &"1400", &expires, &h2, &lens, &"1200", &"1400", &expires];
+    assert_eq!(client.execute(&hold, &params).await.unwrap(), 2);
+
+    let (b1, b2) = (Ulid::new().to_string(), Ulid::new().to_string());
+    let commit = client
+        .prepare("INSERT INTO bookings (id, hold_id, label) VALUES ($1, $2, $3), ($4, $5, $6)")
+        .await
+        .unwrap();
+    let params: [&(dyn ToSql + Sync); 6] = [&b1, &h1, &"body", &b2, &h2, &"lens"];
+    assert_eq!(client.execute(&commit, &params).await.unwrap(), 2);
+
+    for (rid, bid, label) in [(&body, &b1, "body"), (&lens, &b2, "lens")] {
+        let holds = data_rows(&client, &format!("SELECT * FROM holds WHERE resource_id = '{rid}'")).await;
+        assert!(holds.is_empty(), "every hold is consumed by its booking");
+        let rows = data_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(bid.as_str()));
+        assert_eq!((rows[0].get(2), rows[0].get(3)), (Some("1200"), Some("1400")), "the hold's span");
+        assert_eq!(rows[0].get(4), Some(label));
+    }
+}

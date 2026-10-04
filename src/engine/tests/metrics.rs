@@ -155,10 +155,10 @@ fn gc_counter_matches_collected_return() {
 // ── WAL instrumentation ──────────────────────────────────────
 
 #[test]
-fn commit_hold_fsync_records_flush_histograms() {
-    // Three flushes: two group-commit singles (create, place) and the commit's AppendAtomic
-    // pair. The 2.0 batch-size sample and the third duration sample can only come from the
-    // AppendAtomic branch, the terminal write of the booking flow.
+fn commit_and_batch_fsyncs_record_flush_histograms() {
+    // Four flushes: three group-commit singles (create, place, and the commit, which is one
+    // HoldsCommitted record) and a two-booking batch through AppendAtomic. The 2.0 batch-size
+    // sample and the fourth duration sample can only come from the AppendAtomic branch.
     let (log, _) = with_metrics(|| {
         block_on(async {
             let path = test_wal_path("metrics_commit_fsync.wal");
@@ -170,11 +170,18 @@ fn commit_hold_fsync_records_flush_histograms() {
             let now = engine.now_ms();
             engine.place_hold(hold, rid, Span::new(1000, 2000), now + 60_000).await.unwrap();
             engine.commit_hold(hold, Ulid::new(), None).await.unwrap();
+            engine
+                .batch_confirm_bookings(vec![
+                    (Ulid::new(), rid, Span::new(3000, 4000), None),
+                    (Ulid::new(), rid, Span::new(5000, 6000), None),
+                ])
+                .await
+                .unwrap();
         })
     });
 
-    assert_eq!(log.histogram_values(WAL_FLUSH_BATCH_SIZE), vec![1.0, 1.0, 2.0]);
-    assert_eq!(log.histogram_values(WAL_FLUSH_DURATION_SECONDS).len(), 3);
+    assert_eq!(log.histogram_values(WAL_FLUSH_BATCH_SIZE), vec![1.0, 1.0, 1.0, 2.0]);
+    assert_eq!(log.histogram_values(WAL_FLUSH_DURATION_SECONDS).len(), 4);
 }
 
 #[test]

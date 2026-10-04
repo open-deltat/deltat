@@ -155,8 +155,8 @@ This is the destination the whole plan is aimed at, so here is the honest decomp
 
 | Case | Today | Correct mechanism | Work |
 |---|---|---|---|
-| **One bookable, one home** | 🟡 cannot double-book, but not one event | `commit_hold` holds a single write guard across the conflict check and both appends, which share one fsync (`WalCommand::AppendAtomic`) | `engine/mutations.rs:284`. The in-memory release-then-book TOCTOU is **closed**. AVAIL-07's single `HoldCommitted` event is **not built**: still two WAL records, so a torn write between them loses the booking. That fails safe (a freed slot, never a live hold *and* booking, INV-01 holds) but it is not crash atomicity |
-| **N bookables, one tenant** (two colleagues on one instance; also appointment **plus** its travel interval) | ❌ **no primitive**. `check_batch_capacity` takes one `&ResourceState`, so batch writes are single-resource | **MCP-K1**: `CommitHolds(&[hold_id])`, sorted multi-resource lock acquisition, verify all live, one event, all or nothing | small, real kernel work. Lock ordering already exists (store.rs sorted batch locks, ABBA-safe). **Needs a WAL `FORMAT_VERSION` bump** for the new event variant |
+| **One bookable, one home** | ✅ one event | `commit_hold` holds a single write guard across the conflict check and the append of one `HoldsCommitted` record | Done 2026-10-04 (AVAIL-07). A torn write loses the whole commit, never half of it |
+| **N bookables, one tenant** (two colleagues on one instance; also appointment **plus** its travel interval) | ✅ built 2026-10-04 (AVAIL-18) | **MCP-K1**: `commit_holds`, sorted multi-resource lock acquisition, verify all live, one event, all or nothing; over SQL `INSERT INTO bookings (id, hold_id, label)` with a row per hold. Holds are placed together the same way with a multi-row `INSERT INTO holds` | WAL format 2 adds `HoldsCommitted`. The `*_joint` tools (MCP-N6) are edge work on top |
 | **N bookables, N homes** (two strangers, two operators) | ⏸ | TCC saga with compensation. Not atomic and cannot be made atomic without consensus | FED-07, explicitly unsolved. **Document it, never claim otherwise** |
 
 **MCP-N4 📋 Saga discipline for the cross-home case.** Commit in a fixed order (sort by home URI) so concurrent coordinators queue rather than deadlock. Size hold TTL to comfortably exceed the whole fan-out (a 5-minute hold against a sub-second fan-out is four orders of magnitude of headroom). On partial failure, cancel the committed bookings and tell the human plainly. A visible cancellation is an acceptable outcome; a silent double-book is not.
@@ -238,7 +238,7 @@ MCP is one skin. It should be the thinnest of several over a single policy core,
 | **MCP-N1** | Per-request stateless coordinator, no broker, no registry | P1 |
 | **MCP-N2** | Cross-party exchange is D0 free/busy only | P1 |
 | **MCP-N3** | Negotiation state in an MCP Task; only holds are durable | P1 |
-| **MCP-K1** | **Kernel:** `CommitHolds(&[hold_id])`, sorted multi-resource locks, all-or-nothing, WAL `FORMAT_VERSION` bump | P1, the one engine change |
+| **MCP-K1** | **Kernel:** `CommitHolds(&[hold_id])`, sorted multi-resource locks, all-or-nothing, WAL `FORMAT_VERSION` bump | P1, the one engine change. Built 2026-10-04 as AVAIL-18 |
 | **MCP-N4** | Cross-home saga: fixed commit order, TTL ≫ fan-out, compensate visibly | P2 |
 | **MCP-N6** | `find_joint_slots` / `hold_joint` / `commit_joint`; return value states atomic vs saga | P2 |
 | **MCP-N7** | `watch_slots` Task with `on_match: notify \| hold` (reactive availability) | P2, the differentiator |

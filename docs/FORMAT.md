@@ -241,12 +241,13 @@ RuleUpdated     { id, resource_id, span, blocking }
 RuleRemoved     { id, resource_id }
 HoldPlaced      { id, resource_id, span, expires_at }     // shape UNCHANGED from v1 (on-disk stable)
 HoldReleased    { id, resource_id }
-HoldCommitted   { hold_id, booking_id, resource_id, span, label? }   // NEW: the atomic transfer
+HoldsCommitted  { commits: [{ hold_id, booking_id, resource_id, span, label? }] }   // the atomic transfer, one or many holds
 BookingConfirmed{ id, resource_id, span, label? }
 BookingCancelled{ id, resource_id }
 ```
 *(There is no `ScheduleSet`/`ScheduleRemoved` event: kernel Schedule was removed; recurrence is edge
-rules. The current engine has exactly the 10 variants above; `HoldCommitted` is the one planned addition.)*
+rules. The engine has these variants; `HoldsCommitted` was added in WAL format 2 as the last one, and
+carries several holds so a multi-resource commit (MCP-K1) is one record.)*
 
 **A per-resource monotonic sequence number** must be derivable from (or cheaply addable to) this stream
 *before v1.0 freezes*, so federation (V2-DESIGN §5: ownership epoch + per-resource seq + per-op nonce)
@@ -325,5 +326,5 @@ When v1.0 freezes, this corpus *is* the spec; this document is its prose compani
   "everything a publisher chose to publish, via the discovery edge, never via direct kernel query."
 - **Open-ended / variable-duration** stays (`park until I leave`) vs the frozen `start < end` invariant.
   Decide whether to model an open right end (sentinel / separate kind) before freezing the Span rule.
-- **Engine silently truncates multi-row `INSERT`** (only bookings batch). Worked around in the SDK; the
-  framed protocol must make batch *explicit and typed* (and reject, not truncate, anything it can't apply).
+- **Every table now honors a multi-row `INSERT`** (holds since AVAIL-18; they used to truncate). The
+  framed protocol must still make batch *explicit and typed* (and reject, not truncate, anything it can't apply).

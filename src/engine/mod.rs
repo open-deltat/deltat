@@ -45,11 +45,11 @@ pub(super) enum WalCommand {
     },
     /// Append several events under a single fsync. An fsync error, or a crash before the flush,
     /// leaves none of them durable. They remain independent length+CRC records, so this does NOT
-    /// guarantee both-or-neither against a torn write between them (a power loss or write error
+    /// guarantee all-or-none against a torn write between them (a power loss or write error
     /// after one record's bytes reach disk but before the next's): replay discards the torn tail
-    /// and keeps the prefix. Callers must therefore order events so that losing the tail is the
-    /// safe outcome: `commit_hold` writes HoldReleased before BookingConfirmed, so a torn pair
-    /// loses the booking (a re-bookable slot), never leaves a hold plus a booking.
+    /// and keeps the prefix. Use it only where a kept prefix is safe, as for a batch of holds,
+    /// which expire on their own. Where it is not, write one record: that is why hold commits are
+    /// a single `HoldsCommitted`.
     AppendAtomic {
         events: Vec<Event>,
         response: oneshot::Sender<io::Result<()>>,
@@ -271,12 +271,19 @@ fn handle_non_append(wal: &mut Wal, cmd: WalCommand, recording: &mut Option<Vec<
 /// added twice would double-count against capacity, so additions whose id the snapshot carries
 /// are dropped. Updates, removals, and deletes replay idempotently on top of either state and
 /// are kept unconditionally (a removal already reflected in the snapshot replays as a no-op).
+///
+/// A recorded `HoldsCommitted` is expanded first. The snapshot takes one resource lock at a time,
+/// so a commit over A and B can land after A was snapshotted and before B was; replayed whole, it
+/// would add B's booking a second time. Expanded, B's booking is an ordinary addition the filter
+/// drops. The compacted file is swapped in by rename, so writing the steps rather than the single
+/// record loses no crash atomicity.
 fn merge_recorded(mut snapshot: Vec<Event>, recorded: Vec<Event>) -> Vec<Event> {
     let snapshot_ids: std::collections::HashSet<Ulid> =
         snapshot.iter().filter_map(added_id).collect();
     snapshot.extend(
         recorded
-            .into_iter()
+            .iter()
+            .flat_map(Event::per_resource)
             .filter(|event| added_id(event).is_none_or(|id| !snapshot_ids.contains(&id))),
     );
     snapshot
@@ -284,6 +291,7 @@ fn merge_recorded(mut snapshot: Vec<Event>, recorded: Vec<Event>) -> Vec<Event> 
 
 /// The id an event introduces, for `merge_recorded`'s duplicate check. Only the four addition
 /// kinds introduce state keyed by a fresh id; every other kind mutates or removes existing state.
+/// `HoldsCommitted` introduces several, which is why `merge_recorded` expands it before asking.
 fn added_id(event: &Event) -> Option<Ulid> {
     match event {
         Event::ResourceCreated { id, .. }
@@ -295,7 +303,8 @@ fn added_id(event: &Event) -> Option<Ulid> {
         | Event::RuleUpdated { .. }
         | Event::RuleRemoved { .. }
         | Event::HoldReleased { .. }
-        | Event::BookingCancelled { .. } => None,
+        | Event::BookingCancelled { .. }
+        | Event::HoldsCommitted { .. } => None,
     }
 }
 
@@ -381,13 +390,18 @@ impl Engine {
                     }
                     engine.store.remove_resource(id);
                 }
+                Event::HoldsCommitted { commits } => {
+                    let mut resource_ids: Vec<Ulid> = commits.iter().map(|c| c.resource_id).collect();
+                    resource_ids.sort();
+                    resource_ids.dedup();
+                    for resource_id in resource_ids {
+                        engine.replay_on(resource_id, event);
+                    }
+                }
                 other => {
-                    let resource_id = event_resource_id(other);
-                    if let Some(resource_id) = resource_id
-                        && let Some(rs) = engine.store.get_resource(&resource_id) {
-                            let mut guard = rs.try_write().expect("replay: uncontended write");
-                            engine.store.apply_event(&mut guard, other);
-                        }
+                    if let Some(resource_id) = event_resource_id(other) {
+                        engine.replay_on(resource_id, other);
+                    }
                 }
             }
         }
@@ -413,6 +427,15 @@ impl Engine {
         }
 
         Ok(engine)
+    }
+
+    /// Apply one replayed event to one resource, if it still exists. Replay owns every lock, so
+    /// `try_write` cannot contend.
+    fn replay_on(&self, resource_id: Ulid, event: &Event) {
+        if let Some(rs) = self.store.get_resource(&resource_id) {
+            let mut guard = rs.try_write().expect("replay: uncontended write");
+            self.store.apply_event(&mut guard, event);
+        }
     }
 
     /// Override the hold-lifetime ceiling (AVAIL-08). Applies to future `place_hold` calls only;
@@ -531,7 +554,8 @@ impl Engine {
     }
 }
 
-/// Extract the resource_id from an event (for non-Create/Delete events).
+/// The one resource an event applies to. None for create/delete, which replay handles itself, and
+/// for `HoldsCommitted`, which has several and is routed to each by replay.
 fn event_resource_id(event: &Event) -> Option<Ulid> {
     match event {
         Event::RuleAdded { resource_id, .. }
@@ -542,6 +566,6 @@ fn event_resource_id(event: &Event) -> Option<Ulid> {
         | Event::BookingConfirmed { resource_id, .. }
         | Event::BookingCancelled { resource_id, .. } => Some(*resource_id),
         Event::ResourceUpdated { id, .. } => Some(*id),
-        Event::ResourceCreated { .. } | Event::ResourceDeleted { .. } => None,
+        Event::ResourceCreated { .. } | Event::ResourceDeleted { .. } | Event::HoldsCommitted { .. } => None,
     }
 }

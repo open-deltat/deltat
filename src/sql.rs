@@ -133,16 +133,20 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
         }
         "holds" => {
             let all_rows = extract_all_insert_rows(insert)?;
-            // No batch hold path exists in the engine; reject multi-row VALUES loudly rather
-            // than holding only the first slot while reporting success (silent data loss in
-            // the collision-detection domain). The tap SDK places holds one per statement.
-            if all_rows.len() > 1 {
-                return Err(SqlError::Unsupported(
-                    "multi-row INSERT INTO holds (place one hold per statement)".into(),
-                ));
+            if all_rows.len() == 1 {
+                let (id, resource_id, start, end, expires_at) = parse_hold_row(&all_rows[0], &columns)?;
+                Ok(Command::InsertHold { id, resource_id, start, end, expires_at })
+            } else {
+                let holds = parse_rows(&all_rows, |row| parse_hold_row(row, &columns))?;
+                Ok(Command::BatchInsertHolds { holds })
             }
-            let (id, resource_id, start, end, expires_at) = parse_hold_row(&all_rows[0], &columns)?;
-            Ok(Command::InsertHold { id, resource_id, start, end, expires_at })
+        }
+        // A booking made from a hold: committing it, as `UPDATE holds SET booking_id` does for one.
+        // As an INSERT it takes many rows, which is how several holds commit together.
+        "bookings" if columns.iter().any(|c| c == "hold_id") => {
+            let all_rows = extract_all_insert_rows(insert)?;
+            let commits = parse_rows(&all_rows, |row| parse_hold_booking_row(row, &columns))?;
+            Ok(Command::CommitHolds { commits })
         }
         "bookings" => {
             let all_rows = extract_all_insert_rows(insert)?;
@@ -1046,6 +1050,45 @@ fn parse_booking_row(
     ))
 }
 
+/// Parse one `bookings` VALUES row that books a hold into (hold_id, booking_id, label). The booking
+/// takes the hold's resource and span, so those columns are refused rather than ignored. The column
+/// list is always present here, since the caller routes on a declared `hold_id`.
+fn parse_hold_booking_row(
+    values: &[Expr],
+    columns: &[String],
+) -> Result<(Ulid, Ulid, Option<String>), SqlError> {
+    check_column_arity("bookings", columns, values)?;
+    if let Some(taken) = columns.iter().find(|c| ["resource_id", "start", "end"].contains(&c.as_str())) {
+        return Err(SqlError::Parse(format!(
+            "{taken} with hold_id: a booking made from a hold takes the hold's resource and span; \
+             columns are id, hold_id, label"
+        )));
+    }
+    reject_unknown_insert_columns("bookings", columns, &["id", "hold_id", "label"])?;
+    let get = |name: &'static str| {
+        col_value(columns, values, name, 0)
+            .ok_or_else(|| SqlError::Parse(format!("bookings INSERT missing required column: {name}")))
+    };
+    let label = col_value(columns, values, "label", 0)
+        .map(parse_string_or_null)
+        .transpose()?
+        .flatten();
+    Ok((parse_ulid(get("hold_id")?)?, parse_ulid(get("id")?)?, label))
+}
+
+/// Parse every row of an INSERT, naming the row an error came from when there is more than one.
+fn parse_rows<T>(
+    rows: &[Vec<Expr>],
+    parse: impl Fn(&[Expr]) -> Result<T, SqlError>,
+) -> Result<Vec<T>, SqlError> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            parse(row).map_err(|e| if rows.len() > 1 { SqlError::Parse(format!("row {i}: {e}")) } else { e })
+        })
+        .collect()
+}
+
 fn extract_all_insert_rows(insert: &ast::Insert) -> Result<Vec<Vec<Expr>>, SqlError> {
     let body = insert
         .source
@@ -1605,15 +1648,82 @@ mod tests {
     }
 
     #[test]
-    fn parse_multi_row_insert_holds_is_rejected() {
-        // The engine has no batch hold path; a multi-row holds VALUES must fail loudly. Parsing
-        // only the first row and reporting INSERT success would leave the other slots unheld
-        // while the client believes they are protected.
-        let r = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    fn parse_multi_row_insert_holds_is_one_batch_of_every_row() {
+        // Every row becomes part of one all-or-nothing batch (MCP-K1). Parsing only the first row
+        // and reporting success would leave the other slots unheld while the client believes they
+        // are protected; this used to be refused outright for that reason.
+        let (r1, r2) = ("01ARZ3NDEKTSV4RRFFQ69G5FAV", "01DRZ3NDEKTSV4RRFFQ69G5FAY");
+        let (h1, h2) = ("01BRZ3NDEKTSV4RRFFQ69G5FAW", "01CRZ3NDEKTSV4RRFFQ69G5FAX");
         let sql = format!(
-            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('01BRZ3NDEKTSV4RRFFQ69G5FAW', '{r}', 1000, 2000, 3000), ('01CRZ3NDEKTSV4RRFFQ69G5FAX', '{r}', 3000, 4000, 5000)"#
+            r#"INSERT INTO holds (resource_id, id, start, "end", expires_at) VALUES ('{r1}', '{h1}', 1000, 2000, 3000), ('{r2}', '{h2}', 3000, 4000, 5000)"#
         );
-        assert!(parse_sql(&sql).is_err(), "multi-row holds INSERT must be rejected, not truncated");
+        match parse_sql(&sql).unwrap() {
+            Command::BatchInsertHolds { holds } => {
+                let rows: Vec<(String, String, Ms, Ms, Ms)> = holds
+                    .into_iter()
+                    .map(|(id, rid, start, end, exp)| (id.to_string(), rid.to_string(), start, end, exp))
+                    .collect();
+                assert_eq!(
+                    rows,
+                    vec![
+                        (h1.into(), r1.into(), 1000, 2000, 3000),
+                        (h2.into(), r2.into(), 3000, 4000, 5000),
+                    ]
+                );
+            }
+            cmd => panic!("expected BatchInsertHolds, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_bookings_from_holds_is_one_commit_of_every_row() {
+        let (h1, h2) = ("01ARZ3NDEKTSV4RRFFQ69G5FAV", "01BRZ3NDEKTSV4RRFFQ69G5FAW");
+        let (b1, b2) = ("01CRZ3NDEKTSV4RRFFQ69G5FAX", "01DRZ3NDEKTSV4RRFFQ69G5FAY");
+        let sql = format!(
+            "INSERT INTO bookings (hold_id, label, id) VALUES ('{h1}', 'body', '{b1}'), ('{h2}', NULL, '{b2}')"
+        );
+        match parse_sql(&sql).unwrap() {
+            Command::CommitHolds { commits } => {
+                let rows: Vec<(String, String, Option<String>)> = commits
+                    .into_iter()
+                    .map(|(hold, booking, label)| (hold.to_string(), booking.to_string(), label))
+                    .collect();
+                assert_eq!(
+                    rows,
+                    vec![(h1.into(), b1.into(), Some("body".into())), (h2.into(), b2.into(), None)]
+                );
+            }
+            cmd => panic!("expected CommitHolds, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_one_booking_from_a_hold_is_a_commit() {
+        let sql = "INSERT INTO bookings (id, hold_id) VALUES ('01CRZ3NDEKTSV4RRFFQ69G5FAX', '01ARZ3NDEKTSV4RRFFQ69G5FAV')";
+        match parse_sql(sql).unwrap() {
+            Command::CommitHolds { commits } => assert_eq!(commits.len(), 1),
+            cmd => panic!("expected CommitHolds, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_booking_from_a_hold_refuses_its_own_span_or_resource() {
+        // The booking takes the hold's resource and span. Accepting either here would mean
+        // ignoring it, which is the silent write failure the column guards exist to prevent.
+        for extra in ["resource_id", "start", "\"end\""] {
+            let sql = format!(
+                "INSERT INTO bookings (id, hold_id, {extra}) VALUES ('01CRZ3NDEKTSV4RRFFQ69G5FAX', '01ARZ3NDEKTSV4RRFFQ69G5FAV', 5)"
+            );
+            let err = parse_sql(&sql).unwrap_err().to_string();
+            assert!(err.contains("hold's resource and span"), "{extra}: {err}");
+        }
+        let err = parse_sql(
+            "INSERT INTO bookings (id, hold_id, labell) VALUES ('01CRZ3NDEKTSV4RRFFQ69G5FAX', '01ARZ3NDEKTSV4RRFFQ69G5FAV', 'x')",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("labell"), "{err}");
+        assert!(parse_sql("INSERT INTO bookings (hold_id) VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV')").is_err());
     }
 
     #[test]

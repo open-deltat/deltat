@@ -223,6 +223,16 @@ impl InMemoryStore {
                     rs.buffer_after = *buffer_after;
                 }
             }
+            Event::HoldsCommitted { commits } => {
+                // Only this resource's entries: the others belong to resources whose guards the
+                // caller applies the same event to.
+                let own = rs.id;
+                for commit in commits.iter().filter(|c| c.resource_id == own) {
+                    for event in commit.events() {
+                        self.apply_event(rs, &event);
+                    }
+                }
+            }
             Event::ResourceCreated { .. } | Event::ResourceDeleted { .. } => {}
         }
     }
