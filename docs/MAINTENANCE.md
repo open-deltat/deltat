@@ -21,8 +21,9 @@ spelled, and a grep cannot. That pairing is the template.
 
 Everything else was on rung 1. Here is what that cost:
 
-- Both auth docs' fact-check headers still say "there is no `commit_hold` symbol". It shipped at
-  `engine/mutations.rs:284`.
+- `AUTH-AND-PAYMENTS.md`'s fact-check header still says "there is no `commit_hold` symbol". It
+  shipped as `commit_hold` in `engine/mutations.rs`, and both auth docs cite it by a line number
+  that has since moved.
 - `REQUIREMENTS.md`'s own header says "Fact-checked against HEAD (`feat/clock-seam`) on 2026-06-18".
   That branch is a stale pre-history-rewrite ref and the date is three months old.
 - The header goes on to name four docs it knows are stale (GAP-08), and has carried that note rather
@@ -95,7 +96,7 @@ ratcheted. Until then the check is honest about being best-effort.
 1. **WAL `Event` schema fingerprint.** A golden test over the encoded shape of every `Event` variant
    that fails when a field is added, removed or reordered without a `FORMAT_VERSION` bump. This is
    one-way door 5, described in the audit as the most dangerous item in the repo, and it is currently
-   guarded by a comment in `wal.rs:28-39` and nothing else.
+   guarded by the `FORMAT_VERSION` doc comment in `wal.rs` and nothing else.
 2. **No entity id or free text on any read or push surface.** One-way door 1. A test asserting the
    NOTIFY payload carries no `Ulid` and no label, plus a grep that `serde_json::to_string(&event)`
    does not reappear on the notify path. The audit confirms no existing test asserts payload content,

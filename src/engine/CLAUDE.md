@@ -31,7 +31,7 @@ scheme; `CLOCK_MONOTONIC` does not survive a restart and this is a replay system
 
 ## The WAL is append-only and versioned
 
-`../wal.rs:28-39` classifies every change:
+The `FORMAT_VERSION` doc comment in `../wal.rs` classifies every change:
 
 - **Safe**: adding a new `Event` *variant* at the end. bincode indexes variants in declaration order.
 - **Breaking**: adding, removing or reordering a field inside an existing variant, or changing what a

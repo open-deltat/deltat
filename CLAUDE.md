@@ -21,7 +21,7 @@ when it is held is not. State the direction explicitly in the PR.
 | If the change touches | Read first |
 |---|---|
 | auth, identity, tenancy, principals | `docs/AUTH-ARCHITECTURE.md`, `docs/AUDIT-2026-08-26.md` (ship-blockers + one-way doors) |
-| the WAL format, any `Event` variant or field | `src/wal.rs:28-39` (the safe/breaking classification), `docs/FORMAT.md` §7 |
+| the WAL format, any `Event` variant or field | the `FORMAT_VERSION` doc comment in `src/wal.rs` (the safe/breaking classification), `docs/FORMAT.md` §7 |
 | hold expiry, TTLs, any `now` comparison | `docs/AUTH-AND-PAYMENTS.md` FED-AUTH-09, `docs/REQUIREMENTS.md` HW-01..HW-03, HW-20 |
 | NOTIFY, LISTEN, streams, subscriptions | `docs/AUDIT-2026-08-26.md` one-way door 1, `docs/MCP.md` §7 |
 | the MCP surface, agent-facing tools | `docs/MCP.md` (requirement IDs `MCP-*`) |
@@ -40,7 +40,7 @@ is only written down decays, and this repo has the evidence for that.
 | Principle | Enforced by |
 |---|---|
 | Wall-clock reads go through the injected `Clock` (`src/clock.rs`) | `scripts/check-no-ambient-time.sh` **and** the `clippy.toml` `disallowed-methods` rule |
-| Requirement IDs are unique and every referenced ID exists | `scripts/check-requirements.sh` |
+| No new duplicate requirement ID and no new reference to an ID that does not exist | `scripts/check-requirements.sh` (ratchet against `scripts/requirements-baseline.txt`; the corpus predates the check) |
 | No new `✅` requirement without a verifying symbol | `scripts/check-requirements.sh` (ratchet against `scripts/requirements-baseline.txt`) |
 
 Run all of them: `sh scripts/check-all.sh`. CI runs them before the test suite.
@@ -60,15 +60,15 @@ cite new evidence; do not relitigate by accident.
 - **Instants are milliseconds.** `Ms = i64`, end to end. The microsecond widening in `FORMAT.md` is
   superseded. Agents never see the unit (MCP-T3 mandates RFC 3339 output), so it binds only
   wire, SDK and WAL, and `@open-deltat/client` is published speaking ms.
-- **`DELTAT_TENANT_PASSWORDS` does not mitigate the tenant problem.** It fails open at
-  `auth.rs:100`.
+- **`DELTAT_TENANT_PASSWORDS` does not mitigate the tenant problem.** It fails open:
+  `get_password` in `src/auth.rs` falls back to the shared password for any tenant without its own.
 - **PROTO-AUTH-08 is not regression-free.** It changes a released public config surface and inverts
   a currently-passing test that asserts the anti-property.
 - **Write-side controls cannot be "added later".** They are the prerequisite for the read ACL's
   principal.
 - **A stale or hallucinated read cannot become a booking is NOT a kernel property.** `INSERT INTO
-  bookings` takes the caller's span with no hold. Safety currently lives in the *absence* of an MCP
-  tool.
+  bookings` takes the caller's span with no hold. Safety currently lives in the MCP layer having no
+  direct-booking path (tap's `book_slot` tool exists only to refuse and point at hold then commit).
 - **Payment-as-authorization is not the strongest lever.** Retracted; P2 at the earliest.
 - **Adding a new `Event` variant is the safe class; adding or reordering a field inside an existing
   variant is the breaking class.** Only the second needs a `FORMAT_VERSION` bump, and batching the
