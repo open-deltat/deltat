@@ -6,6 +6,8 @@ All notable changes to deltat are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-04
+
 ### Added
 - **Hold several resources at once, and book them all or none.** A camera body, its lens and the
   crew; an operating room, the surgeon and the anaesthetist; an appointment and the drive to it.
