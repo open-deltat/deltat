@@ -37,6 +37,8 @@ const MAGIC: &[u8; 8] = b"DELTATWL";
 ///   what a field's value means (the pending ms to microsecond widening is this class). Records
 ///   before and after the change are indistinguishable by length or CRC, so nothing but this
 ///   version catches the difference.
+///
+/// `format_fingerprint` at the bottom of this file fails on either class under an unchanged version.
 const FORMAT_VERSION: u16 = 1;
 
 /// Files written before 0.3.0 begin with a record instead of a header. They are format 0 by
@@ -1020,6 +1022,146 @@ mod tests {
         assert!(
             dir.contains(&std::process::id().to_string()),
             "wal test dir {dir} is shared across processes"
+        );
+    }
+}
+
+/// Pins the on-disk encoding of every `Event` variant, so the `FORMAT_VERSION` rule above is
+/// checked by a machine instead of remembered (one-way door 5 in `docs/AUDIT-2026-08-26.md`).
+///
+/// A record carries no schema. A field added, removed, reordered or retyped inside a variant
+/// decodes as garbage, or as different valid data, and nothing but the version tells the two
+/// apart. So the encoding table is pinned twice: each variant's exact bytes, and a digest of the
+/// whole table per `FORMAT_VERSION`. Changing the table under an unchanged version fails.
+#[cfg(test)]
+mod format_fingerprint {
+    use super::*;
+    use crate::model::Span;
+    use ulid::Ulid;
+
+    /// The encoding table's digest at each `FORMAT_VERSION`. Append-only: an entry describes data
+    /// already on someone's disk, so editing a shipped one hides exactly the change it records.
+    /// Version 0 (headerless, before 0.3.0) and 1 differ only in the file header, not the records.
+    const FORMAT_HISTORY: &[(u16, u32)] = &[(0, 193150730), (1, 193150730)];
+
+    /// One sample per variant and its golden bincode payload. Every field gets a distinct,
+    /// non-default value (`Some` rather than `None`), so a swapped or retyped field moves bytes.
+    ///
+    /// The macro also emits a match over `Event` with no wildcard: a new variant fails to compile
+    /// until it has a row here. Add it at the end of `Event` (bincode numbers variants by
+    /// position), and bump `FORMAT_VERSION` before anything can write it, because an older binary
+    /// cannot decode a variant it does not have.
+    macro_rules! goldens {
+        ($($variant:ident { $($field:ident: $value:expr),* $(,)? } => $hex:literal,)*) => {
+            fn goldens() -> Vec<(&'static str, Event, &'static str)> {
+                vec![$((stringify!($variant), Event::$variant { $($field: $value),* }, $hex)),*]
+            }
+
+            fn has_a_golden(event: &Event) {
+                match event {
+                    $(Event::$variant { .. } => {})*
+                }
+            }
+        };
+    }
+
+    fn id(n: u128) -> Ulid {
+        Ulid::from(n)
+    }
+
+    goldens! {
+        ResourceCreated { id: id(1), parent_id: Some(id(2)), name: Some("room".into()), capacity: 3, buffer_after: Some(4) }
+            => "000000001a000000000000003030303030303030303030303030303030303030303030303031011a000000000000003030303030303030303030303030303030303030303030303032010400000000000000726f6f6d03000000010400000000000000",
+        ResourceUpdated { id: id(5), name: Some(Some("hall".into())), capacity: Some(6), buffer_after: Some(Some(7)) }
+            => "010000001a0000000000000030303030303030303030303030303030303030303030303030350101040000000000000068616c6c010600000001010700000000000000",
+        ResourceDeleted { id: id(8) }
+            => "020000001a000000000000003030303030303030303030303030303030303030303030303038",
+        RuleAdded { id: id(9), resource_id: id(10), span: Span { start: 11, end: 12 }, blocking: true }
+            => "030000001a0000000000000030303030303030303030303030303030303030303030303030391a0000000000000030303030303030303030303030303030303030303030303030410b000000000000000c0000000000000001",
+        RuleUpdated { id: id(13), resource_id: id(14), span: Span { start: 15, end: 16 }, blocking: true }
+            => "040000001a0000000000000030303030303030303030303030303030303030303030303030441a0000000000000030303030303030303030303030303030303030303030303030450f00000000000000100000000000000001",
+        RuleRemoved { id: id(17), resource_id: id(18) }
+            => "050000001a0000000000000030303030303030303030303030303030303030303030303030481a00000000000000303030303030303030303030303030303030303030303030304a",
+        HoldPlaced { id: id(19), resource_id: id(20), span: Span { start: 21, end: 22 }, expires_at: 23 }
+            => "060000001a00000000000000303030303030303030303030303030303030303030303030304b1a00000000000000303030303030303030303030303030303030303030303030304d150000000000000016000000000000001700000000000000",
+        HoldReleased { id: id(24), resource_id: id(25) }
+            => "070000001a0000000000000030303030303030303030303030303030303030303030303030521a000000000000003030303030303030303030303030303030303030303030303053",
+        BookingConfirmed { id: id(26), resource_id: id(27), span: Span { start: 28, end: 29 }, label: Some("seat".into()) }
+            => "080000001a0000000000000030303030303030303030303030303030303030303030303030541a0000000000000030303030303030303030303030303030303030303030303030561c000000000000001d0000000000000001040000000000000073656174",
+        BookingCancelled { id: id(30), resource_id: id(31) }
+            => "090000001a0000000000000030303030303030303030303030303030303030303030303030591a00000000000000303030303030303030303030303030303030303030303030305a",
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn table_digest(rows: &[(&str, String)]) -> u32 {
+        let table: String = rows.iter().map(|(name, hex)| format!("{name}={hex};")).collect();
+        crc32fast::hash(table.as_bytes())
+    }
+
+    #[test]
+    fn every_event_variant_encodes_exactly_as_pinned() {
+        let actual: Vec<(&str, String)> = goldens()
+            .into_iter()
+            .map(|(name, event, _)| {
+                has_a_golden(&event);
+                (name, hex(&bincode::serialize(&event).unwrap()))
+            })
+            .collect();
+        let drifted: Vec<String> = goldens()
+            .iter()
+            .zip(&actual)
+            .filter(|((_, _, golden), (_, now))| golden != now)
+            .map(|((name, _, golden), (_, now))| format!("  {name}\n    pinned {golden}\n    now    {now}"))
+            .collect();
+        assert!(
+            drifted.is_empty(),
+            "The WAL encoding of these Event variants changed:\n{}\n\n\
+             A record on disk carries no schema, so this is a breaking format change unless you \
+             meant none. If you did not mean one, revert the change to the Event type. If you did: \
+             bump FORMAT_VERSION in src/wal.rs, teach Wal::scan to decode the old shape for older \
+             versions (it decodes every record with today's Event), then paste the new bytes above \
+             and append the new digest that every_format_version_pins_its_encoding_table prints.",
+            drifted.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_format_version_pins_its_encoding_table() {
+        let rows: Vec<(&str, String)> =
+            goldens().into_iter().map(|(name, _, golden)| (name, golden.to_string())).collect();
+        let digest = table_digest(&rows);
+        match FORMAT_HISTORY.iter().find(|(version, _)| *version == FORMAT_VERSION) {
+            None => panic!(
+                "FORMAT_VERSION {FORMAT_VERSION} has no FORMAT_HISTORY entry. Append \
+                 ({FORMAT_VERSION}, {digest}) to FORMAT_HISTORY in src/wal.rs."
+            ),
+            Some((_, pinned)) => assert_eq!(
+                *pinned,
+                digest,
+                "The Event encoding table no longer matches what FORMAT_VERSION {FORMAT_VERSION} \
+                 pins. A variant was added or an encoding changed, and an older binary would misread \
+                 or truncate the new records. Bump FORMAT_VERSION in src/wal.rs to {next} and append \
+                 ({next}, {digest}) to FORMAT_HISTORY. Never edit an existing entry.",
+                next = FORMAT_VERSION + 1,
+            ),
+        }
+    }
+
+    #[test]
+    fn format_history_is_append_only_and_ends_at_the_current_version() {
+        let versions: Vec<u16> = FORMAT_HISTORY.iter().map(|(v, _)| *v).collect();
+        assert!(
+            versions.windows(2).all(|w| w[0] < w[1]),
+            "FORMAT_HISTORY must list versions in increasing order: {versions:?}"
+        );
+        assert_eq!(
+            versions.last(),
+            Some(&FORMAT_VERSION),
+            "FORMAT_HISTORY must end at FORMAT_VERSION {FORMAT_VERSION}, so the current table is \
+             the one pinned"
         );
     }
 }

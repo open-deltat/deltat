@@ -42,8 +42,9 @@ is only written down decays, and this repo has the evidence for that.
 | Wall-clock reads go through the injected `Clock` (`src/clock.rs`) | `scripts/check-no-ambient-time.sh` **and** the `clippy.toml` `disallowed-methods` rule |
 | No new duplicate requirement ID and no new reference to an ID that does not exist | `scripts/check-requirements.sh` (ratchet against `scripts/requirements-baseline.txt`; the corpus predates the check) |
 | No new `✅` requirement without a verifying symbol | `scripts/check-requirements.sh` (ratchet against `scripts/requirements-baseline.txt`) |
+| No `Event` variant changes its WAL encoding, and none is added, under an unchanged `FORMAT_VERSION` | the `wal::format_fingerprint` tests (`cargo test --lib format_fingerprint`), which pin each variant's bytes and a digest per version |
 
-Run all of them: `sh scripts/check-all.sh`. CI runs them before the test suite.
+Run the scripts with `sh scripts/check-all.sh`; the fingerprint runs with the unit suite. CI runs both.
 
 **When you establish a new invariant, add a check in the same PR.** The clock seam is the template:
 state it in the module doc, enforce it two ways (a path-based lint and a spelling-proof grep, because
