@@ -210,13 +210,19 @@ impl Wal {
         Ok(())
     }
 
-    /// Flush the BufWriter and fsync the underlying file.
+    /// Flush the BufWriter and make the appended records durable.
+    ///
+    /// `sync_data` (fdatasync on Linux, HW-07): an append changes only the data and the file size,
+    /// and fdatasync flushes the size along with the data because a read depends on it. What it
+    /// skips is metadata nothing reads back, such as the modification time. File creation,
+    /// truncation and compaction change more than that and keep `sync_all`. On macOS both calls
+    /// are F_FULLFSYNC, so this changes nothing there.
     pub fn flush_sync(&mut self) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other("WAL poisoned by an earlier flush failure"));
         }
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()
+        self.writer.get_ref().sync_data()
     }
 
     /// Return the WAL file path.

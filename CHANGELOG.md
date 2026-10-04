@@ -7,6 +7,10 @@ All notable changes to deltat are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **Appends sync with `fdatasync` on Linux** (HW-07) instead of `fsync`. An append changes only the
+  data and the file size, which fdatasync still flushes, so durability is unchanged and the flush
+  skips metadata nothing reads back. File creation, truncation and compaction still use `fsync`.
+  macOS is unaffected (both are F_FULLFSYNC there).
 - **Reads no longer wait for writes to reach disk** (#25). A hold, booking or commit is applied
   before its fsync and the resource lock is released while the fsync runs, so reads on that
   resource stop queuing behind it, and concurrent writers on one resource share a flush. Measured
