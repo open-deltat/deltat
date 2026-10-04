@@ -39,7 +39,9 @@ The `FORMAT_VERSION` doc comment in `../wal.rs` classifies every change:
   but `FORMAT_VERSION` catches the difference.
 
 A breaking change without a version bump is data-destroying, not merely wrong: mid-log the node will
-not start, and at the tail `Wal::open` truncates and fsyncs, destroying an acknowledged booking.
+not start, and at the tail `Wal::open` truncates and fsyncs, destroying an acknowledged booking. The
+`format_fingerprint` tests at the bottom of `../wal.rs` fail on either class without a bump, and their
+failure message says what to do.
 
 ## Locks
 

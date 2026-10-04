@@ -93,10 +93,10 @@ ratcheted. Until then the check is honest about being best-effort.
 
 ## What to enforce next, ranked by what it would have caught
 
-1. **WAL `Event` schema fingerprint.** A golden test over the encoded shape of every `Event` variant
-   that fails when a field is added, removed or reordered without a `FORMAT_VERSION` bump. This is
-   one-way door 5, described in the audit as the most dangerous item in the repo, and it is currently
-   guarded by the `FORMAT_VERSION` doc comment in `wal.rs` and nothing else.
+1. ~~**WAL `Event` schema fingerprint.**~~ Done: `wal::format_fingerprint` pins every variant's
+   bincode bytes and a digest of the whole table per `FORMAT_VERSION`, and a new variant fails to
+   compile until it is pinned. Mutation-checked against a swapped field pair, two reordered variants,
+   a table change under an unchanged version, and a version bump with no history entry.
 2. **No entity id or free text on any read or push surface.** One-way door 1. A test asserting the
    NOTIFY payload carries no `Ulid` and no label, plus a grep that `serde_json::to_string(&event)`
    does not reappear on the notify path. The audit confirms no existing test asserts payload content,
