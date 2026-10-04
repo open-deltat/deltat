@@ -101,7 +101,7 @@ async fn delete_resource_reclaims_notify_channel() {
     engine.delete_resource(id).await.unwrap();
 
     let delivered = rx.recv().await.unwrap();
-    assert!(matches!(delivered.event, Event::ResourceDeleted { .. }));
+    assert!(matches!(delivered.event(), Event::ResourceDeleted { .. }));
     assert!(matches!(
         rx.recv().await,
         Err(tokio::sync::broadcast::error::RecvError::Closed)

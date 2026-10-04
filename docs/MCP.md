@@ -44,7 +44,7 @@ The abandonment property is the pitch, in one line: **the only durable state a n
 | **Cacheable list results** (`ttlMs`, `cacheScope`) | `tools/list` is per-tenant and near-static: long `ttlMs`. Anonymous availability gets a short `ttlMs` aligned to the VIS-13b 15-minute grid, which is the same key-space bound DOS-01 already demands |
 | **Auth hardening**: RFC 9728 PRM mandatory, RFC 8707 resource indicators, RFC 9207 `iss` validation, Client ID Metadata Documents preferred over DCR (DCR deprecated, 12-month runway) | Fixes the tenant addressing question. See §3 |
 | **Tasks extension** `io.modelcontextprotocol/tasks`, poll-based `tasks/get` / `tasks/update` | The container for a multi-round negotiation and for reactive-availability watches. Negotiation is a Task; the holds are the durable part |
-| **Subscriptions** move to `subscriptions/listen` streams | The mapping target for deltat NOTIFY. Gated on AUTHZ-07: today the forwarder ships the full `Event` including `label` and raw hold `Ulid` |
+| **Subscriptions** move to `subscriptions/listen` streams | The mapping target for deltat NOTIFY. Gated on AUTHZ-07: labels are no longer sent (`label` is always `null`), but the forwarder still ships the raw hold `Ulid` |
 | **Sampling, roots, logging deprecated** (12-month support) | Do not design around sampling. Never rely on the client's model |
 | **2026 roadmap:** `.well-known` server metadata, Tasks productionisation, gateway/enterprise concerns | Our discovery story rides the standard rather than inventing one |
 
@@ -252,7 +252,7 @@ MCP is one skin. It should be the thinnest of several over a single policy core,
 
 ## 9. Risks
 
-**Prompt injection through booking labels is the sharpest new risk MCP adds.** Today `label` is free text in the kernel (`model.rs:61/189`). Under MCP, one tenant's booking label lands in another party's agent context during a joint availability read or a NOTIFY push. That is attacker-controlled text entering an agent's instruction stream. GAP-02 (`label` becomes an opaque `external_ref: Ulid`) was hygiene; it is now a security control, and it should be enforced by a test that no free-text byte crosses an agent-visible surface.
+**Prompt injection through booking labels is the sharpest new risk MCP adds.** Today `label` is free text in the kernel (`model.rs:61/189`). Under MCP, one tenant's booking label lands in another party's agent context during a joint availability read (a NOTIFY push no longer carries labels since deltat#49). That is attacker-controlled text entering an agent's instruction stream. GAP-02 (`label` becomes an opaque `external_ref: Ulid`) was hygiene; it is now a security control, and it should be enforced by a test that no free-text byte crosses an agent-visible surface.
 
 **Hold squatting is the cheapest attack.** Creating a hold costs an attacker nothing and costs the tenant a slot. Idempotency collapses retries, not fresh-Ulid floods. The bounds are per-identity concurrent-hold caps, TTL, and cost (MCP-S5, L6).
 

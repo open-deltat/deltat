@@ -100,7 +100,12 @@ ratcheted. Until then the check is honest about being best-effort.
 2. **No entity id or free text on any read or push surface.** One-way door 1. A test asserting the
    NOTIFY payload carries no `Ulid` and no label, plus a grep that `serde_json::to_string(&event)`
    does not reappear on the notify path. The audit confirms no existing test asserts payload content,
-   so this is cheap to add and would have prevented the leak that is live today.
+   so this is cheap to add and would have prevented the leak that is live today. Labels done
+   (deltat#49): `notify::tests::no_payload_carries_a_booking_label` pins the bytes, and
+   `no_booking_label_reaches_a_listener` (tests/listen_notify.rs) covers each booking statement
+   over the wire, both mutation-checked. A new `Event` variant fails to compile until
+   `notify::broadcastable` decides what of it may be sent. Entity ids and resource names still
+   cross.
 3. **No bearer or token type reachable from `Command`.** PROTO-AUTH-06 and MCP-S3 both require it
    structurally rather than by convention. A dependency-graph assertion over `command.rs` makes
    "token passthrough is impossible" a fact instead of a promise.

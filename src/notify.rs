@@ -12,7 +12,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use ulid::Ulid;
 
-use crate::model::{Event, Span};
+use crate::model::{Event, HoldCommit, Span};
 
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -40,7 +40,8 @@ pub struct Ended {
     pub booking_id: Option<Ulid>,
 }
 
-/// What a LISTEN subscriber is sent for one committed change.
+/// What a LISTEN subscriber is sent for one committed change. Its event is already what subscribers
+/// may see (see `broadcastable`), and private, so nothing reading a notice can reach a label.
 ///
 /// `Event` is the WAL record format (bincode, no schema version), so it cannot grow fields without
 /// making existing logs unreadable. The extra facts ride here, on the notification only.
@@ -49,7 +50,7 @@ pub struct Ended {
 /// cell), so a change nobody listens to is never serialized and one many listen to is serialized once.
 #[derive(Debug, Clone)]
 pub struct Notice {
-    pub event: Event,
+    event: Event,
     pub ended: Option<Ended>,
     payload: Arc<OnceLock<Arc<str>>>,
 }
@@ -80,6 +81,42 @@ enum EndedPayload<'a> {
     BookingCancelled(Ending<'a>),
 }
 
+/// What a subscriber may be told of `event`: all of it except booking labels. A label is whatever
+/// the booker typed, often a name, and notifications are what gets passed on: to browsers watching
+/// a public page, to agents reading a change stream unprompted (AUTHZ-07). Who may read a label is
+/// the read path's decision, so the key stays, as `null`, and the label is read with the booking.
+/// Every variant and every field is named, so a new one of either does not compile until someone
+/// decides whether it may be broadcast.
+fn broadcastable(event: &Event) -> Event {
+    match event {
+        Event::BookingConfirmed { id, resource_id, span, label: _ } => {
+            Event::BookingConfirmed { id: *id, resource_id: *resource_id, span: *span, label: None }
+        }
+        Event::HoldsCommitted { commits } => Event::HoldsCommitted {
+            commits: commits
+                .iter()
+                .map(|&HoldCommit { hold_id, booking_id, resource_id, span, label: _ }| HoldCommit {
+                    hold_id,
+                    booking_id,
+                    resource_id,
+                    span,
+                    label: None,
+                })
+                .collect(),
+        },
+        // Nothing a booker types. A resource's name is set by whoever creates the resource.
+        Event::ResourceCreated { id: _, parent_id: _, name: _, capacity: _, buffer_after: _ }
+        | Event::ResourceUpdated { id: _, name: _, capacity: _, buffer_after: _ }
+        | Event::ResourceDeleted { id: _ }
+        | Event::RuleAdded { id: _, resource_id: _, span: _, blocking: _ }
+        | Event::RuleUpdated { id: _, resource_id: _, span: _, blocking: _ }
+        | Event::RuleRemoved { id: _, resource_id: _ }
+        | Event::HoldPlaced { id: _, resource_id: _, span: _, expires_at: _ }
+        | Event::HoldReleased { id: _, resource_id: _ }
+        | Event::BookingCancelled { id: _, resource_id: _ } => event.clone(),
+    }
+}
+
 fn payload_of(event: &Event, ended: Option<&Ended>) -> Arc<str> {
     let json = match (event, ended) {
         (Event::HoldReleased { id, resource_id }, Some(ended)) => {
@@ -95,13 +132,17 @@ fn payload_of(event: &Event, ended: Option<&Ended>) -> Arc<str> {
 
 impl Notice {
     pub fn of(event: &Event) -> Self {
-        Self { event: event.clone(), ended: None, payload: Arc::default() }
+        Self { event: broadcastable(event), ended: None, payload: Arc::default() }
     }
 
     /// `ended` only reaches the payload for the events it describes (`HoldReleased`,
     /// `BookingCancelled`); any other event goes out exactly as `Notice::of` would send it.
     pub fn ended(event: &Event, ended: Ended) -> Self {
-        Self { event: event.clone(), ended: Some(ended), payload: Arc::default() }
+        Self { event: broadcastable(event), ended: Some(ended), payload: Arc::default() }
+    }
+
+    pub fn event(&self) -> &Event {
+        &self.event
     }
 
     /// The JSON payload: the event in the shape it always had, keys in the same order, with the
@@ -312,6 +353,25 @@ mod tests {
         assert_eq!(inner["span"], serde_json::json!({ "start": 3000, "end": 4000 }));
         assert!(inner.get("reason").is_none());
         assert!(inner.get("booking_id").is_none());
+    }
+
+    #[test]
+    fn no_payload_carries_a_booking_label() {
+        let (hid, bid, rid) = (Ulid::new(), Ulid::new(), Ulid::new());
+        let span = Span::new(1000, 2000);
+        let booked = |label: Option<&str>| Event::BookingConfirmed { id: bid, resource_id: rid, span, label: label.map(Into::into) };
+        let committed = Event::HoldsCommitted {
+            commits: vec![HoldCommit { hold_id: hid, booking_id: bid, resource_id: rid, span, label: Some("Ada".into()) }],
+        };
+        let ended = Ended { span, reason: None, booking_id: None };
+        for event in [booked(Some("Ada")), committed] {
+            for notice in [Notice::of(&event), Notice::ended(&event, ended.clone())] {
+                assert!(!notice.payload().contains("Ada"), "{}", notice.payload());
+                assert!(!format!("{:?}", notice.event).contains("Ada"), "a reader of the notice gets none either");
+            }
+        }
+        // The same bytes as a booking that never had a label, so the key and its place are unchanged.
+        assert_eq!(&*Notice::of(&booked(Some("Ada"))).payload(), serde_json::to_string(&booked(None)).unwrap());
     }
 
     #[test]

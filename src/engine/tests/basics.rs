@@ -759,9 +759,9 @@ async fn engine_commit_hold_notifies_resource_and_ancestors() {
     let committed = Ended { span: Span::new(10, 20), reason: Some(HoldEnd::Committed), booking_id: Some(bid) };
     for rx in [&mut on_child, &mut on_parent] {
         let released = rx.recv().await.unwrap();
-        assert!(matches!(released.event, Event::HoldReleased { .. }));
+        assert!(matches!(released.event(), Event::HoldReleased { .. }));
         assert_eq!(released.ended.as_ref(), Some(&committed));
-        assert!(matches!(rx.recv().await.unwrap().event, Event::BookingConfirmed { .. }));
+        assert!(matches!(rx.recv().await.unwrap().event(), Event::BookingConfirmed { .. }));
     }
 }
 

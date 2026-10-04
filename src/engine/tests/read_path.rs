@@ -74,7 +74,7 @@ async fn a_subscriber_hears_of_a_hold_only_once_it_is_on_disk() {
         "a subscriber heard of the hold before it was durable"
     );
     placing.await.unwrap().unwrap();
-    assert!(matches!(rx.recv().await.unwrap().event, Event::HoldPlaced { .. }));
+    assert!(matches!(rx.recv().await.unwrap().event(), Event::HoldPlaced { .. }));
 }
 
 #[tokio::test]

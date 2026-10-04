@@ -325,14 +325,14 @@ async fn commit_holds_notifies_each_resource_like_a_single_commit() {
 
     for (rx, bid) in listeners.iter_mut().zip([b0, b1]) {
         let released = rx.recv().await.unwrap();
-        assert!(matches!(released.event, Event::HoldReleased { .. }), "got {:?}", released.event);
+        assert!(matches!(released.event(), Event::HoldReleased { .. }), "got {:?}", released.event());
         assert_eq!(
             released.ended,
             Some(Ended { span, reason: Some(HoldEnd::Committed), booking_id: Some(bid) }),
             "the release names the commit, so no listener reads the span as free"
         );
         let confirmed = rx.recv().await.unwrap();
-        assert!(matches!(confirmed.event, Event::BookingConfirmed { id, .. } if id == bid));
+        assert!(matches!(confirmed.event(), Event::BookingConfirmed { id, .. } if *id == bid));
     }
 }
 
