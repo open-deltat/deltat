@@ -1265,8 +1265,8 @@ async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
 #[tokio::test]
 async fn no_booking_label_reaches_a_listener() {
     // A label is what the booker typed, and a listener is anyone who may watch the resource. Every
-    // way to make a booking is covered: directly, by committing one hold, and by committing several
-    // in one statement. The label stays readable where bookings are read.
+    // statement that books is covered: one direct row, several direct rows, one hold committed and
+    // several holds committed together. The label stays readable where bookings are read.
     let (addr, _tm) = start_test_server().await;
     let (listener, mut rx) = connect(addr).await;
     let (client, _) = connect(addr).await;
@@ -1279,11 +1279,21 @@ async fn no_booking_label_reaches_a_listener() {
         .unwrap();
     listener.batch_execute(&format!("LISTEN resource_{rid}")).await.unwrap();
 
-    let [direct, h1, b1, h2, b2, h3, b3] = std::array::from_fn(|_| Ulid::new());
+    let [direct, d1, d2, h1, b1, h2, b2, h3, b3] = std::array::from_fn(|_| Ulid::new());
     client
         .batch_execute(&format!(
             r#"INSERT INTO bookings (id, resource_id, start, "end", label) VALUES ('{direct}', '{rid}', {t0}, {}, 'Ada direct')"#,
             t0 + 1000
+        ))
+        .await
+        .unwrap();
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO bookings (id, resource_id, start, "end", label) VALUES ('{d1}', '{rid}', {}, {}, 'Ada rows'), ('{d2}', '{rid}', {}, {}, 'Ada rows')"#,
+            t0 + 8000,
+            t0 + 9000,
+            t0 + 10_000,
+            t0 + 11_000
         ))
         .await
         .unwrap();
@@ -1307,8 +1317,9 @@ async fn no_booking_label_reaches_a_listener() {
         .await
         .unwrap();
 
+    let booked = [direct, d1, d2, b1, b2, b3];
     let mut confirmed = Vec::new();
-    while confirmed.len() < 4 {
+    while confirmed.len() < booked.len() {
         let n = recv_notification(&mut rx, Duration::from_secs(5)).await.expect("expected a notification");
         assert!(!n.payload().contains("Ada"), "a label reached a listener: {}", n.payload());
         let v: serde_json::Value = serde_json::from_str(n.payload()).expect("payload is JSON");
@@ -1317,13 +1328,17 @@ async fn no_booking_label_reaches_a_listener() {
             confirmed.push(booking["id"].as_str().unwrap_or_default().to_string());
         }
     }
+    // Whatever follows the last booking is held to the same rule.
+    while let Some(n) = recv_notification(&mut rx, Duration::from_millis(300)).await {
+        assert!(!n.payload().contains("Ada"), "a label reached a listener: {}", n.payload());
+    }
     confirmed.sort();
-    let mut expected: Vec<String> = [direct, b1, b2, b3].iter().map(Ulid::to_string).collect();
+    let mut expected: Vec<String> = booked.iter().map(Ulid::to_string).collect();
     expected.sort();
-    assert_eq!(confirmed, expected, "every way to book was heard");
+    assert_eq!(confirmed, expected, "every booking was heard");
 
     let labels = select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
-    assert_eq!(labels.iter().filter(|(_, label)| label.starts_with("Ada")).count(), 4, "{labels:?}");
+    assert_eq!(labels.iter().filter(|(_, label)| label.starts_with("Ada")).count(), booked.len(), "{labels:?}");
 }
 
 #[tokio::test]

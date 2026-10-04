@@ -5,7 +5,6 @@
 //! writers, and is told so with a `Lagged` notification (see `lagged_payload`), so it knows to
 //! re-read authoritative state instead of trusting the stream.
 
-use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -41,7 +40,8 @@ pub struct Ended {
     pub booking_id: Option<Ulid>,
 }
 
-/// What a LISTEN subscriber is sent for one committed change.
+/// What a LISTEN subscriber is sent for one committed change. `event` is already what subscribers
+/// may see (see `broadcastable`), so nothing reading a notice can reach a label.
 ///
 /// `Event` is the WAL record format (bincode, no schema version), so it cannot grow fields without
 /// making existing logs unreadable. The extra facts ride here, on the notification only.
@@ -81,29 +81,29 @@ enum EndedPayload<'a> {
     BookingCancelled(Ending<'a>),
 }
 
-/// `event` with every booking label cleared. A label is whatever the booker typed, often a name,
-/// and anyone who may LISTEN on a resource hears it, not only whoever may read its bookings
-/// (AUTHZ-07). The key stays, as `null`, so the shape does not change; the label is read with the
-/// booking. Each pattern names every field, so a new one does not compile until someone decides
-/// whether it may be broadcast.
-fn without_labels(event: &Event) -> Cow<'_, Event> {
+/// What a subscriber may be told of `event`: all of it except booking labels. A label is whatever
+/// the booker typed, often a name, and anyone who may LISTEN on a resource hears its changes, not
+/// only whoever may read its bookings (AUTHZ-07). The key stays, as `null`, so the payload keeps
+/// its shape; the label is read with the booking. Every variant is named, so a new one does not
+/// compile until someone decides what of it may be broadcast.
+fn broadcastable(event: &Event) -> Event {
     match event {
-        Event::BookingConfirmed { id, resource_id, span, label: Some(_) } => {
-            Cow::Owned(Event::BookingConfirmed { id: *id, resource_id: *resource_id, span: *span, label: None })
+        Event::BookingConfirmed { id, resource_id, span, label: _ } => {
+            Event::BookingConfirmed { id: *id, resource_id: *resource_id, span: *span, label: None }
         }
-        Event::HoldsCommitted { commits } => Cow::Owned(Event::HoldsCommitted {
-            commits: commits
-                .iter()
-                .map(|&HoldCommit { hold_id, booking_id, resource_id, span, label: _ }| HoldCommit {
-                    hold_id,
-                    booking_id,
-                    resource_id,
-                    span,
-                    label: None,
-                })
-                .collect(),
-        }),
-        _ => Cow::Borrowed(event),
+        Event::HoldsCommitted { commits } => Event::HoldsCommitted {
+            commits: commits.iter().map(|commit| HoldCommit { label: None, ..commit.clone() }).collect(),
+        },
+        // Nothing a booker types. A resource's name is set by whoever creates the resource.
+        Event::ResourceCreated { .. }
+        | Event::ResourceUpdated { .. }
+        | Event::ResourceDeleted { .. }
+        | Event::RuleAdded { .. }
+        | Event::RuleUpdated { .. }
+        | Event::RuleRemoved { .. }
+        | Event::HoldPlaced { .. }
+        | Event::HoldReleased { .. }
+        | Event::BookingCancelled { .. } => event.clone(),
     }
 }
 
@@ -115,20 +115,20 @@ fn payload_of(event: &Event, ended: Option<&Ended>) -> Arc<str> {
         (Event::BookingCancelled { id, resource_id }, Some(ended)) => {
             serde_json::to_string(&EndedPayload::BookingCancelled(Ending { id, resource_id, ended }))
         }
-        _ => serde_json::to_string(&without_labels(event)),
+        _ => serde_json::to_string(event),
     };
     json.unwrap_or_default().into()
 }
 
 impl Notice {
     pub fn of(event: &Event) -> Self {
-        Self { event: event.clone(), ended: None, payload: Arc::default() }
+        Self { event: broadcastable(event), ended: None, payload: Arc::default() }
     }
 
     /// `ended` only reaches the payload for the events it describes (`HoldReleased`,
     /// `BookingCancelled`); any other event goes out exactly as `Notice::of` would send it.
     pub fn ended(event: &Event, ended: Ended) -> Self {
-        Self { event: event.clone(), ended: Some(ended), payload: Arc::default() }
+        Self { event: broadcastable(event), ended: Some(ended), payload: Arc::default() }
     }
 
     /// The JSON payload: the event in the shape it always had, keys in the same order, with the
@@ -349,9 +349,12 @@ mod tests {
         let committed = Event::HoldsCommitted {
             commits: vec![HoldCommit { hold_id: hid, booking_id: bid, resource_id: rid, span, label: Some("Ada".into()) }],
         };
+        let ended = Ended { span, reason: None, booking_id: None };
         for event in [booked(Some("Ada")), committed] {
-            let payload = Notice::of(&event).payload();
-            assert!(!payload.contains("Ada"), "{payload}");
+            for notice in [Notice::of(&event), Notice::ended(&event, ended.clone())] {
+                assert!(!notice.payload().contains("Ada"), "{}", notice.payload());
+                assert!(!format!("{:?}", notice.event).contains("Ada"), "a reader of the notice gets none either");
+            }
         }
         // The same bytes as a booking that never had a label, so the key and its place are unchanged.
         assert_eq!(&*Notice::of(&booked(Some("Ada"))).payload(), serde_json::to_string(&booked(None)).unwrap());
