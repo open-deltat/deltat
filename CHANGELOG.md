@@ -7,10 +7,6 @@ All notable changes to deltat are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
-- **Appends sync with `fdatasync` on Linux** (HW-07) instead of `fsync`. An append changes only the
-  data and the file size, which fdatasync still flushes, so durability is unchanged and the flush
-  skips metadata nothing reads back. File creation, truncation and compaction still use `fsync`.
-  macOS is unaffected (both are F_FULLFSYNC there).
 - **Reads no longer wait for writes to reach disk** (#25). A hold, booking or commit is applied
   before its fsync and the resource lock is released while the fsync runs, so reads on that
   resource stop queuing behind it, and concurrent writers on one resource share a flush. Measured
@@ -23,6 +19,18 @@ All notable changes to deltat are documented here. The format follows
   truncating the torn tail; since changes now reach memory before disk, it refuses every further
   write and compaction instead, and the next query rebuilds the tenant from its log, keeping open
   LISTEN subscriptions. Acknowledged data is unaffected; the writes that failed fail.
+
+### Fixed
+- **A log ending in zero bytes no longer stops the tenant from starting.** A crash after the file
+  grew but before its last data landed (ext4 with `data=writeback`, for one) leaves zeros at the
+  end. Eight zero bytes passed as a record, because the CRC of an empty payload is 0, and then
+  failed to decode, so the log was refused as corrupt when it only had an unacknowledged tail.
+  An all-zero tail is now cut off like any torn tail; zeros followed by data are still refused.
+  This is also what lets a later release reserve log space ahead of appends (HW-07) and still be
+  rolled back to this one.
+- **Creating a log syncs its directory.** A new tenant's log file was synced but its directory
+  entry was not, so on a filesystem that keeps the two apart a power loss could take the whole
+  log, bookings included. Compaction and the format upgrade already did this.
 
 ## [0.4.0] - 2026-10-04
 

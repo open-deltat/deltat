@@ -8,7 +8,7 @@
 //! stopping there would drop acknowledged records.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::model::Event;
@@ -88,6 +88,21 @@ fn write_header(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(&FORMAT_VERSION.to_le_bytes())
 }
 
+/// Sync the directory holding `path`, which is what makes a create or rename of it durable.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
+}
+
+/// Whether everything left to read is zero bytes.
+fn rest_is_zero(reader: &mut impl BufRead) -> io::Result<bool> {
+    match reader.bytes().find(|byte| !matches!(byte, Ok(0))) {
+        None => Ok(true),
+        Some(Ok(_)) => Ok(false),
+        Some(Err(e)) => Err(e),
+    }
+}
+
 fn mid_log_corruption(offset: u64, what: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -161,6 +176,9 @@ impl Wal {
             write_header(&mut writer)?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
+            // The file may be new, and syncing a file does not make its name durable: without
+            // this a power loss could take a new tenant's whole log, every booking in it acked.
+            sync_dir(path)?;
         }
         Ok(Self {
             writer,
@@ -210,19 +228,13 @@ impl Wal {
         Ok(())
     }
 
-    /// Flush the BufWriter and make the appended records durable.
-    ///
-    /// `sync_data` (fdatasync on Linux, HW-07): an append changes only the data and the file size,
-    /// and fdatasync flushes the size along with the data because a read depends on it. What it
-    /// skips is metadata nothing reads back, such as the modification time. File creation,
-    /// truncation and compaction change more than that and keep `sync_all`. On macOS both calls
-    /// are F_FULLFSYNC, so this changes nothing there.
+    /// Flush the BufWriter and fsync the underlying file.
     pub fn flush_sync(&mut self) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other("WAL poisoned by an earlier flush failure"));
         }
         self.writer.flush()?;
-        self.writer.get_ref().sync_data()
+        self.writer.get_ref().sync_all()
     }
 
     /// Return the WAL file path.
@@ -289,8 +301,7 @@ impl Wal {
     /// Shared by compaction and by the format upgrade, which need identical guarantees.
     fn swap_temp_into_place(path: &Path) -> io::Result<()> {
         fs::rename(path.with_extension("wal.tmp"), path)?;
-        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-        File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
+        sync_dir(path)
     }
 
     /// Walk the log, returning the events of the valid prefix, its byte length (the boundary `open`
@@ -321,6 +332,18 @@ impl Wal {
                 Err(e) => return Err(e),
             }
             let len = u32::from_le_bytes(len_buf) as usize;
+            // No record has length 0 (every payload encodes at least its variant), so zeros here are
+            // space the file grew by but whose data never landed: a crash after the size reached
+            // disk and before the data did, or space reserved ahead of appends. If nothing but zeros
+            // follows, the log ends here. Without this check, eight zero bytes would pass as a
+            // record, since the CRC of an empty payload is 0, and then fail to decode as mid-log
+            // corruption, so the tenant would never start again.
+            if len == 0 {
+                if rest_is_zero(&mut reader)? {
+                    break;
+                }
+                return Err(mid_log_corruption(valid_len, "zero-length record"));
+            }
             // Reject an implausible length before allocating, so a corrupt prefix cannot drive a
             // multi-gigabyte allocation ahead of the CRC check. The record's extent is unknowable,
             // so classify by size: a single torn append leaves at most one record's worth of bytes
@@ -790,6 +813,54 @@ mod tests {
 
         let replayed = Wal::replay(&path).unwrap();
         assert_eq!(replayed, vec![first, second]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_zero_filled_tail_is_where_the_log_ends() {
+        // The file grew but its last data never landed (or the space was reserved ahead of time).
+        // Those zeros were never acknowledged, so they are a tail to cut, not corruption.
+        let path = tmp_path("zero_tail.wal");
+        let _ = fs::remove_file(&path);
+
+        let first = create_event();
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&first).unwrap();
+        }
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0u8; 4096]).unwrap();
+        }
+        assert_eq!(Wal::replay(&path).unwrap(), vec![first.clone()]);
+
+        let second = create_event();
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&second).unwrap();
+        }
+        assert_eq!(Wal::replay(&path).unwrap(), vec![first, second]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zeros_followed_by_data_are_still_corruption() {
+        // Only an all-zero rest is a tail. Data after the zeros may be acknowledged records, and
+        // stopping at the zeros would drop them.
+        let path = tmp_path("zeros_then_data.wal");
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut f = File::create(&path).unwrap();
+            write_raw_record(&mut f, &create_event(), None);
+            f.write_all(&[0u8; 64]).unwrap();
+            write_raw_record(&mut f, &create_event(), None);
+        }
+
+        assert_eq!(Wal::replay(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(Wal::open(&path).is_err());
 
         let _ = fs::remove_file(&path);
     }
