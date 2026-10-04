@@ -95,78 +95,41 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
     let table = insert_table_name(insert)?;
     let columns = extract_column_names(insert);
     reject_unsupported_write_clauses(insert.returning.as_ref(), insert.on.is_some())?;
+    let rows = || extract_all_insert_rows(insert);
 
-    match table.as_str() {
-        "resources" => {
-            let all_rows = extract_all_insert_rows(insert)?;
-            if all_rows.len() == 1 {
-                let (id, parent_id, name, capacity, buffer_after) =
-                    parse_resource_row(&all_rows[0], &columns)?;
-                Ok(Command::InsertResource { id, parent_id, name, capacity, buffer_after })
-            } else {
-                let mut resources = Vec::with_capacity(all_rows.len());
-                for (i, row) in all_rows.iter().enumerate() {
-                    resources.push(
-                        parse_resource_row(row, &columns)
-                            .map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                    );
-                }
-                Ok(Command::BatchInsertResources { resources })
+    // One row keeps its single-row command, which can offer alternatives on a refusal; several
+    // become one all-or-nothing batch.
+    Ok(match table.as_str() {
+        "resources" => match single_row(parse_rows(&rows()?, |r| parse_resource_row(r, &columns))?) {
+            Ok((id, parent_id, name, capacity, buffer_after)) => {
+                Command::InsertResource { id, parent_id, name, capacity, buffer_after }
             }
-        }
-        "rules" => {
-            let all_rows = extract_all_insert_rows(insert)?;
-            if all_rows.len() == 1 {
-                let (id, resource_id, start, end, blocking) =
-                    parse_rule_row(&all_rows[0], &columns)?;
-                Ok(Command::InsertRule { id, resource_id, start, end, blocking })
-            } else {
-                let mut rules = Vec::with_capacity(all_rows.len());
-                for (i, row) in all_rows.iter().enumerate() {
-                    rules.push(
-                        parse_rule_row(row, &columns)
-                            .map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                    );
-                }
-                Ok(Command::BatchInsertRules { rules })
-            }
-        }
-        "holds" => {
-            let all_rows = extract_all_insert_rows(insert)?;
-            if all_rows.len() == 1 {
-                let (id, resource_id, start, end, expires_at) = parse_hold_row(&all_rows[0], &columns)?;
-                Ok(Command::InsertHold { id, resource_id, start, end, expires_at })
-            } else {
-                let holds = parse_rows(&all_rows, |row| parse_hold_row(row, &columns))?;
-                Ok(Command::BatchInsertHolds { holds })
-            }
-        }
+            Err(resources) => Command::BatchInsertResources { resources },
+        },
+        "rules" => match single_row(parse_rows(&rows()?, |r| parse_rule_row(r, &columns))?) {
+            Ok((id, resource_id, start, end, blocking)) => Command::InsertRule { id, resource_id, start, end, blocking },
+            Err(rules) => Command::BatchInsertRules { rules },
+        },
+        "holds" => match single_row(parse_rows(&rows()?, |r| parse_hold_row(r, &columns))?) {
+            Ok((id, resource_id, start, end, expires_at)) => Command::InsertHold { id, resource_id, start, end, expires_at },
+            Err(holds) => Command::BatchInsertHolds { holds },
+        },
         // A booking made from a hold: committing it, as `UPDATE holds SET booking_id` does for one.
         // As an INSERT it takes many rows, which is how several holds commit together.
         "bookings" if columns.iter().any(|c| c == "hold_id") => {
-            let all_rows = extract_all_insert_rows(insert)?;
-            let commits = parse_rows(&all_rows, |row| parse_hold_booking_row(row, &columns))?;
-            Ok(Command::CommitHolds { commits })
+            Command::CommitHolds { commits: parse_rows(&rows()?, |r| parse_hold_booking_row(r, &columns))? }
         }
-        "bookings" => {
-            let all_rows = extract_all_insert_rows(insert)?;
-            if all_rows.len() == 1 {
-                let (id, resource_id, start, end, label) =
-                    parse_booking_row(&all_rows[0], &columns)?;
-                Ok(Command::InsertBooking { id, resource_id, start, end, label })
-            } else {
-                let mut bookings = Vec::with_capacity(all_rows.len());
-                for (i, row) in all_rows.iter().enumerate() {
-                    bookings.push(
-                        parse_booking_row(row, &columns)
-                            .map_err(|e| SqlError::Parse(format!("row {i}: {e}")))?,
-                    );
-                }
-                Ok(Command::BatchInsertBookings { bookings })
-            }
-        }
-        _ => Err(SqlError::UnknownTable(table)),
-    }
+        "bookings" => match single_row(parse_rows(&rows()?, |r| parse_booking_row(r, &columns))?) {
+            Ok((id, resource_id, start, end, label)) => Command::InsertBooking { id, resource_id, start, end, label },
+            Err(bookings) => Command::BatchInsertBookings { bookings },
+        },
+        _ => return Err(SqlError::UnknownTable(table)),
+    })
+}
+
+/// The row of a one-row INSERT, or every row of a multi-row one.
+fn single_row<T>(rows: Vec<T>) -> Result<T, Vec<T>> {
+    <[T; 1]>::try_from(rows).map(|[row]| row)
 }
 
 fn parse_delete(delete: &ast::Delete) -> Result<Command, SqlError> {
@@ -1065,14 +1028,11 @@ fn parse_hold_booking_row(
         )));
     }
     reject_unknown_insert_columns("bookings", columns, &["id", "hold_id", "label"])?;
+    let named = |name: &str| cell(values, columns.iter().position(|c| c == name));
     let get = |name: &'static str| {
-        col_value(columns, values, name, 0)
-            .ok_or_else(|| SqlError::Parse(format!("bookings INSERT missing required column: {name}")))
+        named(name).ok_or_else(|| SqlError::Parse(format!("bookings INSERT missing required column: {name}")))
     };
-    let label = col_value(columns, values, "label", 0)
-        .map(parse_string_or_null)
-        .transpose()?
-        .flatten();
+    let label = named("label").map(parse_string_or_null).transpose()?.flatten();
     Ok((parse_ulid(get("hold_id")?)?, parse_ulid(get("id")?)?, label))
 }
 

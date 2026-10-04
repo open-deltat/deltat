@@ -54,6 +54,23 @@ pub(crate) fn validate_timestamp(ts: Ms) -> Result<(), EngineError> {
     Ok(())
 }
 
+pub(crate) fn validate_label(label: Option<&String>) -> Result<(), EngineError> {
+    if label.is_some_and(|l| l.len() > crate::limits::MAX_LABEL_LEN) {
+        return Err(EngineError::LimitExceeded("label too long"));
+    }
+    Ok(())
+}
+
+/// Two members of one batch sharing an id. No state check can catch it, because neither exists
+/// yet, and both landing would strand an interval (see `reject_reused_id`).
+pub(crate) fn reject_repeats(ids: impl IntoIterator<Item = Ulid>) -> Result<(), EngineError> {
+    let mut seen = std::collections::HashSet::new();
+    match ids.into_iter().find(|id| !seen.insert(*id)) {
+        Some(id) => Err(EngineError::AlreadyExists(id)),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Result<(), EngineError> {
     check_no_conflict_excluding(rs, span, now, None)
 }

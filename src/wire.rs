@@ -298,17 +298,10 @@ impl DeltaTHandler {
                 Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(1))])
             }
             Command::CommitHold { hold_id, booking_id, label } => {
-                // No resource_id in hand here: the statement addresses a hold, and resolving the
-                // resource would be a second lookup purely to decorate an error. The DETAIL body
-                // omits the field rather than carrying a guess.
                 engine
-                    .commit_hold_offering(hold_id, booking_id, label, self.counter_offer_limit)
+                    .commit_holds_offering(vec![(hold_id, booking_id, label)], self.counter_offer_limit)
                     .await
-                    .map_err(|r| WireError::Engine {
-                        cause: r.error,
-                        offer: r.offer,
-                        resource_id: None,
-                    })?;
+                    .map_err(refused_commit)?;
                 Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
             }
             Command::InsertBooking {
@@ -356,7 +349,10 @@ impl DeltaTHandler {
             Command::CommitHolds { commits } => {
                 // An INSERT of bookings, so the tag counts bookings created, as a batch booking's does.
                 let count = commits.len();
-                engine.commit_holds(commits).await?;
+                engine
+                    .commit_holds_offering(commits, self.counter_offer_limit)
+                    .await
+                    .map_err(refused_commit)?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(count))])
             }
             Command::DeleteBooking { id } => {
@@ -1333,6 +1329,16 @@ fn refused(r: crate::engine::Refused, resource_id: Ulid) -> WireError {
         cause: r.error,
         offer: r.offer,
         resource_id: Some(resource_id),
+    }
+}
+
+/// A commit statement addresses holds, not a resource, and resolving one would be a second lookup
+/// purely to decorate an error, so the DETAIL body omits the field rather than carrying a guess.
+fn refused_commit(r: crate::engine::Refused) -> WireError {
+    WireError::Engine {
+        cause: r.error,
+        offer: r.offer,
+        resource_id: None,
     }
 }
 
