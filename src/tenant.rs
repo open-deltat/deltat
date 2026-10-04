@@ -58,7 +58,9 @@ impl TenantManager {
         let safe_name = Self::sanitize(tenant)?;
 
         // Hot path: an already-created tenant needs only a shard read lock.
-        if let Some(engine) = self.engines.get(&safe_name) {
+        if let Some(engine) = self.engines.get(&safe_name)
+            && !engine.is_failed()
+        {
             return Ok(engine.value().clone());
         }
 
@@ -73,34 +75,46 @@ impl TenantManager {
         // same WAL path and each spawn a reaper/compactor/GC set, and the loser's tasks would leak
         // forever. Engine::new is synchronous, so it runs inside the entry guard directly.
         match self.engines.entry(safe_name.clone()) {
-            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Occupied(e) if !e.get().is_failed() => Ok(e.get().clone()),
+            // A failed WAL flush stopped this tenant (see the engine's `Writer`): rebuild it from its
+            // log, which holds exactly what was acknowledged. The notify hub carries over, so open
+            // LISTEN subscriptions keep receiving from the rebuilt engine.
+            Entry::Occupied(mut e) => {
+                tracing::warn!("tenant {safe_name} stopped after a failed WAL flush; rebuilding it from its log");
+                let engine = self.start(&safe_name, e.get().notify.clone())?;
+                e.insert(engine.clone());
+                Ok(engine)
+            }
             Entry::Vacant(e) => {
-                let wal_path = self.data_dir.join(format!("{safe_name}.wal"));
-                let notify = Arc::new(NotifyHub::new());
-                let engine =
-                    Arc::new(Engine::new(wal_path, notify)?.with_max_hold_ttl(self.max_hold_ttl_ms));
-
-                // Spawn reaper + compactor + GC for this tenant
-                let reaper_engine = engine.clone();
-                tokio::spawn(async move {
-                    reaper::run_reaper(reaper_engine).await;
-                });
-                let compactor_engine = engine.clone();
-                let threshold = self.compact_threshold;
-                tokio::spawn(async move {
-                    reaper::run_compactor(compactor_engine, threshold).await;
-                });
-                let gc_engine = engine.clone();
-                let retention = self.gc_retention_ms;
-                tokio::spawn(async move {
-                    reaper::run_gc(gc_engine, retention).await;
-                });
-
+                let engine = self.start(&safe_name, Arc::new(NotifyHub::new()))?;
                 e.insert(engine.clone());
                 metrics::gauge!(crate::observability::TENANTS_ACTIVE).set(self.engines.len() as f64);
                 Ok(engine)
             }
         }
+    }
+
+    /// Build a tenant's engine from its WAL and spawn its reaper, compactor and GC. The tasks of a
+    /// stopped engine end on their own (see `reaper`).
+    fn start(&self, safe_name: &str, notify: Arc<NotifyHub>) -> std::io::Result<Arc<Engine>> {
+        let wal_path = self.data_dir.join(format!("{safe_name}.wal"));
+        let engine = Arc::new(Engine::new(wal_path, notify)?.with_max_hold_ttl(self.max_hold_ttl_ms));
+
+        let reaper_engine = engine.clone();
+        tokio::spawn(async move {
+            reaper::run_reaper(reaper_engine).await;
+        });
+        let compactor_engine = engine.clone();
+        let threshold = self.compact_threshold;
+        tokio::spawn(async move {
+            reaper::run_compactor(compactor_engine, threshold).await;
+        });
+        let gc_engine = engine.clone();
+        let retention = self.gc_retention_ms;
+        tokio::spawn(async move {
+            reaper::run_gc(gc_engine, retention).await;
+        });
+        Ok(engine)
     }
 
     /// Strip path-traversal characters, keeping only alphanumerics, `_`, and `-`. A name that is
@@ -164,6 +178,27 @@ mod tests {
         // Tenant A should have availability
         let avail_a = eng_a.compute_availability(rid, 0, 10000, None).await.unwrap();
         assert_eq!(avail_a, vec![Span::new(0, 10000)]);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_stopped_by_a_failed_flush_is_rebuilt_from_its_log_on_next_use() {
+        let tm = TenantManager::new(test_data_dir("rebuild"), 1000, 604_800_000);
+        let stopped = tm.get_or_create("t").unwrap();
+        let rid = Ulid::new();
+        stopped.create_resource(rid, None, None, 1, None).await.unwrap();
+        stopped.add_rule(Ulid::new(), rid, Span::new(0, 10_000), false).await.unwrap();
+        stopped.wal_faults.fail_next_flush.store(true, std::sync::atomic::Ordering::Relaxed);
+        let far = crate::clock::now_ms() + 3_600_000;
+        assert!(stopped.place_hold(Ulid::new(), rid, Span::new(1000, 2000), far).await.is_err());
+        assert!(stopped.is_failed());
+
+        let rebuilt = tm.get_or_create("t").unwrap();
+        assert!(!Arc::ptr_eq(&stopped, &rebuilt), "a stopped engine must not be handed out again");
+        assert!(!rebuilt.is_failed());
+        assert!(rebuilt.get_resource(&rid).is_some(), "acknowledged state survives");
+        assert!(rebuilt.get_holds(rid, &[]).await.unwrap().is_empty(), "the failed hold does not");
+        assert!(Arc::ptr_eq(&stopped.notify, &rebuilt.notify), "open subscriptions carry over");
+        rebuilt.place_hold(Ulid::new(), rid, Span::new(1000, 2000), far).await.unwrap();
     }
 
     #[tokio::test]

@@ -11,11 +11,15 @@ use tracing::info;
 
 use crate::engine::Engine;
 
-/// Background task that periodically cleans up expired holds.
+/// Background task that periodically cleans up expired holds. Each loop here ends once its engine
+/// has stopped after a failed WAL flush; the tenant manager starts fresh ones for the rebuild.
 pub async fn run_reaper(engine: Arc<Engine>) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
+        if engine.is_failed() {
+            return;
+        }
         let now = engine.now_ms();
         let expired = engine.collect_expired_holds(now);
         for (hold_id, _resource_id) in expired {
@@ -35,6 +39,9 @@ pub async fn run_gc(engine: Arc<Engine>, retention_ms: i64) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         interval.tick().await;
+        if engine.is_failed() {
+            return;
+        }
         let now = engine.now_ms();
         let collected = engine.gc_past_intervals(now, retention_ms);
         if collected > 0 {
@@ -53,6 +60,9 @@ pub async fn run_compactor(engine: Arc<Engine>, threshold: u64) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     loop {
         interval.tick().await;
+        if engine.is_failed() {
+            return;
+        }
         if engine.wal_appends_since_compact().await >= threshold {
             match engine.compact_wal().await {
                 Ok(()) => info!("WAL compacted"),

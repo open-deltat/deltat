@@ -5,12 +5,18 @@ use ulid::Ulid;
 
 const HOUR: i64 = 3_600_000; // 1 hour in ms
 
+/// A client on a fresh tenant of its own.
 async fn connect(host: &str, port: u16) -> tokio_postgres::Client {
+    connect_to(host, port, &format!("bench_{}", Ulid::new())).await
+}
+
+/// A client on a named tenant, so several clients can contend for the same resources.
+async fn connect_to(host: &str, port: u16, tenant: &str) -> tokio_postgres::Client {
     let mut config = Config::new();
     config
         .host(host)
         .port(port)
-        .dbname(format!("bench_{}", Ulid::new()))
+        .dbname(tenant)
         .user("deltat")
         .password("deltat");
 
@@ -181,141 +187,113 @@ async fn phase2_concurrent(host: &str, port: u16, resources: &[Resource]) {
     );
 }
 
-async fn phase3_read_under_load(host: &str, port: u16, resource: &Resource) {
-    let rid = resource.id;
-    let cap = resource.capacity;
+/// Read latency on ONE resource while N clients book on that same resource, in one tenant
+/// (issue #25). A reader and a writer meet on the resource's lock, which is the contention that
+/// matters; giving every client its own tenant, as this phase used to, measured none of it.
+async fn phase3_reads_beside_writers(host: &str, port: u16) {
+    const DAY: i64 = 24 * HOUR;
+    const READERS: usize = 10;
+    const READS_PER_READER: usize = 300;
+    // Inside the kernel's 90-day query cap; the old 365-day window was refused and panicked here.
+    const WINDOW: i64 = 90 * DAY;
+    // Writers book after the read window, so every read does the same work whatever they add.
+    const WRITES_FROM: i64 = 100 * DAY;
 
-    // Setup: shared tenant with pre-populated data
-    let setup_client = connect(host, port).await;
-    setup_client
-        .batch_execute(&format!(
-            "INSERT INTO resources (id, capacity) VALUES ('{rid}', {cap})"
-        ))
-        .await
-        .unwrap();
-    let rule_id = Ulid::new();
-    setup_client
-        .batch_execute(&format!(
-            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{rule_id}', '{rid}', 0, 31536000000, false)"#
-        ))
-        .await
-        .unwrap();
-    // Pre-fill some bookings
-    for i in 0..200 {
-        let bid = Ulid::new();
-        let s = (i as i64) * HOUR;
-        let e = s + HOUR;
-        setup_client
+    println!("  writers  read p50   read p99   reads/s   writes/s");
+    for writers in [0usize, 1, 8] {
+        let tenant = format!("bench_{}", Ulid::new());
+        let rid = Ulid::new();
+        let setup = connect_to(host, port, &tenant).await;
+        setup
+            .batch_execute(&format!("INSERT INTO resources (id, capacity) VALUES ('{rid}', 1)"))
+            .await
+            .unwrap();
+        setup
             .batch_execute(&format!(
-                r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{bid}', '{rid}', {s}, {e})"#
+                r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{}', '{rid}', 0, {}, false)"#,
+                Ulid::new(),
+                3600 * DAY // just under the kernel's ten-year span cap
             ))
             .await
             .unwrap();
-    }
-    drop(setup_client);
-
-    // Writer tasks: continuously add bookings in the background
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut writer_handles = Vec::new();
-    for w in 0..5 {
-        let host = host.to_string();
-        let stop = stop.clone();
-        writer_handles.push(tokio::spawn(async move {
-            let client = connect(&host, port).await;
-            // Writers use their own tenant to avoid conflicts
-            let wrid = Ulid::new();
-            client
+        for i in 0..50 {
+            let s = i * HOUR * 3;
+            setup
                 .batch_execute(&format!(
-                    "INSERT INTO resources (id, capacity) VALUES ('{wrid}', 10)"
+                    r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{}', '{rid}', {s}, {})"#,
+                    Ulid::new(),
+                    s + HOUR
                 ))
                 .await
                 .unwrap();
-            let rule_id = Ulid::new();
-            client
-                .batch_execute(&format!(
-                    r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{rule_id}', '{wrid}', 0, 31536000000, false)"#
-                ))
-                .await
-                .unwrap();
-            let mut i = 0i64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let bid = Ulid::new();
-                let s = (w as i64 * 100_000 + i) * HOUR;
-                let e = s + HOUR;
-                let _ = client
-                    .batch_execute(&format!(
-                        r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{bid}', '{wrid}', {s}, {e})"#
-                    ))
-                    .await;
-                i += 1;
-            }
-        }));
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut writer_handles = Vec::new();
+        for w in 0..writers {
+            let (host, tenant) = (host.to_string(), tenant.clone());
+            let (stop, written) = (stop.clone(), written.clone());
+            writer_handles.push(tokio::spawn(async move {
+                let client = connect_to(&host, port, &tenant).await;
+                let mut i = 0i64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Each writer owns a disjoint run of hours, so no write conflicts with another.
+                    let s = WRITES_FROM + (w as i64 * 8_000 + i) * HOUR;
+                    let booked = client
+                        .batch_execute(&format!(
+                            r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{}', '{rid}', {s}, {})"#,
+                            Ulid::new(),
+                            s + HOUR
+                        ))
+                        .await;
+                    if booked.is_ok() {
+                        written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    i += 1;
+                }
+            }));
+        }
+
+        let started = Instant::now();
+        let mut reader_handles = Vec::new();
+        for _ in 0..READERS {
+            let (host, tenant) = (host.to_string(), tenant.clone());
+            reader_handles.push(tokio::spawn(async move {
+                let client = connect_to(&host, port, &tenant).await;
+                let mut latencies = Vec::with_capacity(READS_PER_READER);
+                for _ in 0..READS_PER_READER {
+                    let t = Instant::now();
+                    client
+                        .batch_execute(&format!(
+                            r#"SELECT * FROM availability WHERE resource_id = '{rid}' AND start >= 0 AND "end" <= {WINDOW}"#
+                        ))
+                        .await
+                        .unwrap();
+                    latencies.push(t.elapsed());
+                }
+                latencies
+            }));
+        }
+        let mut latencies = Vec::new();
+        for h in reader_handles {
+            latencies.extend(h.await.unwrap());
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in writer_handles {
+            let _ = h.await;
+        }
+
+        latencies.sort();
+        println!(
+            "  {writers:>7}  {:>6.2}ms  {:>7.2}ms  {:>8.0}  {:>8.0}",
+            percentile(&latencies, 50.0).as_secs_f64() * 1000.0,
+            percentile(&latencies, 99.0).as_secs_f64() * 1000.0,
+            latencies.len() as f64 / elapsed,
+            written.load(std::sync::atomic::Ordering::Relaxed) as f64 / elapsed,
+        );
     }
-
-    // Reader tasks: query availability and measure latency
-    // All readers connect to the same tenant as setup_client (same dbname won't work since
-    // connect() creates unique dbnames). Instead, readers re-setup their own data.
-    let n_readers = 10;
-    let reads_per_reader = 500;
-    let mut reader_handles = Vec::new();
-
-    for _ in 0..n_readers {
-        let host = host.to_string();
-        reader_handles.push(tokio::spawn(async move {
-            let client = connect(&host, port).await;
-            let rrid = Ulid::new();
-            client
-                .batch_execute(&format!(
-                    "INSERT INTO resources (id, capacity) VALUES ('{rrid}', 10)"
-                ))
-                .await
-                .unwrap();
-            let rule_id = Ulid::new();
-            client
-                .batch_execute(&format!(
-                    r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{rule_id}', '{rrid}', 0, 31536000000, false)"#
-                ))
-                .await
-                .unwrap();
-            // Add some bookings to make availability non-trivial
-            for i in 0..50 {
-                let bid = Ulid::new();
-                let s = (i as i64) * HOUR;
-                let e = s + HOUR;
-                client
-                    .batch_execute(&format!(
-                        r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{bid}', '{rrid}', {s}, {e})"#
-                    ))
-                    .await
-                    .unwrap();
-            }
-
-            let mut latencies = Vec::with_capacity(reads_per_reader);
-            for _ in 0..reads_per_reader {
-                let t = Instant::now();
-                client
-                    .batch_execute(&format!(
-                        r#"SELECT * FROM availability WHERE resource_id = '{rrid}' AND start >= 0 AND "end" <= 31536000000"#
-                    ))
-                    .await
-                    .unwrap();
-                latencies.push(t.elapsed());
-            }
-            latencies
-        }));
-    }
-
-    let mut all_latencies = Vec::new();
-    for h in reader_handles {
-        all_latencies.extend(h.await.unwrap());
-    }
-
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    for h in writer_handles {
-        let _ = h.await;
-    }
-
-    print_latency("availability query", &mut all_latencies);
 }
 
 async fn phase4_connection_storm(host: &str, port: u16) {
@@ -397,8 +375,8 @@ async fn main() {
     println!("\n[phase 2] concurrent write throughput");
     phase2_concurrent(&host, port, &resources).await;
 
-    println!("\n[phase 3] read latency under write load");
-    phase3_read_under_load(&host, port, &resources[9]).await;
+    println!("\n[phase 3] reads on one resource while others book on it");
+    phase3_reads_beside_writers(&host, port).await;
 
     println!("\n[phase 4] connection storm");
     phase4_connection_storm(&host, port).await;

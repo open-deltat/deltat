@@ -6,6 +6,20 @@ All notable changes to deltat are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Reads no longer wait for writes to reach disk** (#25). A hold, booking or commit is applied
+  before its fsync and the resource lock is released while the fsync runs, so reads on that
+  resource stop queuing behind it, and concurrent writers on one resource share a flush. Measured
+  on the stress bench (phase 3, one resource, ten readers): with one writer, read p50 2.94 ms to
+  0.15 ms and reads/sec 3,754 to 62,239; with eight writers, read p50 24 ms to 0.13 ms, reads/sec
+  438 to 71,803 and writes/sec 346 to 1,532. Releases, cancellations, rules and resources keep the
+  old order, because seeing them early could show time as free that a crash would take back.
+  Notifications are still sent only once an event is on disk, now in log order.
+- **A failed WAL flush stops the tenant until it is rebuilt.** It used to carry on after
+  truncating the torn tail; since changes now reach memory before disk, it refuses every further
+  write and compaction instead, and the next query rebuilds the tenant from its log, keeping open
+  LISTEN subscriptions. Acknowledged data is unaffected; the writes that failed fail.
+
 ## [0.4.0] - 2026-10-04
 
 ### Added

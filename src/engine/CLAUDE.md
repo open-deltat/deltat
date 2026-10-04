@@ -45,13 +45,26 @@ failure message says what to do.
 
 ## Locks
 
-Lock ordering already exists and is ABBA-safe (sorted batch locks in `store.rs`). Never hold a
-resource write guard while awaiting another resource's lock; collect what you need from ancestors
-*before* taking the guard, which is what `collect_inherited_rules` is for.
+Lock ordering already exists and is ABBA-safe (`lock_resources` locks in ascending id order). Never
+hold a resource write guard while awaiting another resource's lock; collect what you need from
+ancestors *before* taking the guard, which is what `collect_inherited_rules` is for.
 
-Note the open issue here: `persist_and_apply` awaits the WAL fsync while holding the write guard, so
-reads serialise behind commits. See issue #25 before optimising anything on the read path, because
-the fix changes the shape of this function.
+## Two write paths (#25)
+
+- **`persist_early`** for writes that only take time away: holds, bookings, commits and their
+  batches. Queue the record and apply it under the lock, release the lock, then wait for the flush,
+  so reads never wait out an fsync and writers on one resource share one. Queue *before* applying:
+  that is what keeps a compaction snapshot from ever holding a change whose record was not queued.
+- **`persist_and_apply`** for everything that can free time or reshape a resource: releases,
+  cancellations, rules, resources. On disk first, visible after, lock held throughout.
+
+A write moves from the second to the first only if a reader seeing it early can show **less**
+availability, never more. `tests/read_path.rs` pins both sides.
+
+The first path is safe only because a failed flush **stops the tenant** (the WAL `Writer`): every
+later write and compaction is refused, so memory that ran ahead of the disk is never built on or
+written out, and the tenant manager rebuilds the tenant from its log on next use. Do not weaken
+the stop into "recover and carry on", which is what made the old path safe and this one not.
 
 ## Failure direction
 

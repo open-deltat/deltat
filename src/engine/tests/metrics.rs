@@ -227,16 +227,27 @@ fn wal_errors_counted_on_poisoned_append_and_flush() {
 
         // Poisoned: the group-commit path and the AppendAtomic path must each count their
         // failed append and failed flush.
-        let mut recording = None;
-        let (tx, mut rx) = oneshot::channel();
-        let mut batch = vec![(create_event(), tx)];
-        flush_and_respond(&mut wal, &mut batch, &mut recording);
-        assert!(rx.try_recv().unwrap().is_err());
+        let mut writer = Writer {
+            wal,
+            recording: None,
+            notify: Arc::new(NotifyHub::new()),
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            faults: Arc::default(),
+        };
+        block_on(async {
+            let (tx, mut rx) = oneshot::channel();
+            writer.commit_batch(vec![Pending { event: create_event(), announce: Vec::new(), response: tx }]).await;
+            assert!(rx.try_recv().unwrap().is_err());
 
-        let (tx, mut rx) = oneshot::channel();
-        let cmd = WalCommand::AppendAtomic { events: vec![create_event()], response: tx };
-        handle_non_append(&mut wal, cmd, &mut recording);
-        assert!(rx.try_recv().unwrap().is_err());
+            // The failure stopped the tenant, which would refuse the next write before touching
+            // the WAL. Clear it to reach the atomic path's own append and flush.
+            writer.failed.store(false, std::sync::atomic::Ordering::Release);
+            let (tx, mut rx) = oneshot::channel();
+            writer
+                .handle(WalCommand::AppendAtomic { events: vec![create_event()], announce: Vec::new(), response: tx })
+                .await;
+            assert!(rx.try_recv().unwrap().is_err());
+        });
     });
 
     assert_eq!(log.counter_total(WAL_ERRORS_TOTAL, &[("kind", "append")]), 2);
