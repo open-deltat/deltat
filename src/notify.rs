@@ -5,6 +5,7 @@
 //! writers, and is told so with a `Lagged` notification (see `lagged_payload`), so it knows to
 //! re-read authoritative state instead of trusting the stream.
 
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -12,7 +13,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use ulid::Ulid;
 
-use crate::model::{Event, Span};
+use crate::model::{Event, HoldCommit, Span};
 
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -80,6 +81,32 @@ enum EndedPayload<'a> {
     BookingCancelled(Ending<'a>),
 }
 
+/// `event` with every booking label cleared. A label is whatever the booker typed, often a name,
+/// and anyone who may LISTEN on a resource hears it, not only whoever may read its bookings
+/// (AUTHZ-07). The key stays, as `null`, so the shape does not change; the label is read with the
+/// booking. Each pattern names every field, so a new one does not compile until someone decides
+/// whether it may be broadcast.
+fn without_labels(event: &Event) -> Cow<'_, Event> {
+    match event {
+        Event::BookingConfirmed { id, resource_id, span, label: Some(_) } => {
+            Cow::Owned(Event::BookingConfirmed { id: *id, resource_id: *resource_id, span: *span, label: None })
+        }
+        Event::HoldsCommitted { commits } => Cow::Owned(Event::HoldsCommitted {
+            commits: commits
+                .iter()
+                .map(|&HoldCommit { hold_id, booking_id, resource_id, span, label: _ }| HoldCommit {
+                    hold_id,
+                    booking_id,
+                    resource_id,
+                    span,
+                    label: None,
+                })
+                .collect(),
+        }),
+        _ => Cow::Borrowed(event),
+    }
+}
+
 fn payload_of(event: &Event, ended: Option<&Ended>) -> Arc<str> {
     let json = match (event, ended) {
         (Event::HoldReleased { id, resource_id }, Some(ended)) => {
@@ -88,7 +115,7 @@ fn payload_of(event: &Event, ended: Option<&Ended>) -> Arc<str> {
         (Event::BookingCancelled { id, resource_id }, Some(ended)) => {
             serde_json::to_string(&EndedPayload::BookingCancelled(Ending { id, resource_id, ended }))
         }
-        _ => serde_json::to_string(event),
+        _ => serde_json::to_string(&without_labels(event)),
     };
     json.unwrap_or_default().into()
 }
@@ -312,6 +339,22 @@ mod tests {
         assert_eq!(inner["span"], serde_json::json!({ "start": 3000, "end": 4000 }));
         assert!(inner.get("reason").is_none());
         assert!(inner.get("booking_id").is_none());
+    }
+
+    #[test]
+    fn no_payload_carries_a_booking_label() {
+        let (hid, bid, rid) = (Ulid::new(), Ulid::new(), Ulid::new());
+        let span = Span::new(1000, 2000);
+        let booked = |label: Option<&str>| Event::BookingConfirmed { id: bid, resource_id: rid, span, label: label.map(Into::into) };
+        let committed = Event::HoldsCommitted {
+            commits: vec![HoldCommit { hold_id: hid, booking_id: bid, resource_id: rid, span, label: Some("Ada".into()) }],
+        };
+        for event in [booked(Some("Ada")), committed] {
+            let payload = Notice::of(&event).payload();
+            assert!(!payload.contains("Ada"), "{payload}");
+        }
+        // The same bytes as a booking that never had a label, so the key and its place are unchanged.
+        assert_eq!(&*Notice::of(&booked(Some("Ada"))).payload(), serde_json::to_string(&booked(None)).unwrap());
     }
 
     #[test]

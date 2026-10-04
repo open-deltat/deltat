@@ -1263,6 +1263,70 @@ async fn ended_holds_and_bookings_say_when_and_why_over_the_wire() {
 }
 
 #[tokio::test]
+async fn no_booking_label_reaches_a_listener() {
+    // A label is what the booker typed, and a listener is anyone who may watch the resource. Every
+    // way to make a booking is covered: directly, by committing one hold, and by committing several
+    // in one statement. The label stays readable where bookings are read.
+    let (addr, _tm) = start_test_server().await;
+    let (listener, mut rx) = connect(addr).await;
+    let (client, _) = connect(addr).await;
+    let rid = Ulid::new();
+    let t0 = client_now_ms() + 86_400_000;
+    let expires = client_now_ms() + 60_000;
+    client
+        .batch_execute(&format!("INSERT INTO resources (id, capacity) VALUES ('{rid}', 5)"))
+        .await
+        .unwrap();
+    listener.batch_execute(&format!("LISTEN resource_{rid}")).await.unwrap();
+
+    let [direct, h1, b1, h2, b2, h3, b3] = std::array::from_fn(|_| Ulid::new());
+    client
+        .batch_execute(&format!(
+            r#"INSERT INTO bookings (id, resource_id, start, "end", label) VALUES ('{direct}', '{rid}', {t0}, {}, 'Ada direct')"#,
+            t0 + 1000
+        ))
+        .await
+        .unwrap();
+    for (hid, start) in [(h1, t0 + 2000), (h2, t0 + 4000), (h3, t0 + 6000)] {
+        client
+            .batch_execute(&format!(
+                r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hid}', '{rid}', {start}, {}, {expires})"#,
+                start + 1000
+            ))
+            .await
+            .unwrap();
+    }
+    client
+        .batch_execute(&format!("UPDATE holds SET booking_id = '{b1}', label = 'Ada one' WHERE id = '{h1}'"))
+        .await
+        .unwrap();
+    client
+        .batch_execute(&format!(
+            "INSERT INTO bookings (id, hold_id, label) VALUES ('{b2}', '{h2}', 'Ada kit'), ('{b3}', '{h3}', 'Ada kit')"
+        ))
+        .await
+        .unwrap();
+
+    let mut confirmed = Vec::new();
+    while confirmed.len() < 4 {
+        let n = recv_notification(&mut rx, Duration::from_secs(5)).await.expect("expected a notification");
+        assert!(!n.payload().contains("Ada"), "a label reached a listener: {}", n.payload());
+        let v: serde_json::Value = serde_json::from_str(n.payload()).expect("payload is JSON");
+        if let Some(booking) = v.get("BookingConfirmed") {
+            assert_eq!(booking.get("label"), Some(&serde_json::Value::Null), "the key stays, empty");
+            confirmed.push(booking["id"].as_str().unwrap_or_default().to_string());
+        }
+    }
+    confirmed.sort();
+    let mut expected: Vec<String> = [direct, b1, b2, b3].iter().map(Ulid::to_string).collect();
+    expected.sort();
+    assert_eq!(confirmed, expected, "every way to book was heard");
+
+    let labels = select_rows(&client, &format!("SELECT * FROM bookings WHERE resource_id = '{rid}'")).await;
+    assert_eq!(labels.iter().filter(|(_, label)| label.starts_with("Ada")).count(), 4, "{labels:?}");
+}
+
+#[tokio::test]
 async fn listen_over_the_per_connection_limit_is_refused_not_silently_ignored() {
     // Before: LISTEN answered success and the connection loop then skipped the subscription, so the
     // client waited on a channel that would never deliver anything and was never told.
