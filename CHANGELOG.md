@@ -6,6 +6,11 @@ All notable changes to deltat are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-04
+
+The WAL format is unchanged (still 2), so 0.4.0 can read what this release writes and rolling
+back needs no restore.
+
 ### Changed
 - **Reads no longer wait for writes to reach disk** (#25). A hold, booking or commit is applied
   before its fsync and the resource lock is released while the fsync runs, so reads on that
